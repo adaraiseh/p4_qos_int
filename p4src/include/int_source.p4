@@ -81,7 +81,7 @@ control process_int_source (
             hdr.udp.length_ = hdr.udp.length_ + INT_TOTAL_HEADER_SIZE;
         }
         
-        //hdr.ipv4.dscp = DSCP_INT;
+        hdr.ipv4.dscp = DSCP_INT;
     }
 
     table tb_int_source {

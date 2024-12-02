@@ -31,30 +31,30 @@ parser MyParser(packet_in packet,
         packet.extract(hdr.tcp);
         local_metadata.l4_src_port = hdr.tcp.src_port;
         local_metadata.l4_dst_port = hdr.tcp.dst_port;
-        /*transition select(hdr.ipv4.dscp) {
+        transition select(hdr.ipv4.dscp) {
             DSCP_INT &&& DSCP_MASK: parse_intl4_shim;
             default: accept;
         }
-        transition select(hdr.udp.src_port) {
-            SRC_PORT_INT: parse_intl4_shim;
-            default: parse_intl4_shim;
+        /*transition select(hdr.udp.dst_port) {
+            DST_PORT_INT: parse_intl4_shim;
+            default: accept;
         }*/
-        transition parse_intl4_shim;
+        // transition parse_intl4_shim;
     }
 
     state parse_udp {
         packet.extract(hdr.udp);
         local_metadata.l4_src_port = hdr.udp.src_port;
         local_metadata.l4_dst_port = hdr.udp.dst_port;
-        /*transition select(hdr.ipv4.dscp) {
+        transition select(hdr.ipv4.dscp) {
             DSCP_INT &&& DSCP_MASK: parse_intl4_shim;
             default: accept;
         }
-        transition select(hdr.udp.src_port) {
-            SRC_PORT_INT: parse_intl4_shim;
+        /*transition select(hdr.tcp.dst_port) {
+            DST_PORT_INT: parse_intl4_shim;
             default: parse_intl4_shim;
         }*/
-        transition parse_intl4_shim;
+        // transition parse_intl4_shim;
     }
 
     state parse_intl4_shim {
