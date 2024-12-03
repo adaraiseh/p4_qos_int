@@ -10,6 +10,7 @@ class Controller:
         self.controllers = {}
         self.forwarding_entries = {}
         self.net_graph = nx.Graph()
+        self.paths = []  # List to store paths between hosts
 
         self.connect_to_switches()
         self.build_network_graph()
@@ -28,6 +29,7 @@ class Controller:
         """
         Build a network graph using NetworkX for path computation.
         """
+        # Extract node names from the dictionaries
         p4switches = list(self.topo.get_p4switches().keys())
         hosts = list(self.topo.get_hosts().keys())
         nodes = p4switches + hosts
@@ -58,6 +60,10 @@ class Controller:
                 except nx.NetworkXNoPath:
                     print(f"No path between {src_host} and {dst_host}")
                     continue
+
+                # Store the path in the list
+                path_str = f"Path from {src_host} to {dst_host}: {' -> '.join(path)}"
+                self.paths.append(path_str)
 
                 # Iterate over the path and generate forwarding entries
                 for i in range(1, len(path) - 1):  # Exclude src_host and dst_host
@@ -121,6 +127,13 @@ class Controller:
                     [next_hop_mac, str(egress_port)]
                 )
 
+    def print_paths(self):
+        """
+        Print the stored paths between hosts.
+        """
+        for path_str in self.paths:
+            print(path_str)
+
     def print_forwarding_entries(self):
         """
         Optional: Print the forwarding entries for debugging purposes.
@@ -133,4 +146,8 @@ class Controller:
 
 if __name__ == "__main__":
     controller = Controller()
-    controller.print_forwarding_entries()
+    print("\n\nSUMMARY:")
+    print("\nOSPF Shortest Paths:")
+    controller.print_paths()  # Print the stored paths
+    print("\nP4 Table Entries:")
+    controller.print_forwarding_entries()  # Print forwarding entries
