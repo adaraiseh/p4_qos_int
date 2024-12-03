@@ -11,33 +11,39 @@ def config_network(p4):
     net.enableCli()
 
     # Network definition
+    host_nodes = 8
+    tor_nodes = 4
+    agg_nodes = 4
+    core_nodes = 2
+
     # Hosts
     hosts = []
-    for i in range(1, 17):
+    for i in range(1, host_nodes + 1):
         host = net.addHost(f'h{i}')
         hosts.append(host)
 
     # ToR (Edge) switches
     tor_switches = []
-    for i in range(1, 9):
+    for i in range(1, tor_nodes + 1):
         tor_switch = net.addP4Switch(f't{i}', priority_queues_num=4, cli_input=default_rule + f't{i}-commands.txt')
         tor_switches.append(tor_switch)
 
     # Aggregate switches
     agg_switches = []
-    for i in range(1, 9):
+    for i in range(1, agg_nodes + 1):
         agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=4, cli_input=default_rule + f'a{i}-commands.txt')
         agg_switches.append(agg_switch)
 
     # Core switches
     core_switches = []
-    for i in range(1, 5):
+    for i in range(1, core_nodes + 1):
         core_switch = net.addP4Switch(f'c{i}', priority_queues_num=4, cli_input=default_rule + f'c{i}-commands.txt')
         core_switches.append(core_switch)
 
+    net.setP4SourceAll(p4)
     # Add links with 1 Mbps bandwidth
     # Connect hosts to ToR switches
-    for i in range(8):
+    for i in range(tor_nodes):
         for j in range(2):  # Each ToR switch connects to 2 hosts
             net.addLink(hosts[i * 2 + j], tor_switches[i], bw=1)
 
