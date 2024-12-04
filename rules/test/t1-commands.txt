@@ -1,0 +1,6 @@
+//set up process_int_source_sink (the port number where monitored packets are comming from)
+table_add process_int_source_sink.tb_set_source int_set_source 1 =>  
+table_add process_int_source.tb_int_source int_source 10.0.7.1&&&0xFFFFFFFF 10.0.10.8&&&0xFFFFFFFF => 11 15 0xF 0xF 10
+
+//set up switch ID
+table_set_default process_int_transit.tb_int_insert init_metadata 1

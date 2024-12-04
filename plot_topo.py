@@ -31,11 +31,14 @@ def build_graph(data):
         elif node_id.startswith('c'):
             core_switches.append(node_id)
 
-    # Add edges
+    # Add edges with port information as edge attributes
     for link in data['links']:
         node1 = link['node1']
         node2 = link['node2']
-        G.add_edge(node1, node2)
+        port1 = link.get('port1', 'N/A')
+        port2 = link.get('port2', 'N/A')
+        # Store ports as a mapping from node to port
+        G.add_edge(node1, node2, ports={node1: port1, node2: port2})
 
     return G, hosts, tor_switches, agg_switches, core_switches, node_labels
 
@@ -94,20 +97,24 @@ def plot_graph(G, pos, labels, data):
             node_colors.append('grey')
 
     nx.draw_networkx_nodes(G, pos, node_size=800, node_color=node_colors, edgecolors='black')
-    nx.draw_networkx_edges(G, pos)
+    
+    # Draw edges with light grey color
+    nx.draw_networkx_edges(G, pos, edge_color='lightgrey')  # Updated line
+    
     nx.draw_networkx_labels(G, pos, labels, font_size=9, font_weight='bold')
 
-    # Add port numbers to edges
+    # Build edge labels from G.edges(data=True)
     edge_labels = {}
-    for link in data['links']:
-        node1 = link['node1']
-        node2 = link['node2']
-        port1 = link.get('port1', 'N/A')
-        port2 = link.get('port2', 'N/A')
-        edge_labels[(node1, node2)] = f"{port1} - {port2}"
+    for u, v, attrs in G.edges(data=True):
+        ports = attrs.get('ports', {})
+        port_u = ports.get(u, 'N/A')
+        port_v = ports.get(v, 'N/A')
+        edge_labels[(u, v)] = f"{port_u}          {port_v}"
 
     # Draw edge labels without background fill
-    #nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, bbox=dict(alpha=0), font_color="blue", font_weight='bold')
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=9,
+                                 bbox=dict(alpha=0), font_color="red", font_weight='bold')
+
     plt.title('Fat-Tree Network Topology', fontsize=16)
     plt.axis('off')
     plt.tight_layout()

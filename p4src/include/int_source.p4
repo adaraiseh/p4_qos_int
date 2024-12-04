@@ -86,13 +86,13 @@ control process_int_source (
 
     table tb_int_source {
         key = {
-            //configure for each flow to be monitored
+            // AMJ INT source match keys
+            // configure for each flow to be monitored
             // 4 fields identifying flow
-            //include ip src, udp/tcp src and dest too
             hdr.ipv4.src_ipv4_addr: ternary;
             hdr.ipv4.dst_ipv4_addr: ternary;
-            local_metadata.l4_src_port: ternary;
-            local_metadata.l4_dst_port: ternary;
+            //local_metadata.l4_src_port: ternary;
+            //local_metadata.l4_dst_port: ternary;
         }
         actions = {
             int_source;

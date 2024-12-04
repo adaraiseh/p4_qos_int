@@ -141,7 +141,7 @@ def handle_pkt(pkt):
         parse_metadata(INTShim(pkt.load))
 
 def main():
-    iface = 's3-cpu-eth1'
+    iface = 't4-eth1'
     print("sniffing on %s" % iface)
     sys.stdout.flush()
     sniff(iface = iface,filter='inbound and tcp or udp',

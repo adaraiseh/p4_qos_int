@@ -48,6 +48,7 @@ class Controller:
         Compute forwarding entries based on shortest paths between hosts.
         """
         hosts = list(self.topo.get_hosts().keys())
+        dscp_list = ["0xEF", "0x18", "0x14", "0x00"]
 
         for src_host in hosts:
             for dst_host in hosts:
@@ -76,7 +77,6 @@ class Controller:
 
                     # Get destination IP
                     dst_ip = self.topo.get_host_ip(dst_host).split('/')[0]
-                    dscp = "0x00"
 
                     # Get egress port
                     egress_port = self.topo.node_to_node_port_num(sw_name, next_hop)
@@ -90,20 +90,21 @@ class Controller:
                         next_hop_mac = "00:00:00:00:00:00"
                         dst_prefix = f"{dst_ip}/24"
 
-                    # Create forwarding entry
-                    entry = {
-                        'dst_prefix': dst_prefix,
-                        'dscp': dscp,
-                        'next_hop_mac': next_hop_mac,
-                        'egress_port': egress_port
-                    }
+                    for dscp in dscp_list:
+                        # Create forwarding entry
+                        entry = {
+                            'dst_prefix': dst_prefix,
+                            'dscp': dscp,
+                            'next_hop_mac': next_hop_mac,
+                            'egress_port': egress_port
+                        }
 
-                    if sw_name not in self.forwarding_entries:
-                        self.forwarding_entries[sw_name] = []
+                        if sw_name not in self.forwarding_entries:
+                            self.forwarding_entries[sw_name] = []
 
-                    # Avoid duplicates
-                    if entry not in self.forwarding_entries[sw_name]:
-                        self.forwarding_entries[sw_name].append(entry)
+                        # Avoid duplicates
+                        if entry not in self.forwarding_entries[sw_name]:
+                            self.forwarding_entries[sw_name].append(entry)
 
     def program_switches(self):
         """

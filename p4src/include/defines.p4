@@ -26,7 +26,7 @@ typedef bit<16> next_hop_id_t;
 const port_t CPU_PORT = 255;
 
 /* indicate INT by DSCP value */
-const bit<6> DSCP_INT = 0x17;
+const bit<6> DSCP_INT = 0x18;
 const bit<6> DSCP_MASK = 0x3F;
 
 //const bit<16> DST_PORT_INT = 6000;
