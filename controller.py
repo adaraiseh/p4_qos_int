@@ -48,7 +48,8 @@ class Controller:
         Compute forwarding entries based on shortest paths between hosts.
         """
         hosts = list(self.topo.get_hosts().keys())
-        dscp_list = ["0xEF", "0x18", "0x14", "0x00"]
+        #           EF(184), CS3(96), AF21(72), 00
+        dscp_list = ["0x2E", "0x18", "0x12", "0x00"]
 
         for src_host in hosts:
             for dst_host in hosts:

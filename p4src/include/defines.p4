@@ -26,10 +26,10 @@ typedef bit<16> next_hop_id_t;
 const port_t CPU_PORT = 255;
 
 /* indicate INT by DSCP value */
-const bit<6> DSCP_INT = 0x18;
-const bit<6> DSCP_MASK = 0x3F;
-
-//const bit<16> DST_PORT_INT = 6000;
+//const bit<6> DSCP_INT = 0x18;
+//const bit<6> DSCP_MASK = 0x3F;
+const bit<2> INT_ECN_BIT = 0x2;   // Using the most significant bit of the ECN field
+const bit<2> INT_ECN_MASK = 0x2;
 
 typedef bit<48> timestamp_t;
 typedef bit<32> switch_id_t;

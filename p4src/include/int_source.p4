@@ -53,8 +53,10 @@ control process_int_source (
         hdr.intl4_shim.int_type = 1;                            // int_type: Hop-by-hop type (1) , destination type (2), MX-type (3)
         hdr.intl4_shim.npt = 0;                                 // next protocol type: 0
         hdr.intl4_shim.len = INT_HEADER_WORD;                   // This is 3 from 0xC (INT_TOTAL_HEADER_SIZE >> 2)
-        hdr.intl4_shim.udp_ip_dscp = hdr.ipv4.dscp;             // although should be first 6 bits of the second byte
-        hdr.intl4_shim.udp_ip = 0;                              // although should be first 6 bits of the second byte
+        hdr.intl4_shim.udp_ip_dscp = hdr.ipv4.dscp;             // Store original DSCP value
+        hdr.intl4_shim.udp_ip_ecn = hdr.ipv4.ecn;               // Store original ECN bits
+        hdr.ipv4.ecn = hdr.ipv4.ecn | INT_ECN_BIT;              // Set INT bit in DSCP field
+        hdr.intl4_shim.rsvd2 = 0;
         
         // insert INT header
         hdr.int_header.setValid();
@@ -80,8 +82,6 @@ control process_int_source (
         if(hdr.udp.isValid()) {
             hdr.udp.length_ = hdr.udp.length_ + INT_TOTAL_HEADER_SIZE;
         }
-        
-        hdr.ipv4.dscp = DSCP_INT;
     }
 
     table tb_int_source {

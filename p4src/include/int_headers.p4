@@ -10,8 +10,9 @@ header intl4_shim_t {
     bit<2> npt;                     // Next protocol type
     bit<2> rsvd;                    // Reserved
     bit<8> len;                     // Length of INT Metadata header and INT stack in 4-byte words, not including the shim header (1 word)
-    bit<6> udp_ip_dscp;            // depends on npt field. either original dscp, ip protocol or udp dest port
-    bit<10> udp_ip;                // depends on npt field. either original dscp, ip protocol or udp dest port
+    bit<6> udp_ip_dscp;             // Original DSCP value (6 bits)
+    bit<2> udp_ip_ecn;              // Original ECN value (2 bits)
+    bit<8> rsvd2;                   // Reserved
 }
 
 const bit<16> INT_SHIM_HEADER_SIZE = 4;

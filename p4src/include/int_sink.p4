@@ -6,8 +6,9 @@ control process_int_sink (
     inout standard_metadata_t standard_metadata) {
 
     action int_sink() {
-        // restore original headers
-        hdr.ipv4.dscp = hdr.intl4_shim.udp_ip_dscp;
+        // Restore original DSCP value
+        //hdr.ipv4.dscp = hdr.intl4_shim.udp_ip_dscp;
+        hdr.ipv4.ecn = hdr.intl4_shim.udp_ip_ecn; 
         // restore length fields of IPv4 header and UDP header
         bit<16> len_bytes = (((bit<16>)hdr.intl4_shim.len) << 2) + INT_SHIM_HEADER_SIZE;
         hdr.ipv4.len = hdr.ipv4.len - len_bytes;
