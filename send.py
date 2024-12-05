@@ -16,7 +16,7 @@ def get_if():
     for i in get_if_list():
         if "eth0" in i:
             iface=i
-            break;
+            break
     if not iface:
         print("Cannot find eth0 interface")
         exit(1)
@@ -26,7 +26,7 @@ def main(args):
 
     addr = socket.gethostbyname(args.ip)
     iface = get_if()
-    tos = 0   # EF (184) , CS3 (96) , AF21 (72) , 00
+    tos = 184   # EF (184) , CS3 (96) , AF21 (72) , 00
     print("sending on interface %s to %s" % (iface, str(addr)))
     pkt =  Ether(src=get_if_hwaddr(iface), dst='ff:ff:ff:ff:ff:ff')
     if(args.l4 == 'tcp'):

@@ -27,8 +27,7 @@ control process_int_transit (
     action int_set_header_3() { //q_occupancy
         // TODO: Support egress queue ID
         hdr.int_q_occupancy.setValid();
-        hdr.int_q_occupancy.q_id =0;
-        // (bit<8>) standard_metadata.egress_qid;
+        hdr.int_q_occupancy.q_id = (bit<8>) standard_metadata.qid;
         hdr.int_q_occupancy.q_occupancy = (bit<24>) standard_metadata.deq_qdepth;
     }
   

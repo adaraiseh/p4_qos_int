@@ -34,14 +34,14 @@ control l3_forward(inout headers hdr,
     apply {
         if(hdr.ipv4.isValid()) {
             if (hdr.ipv4.dscp == 0x2E) { // EF
-                standard_metadata.priority = 0;
+                standard_metadata.priority = (bit<3>)3;
             } else if (hdr.ipv4.dscp == 0x18) { // CS3
-                standard_metadata.priority = 1;
+                standard_metadata.priority = (bit<3>)2;
             } else if (hdr.ipv4.dscp == 0x12 || hdr.ipv4.dscp == 0x14 || hdr.ipv4.dscp == 0x16) { // AF21, AF22, AF23
-                standard_metadata.priority = 2;
+                standard_metadata.priority = (bit<3>)1;
             } else {
                 // Best Effort (default priority)
-                standard_metadata.priority = 3;
+                standard_metadata.priority = (bit<3>)0;
             }
             ipv4_lpm.apply();
         }
@@ -81,16 +81,6 @@ control port_forward(inout headers hdr,
     }
 
     apply {
-        if (hdr.ipv4.dscp == 0x2E) { // EF
-            standard_metadata.priority = 0;
-        } else if (hdr.ipv4.dscp == 0x18) { // CS3
-            standard_metadata.priority = 1;
-        } else if (hdr.ipv4.dscp == 0x12 || hdr.ipv4.dscp == 0x14 || hdr.ipv4.dscp == 0x16) { // AF21, AF22, AF23
-            standard_metadata.priority = 2;
-        } else {
-            // Best Effort (default priority)
-            standard_metadata.priority = 3;
-        }
         tb_port_forward.apply();
      }
 }
