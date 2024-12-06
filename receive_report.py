@@ -128,6 +128,7 @@ def parse_metadata(int_pkt):
     for i in range(hop_count):
         metadata_source = int_metadata[i*hop_meta_len<<2:(i+1)*hop_meta_len<<2]
         meta = HopMetadata.from_bytes(metadata_source, instructions)
+        print(f"Switch ID: {meta.switch_id} TX Utilization (Percentage): {meta.egress_port_tx_util / 1e4:.2f}%")
         print(meta)
         hop_metadata.append(meta)
 
