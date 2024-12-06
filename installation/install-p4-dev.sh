@@ -23,11 +23,11 @@ USER_NAME=$(whoami)
 BUILD_DIR=~/p4-tools
 # number of cores
 NUM_CORES=`grep -c ^processor /proc/cpuinfo`
-DEBUG_FLAGS=true
-P4_RUNTIME=true
+DEBUG_FLAGS=false
+P4_RUNTIME=false
 SYSREPO=false   # Sysrepo prevents simple_switch_grpc from starting correctly
-FRROUTING=true
-DOCUMENTATION=true
+FRROUTING=false
+DOCUMENTATION=false
 
 # p4-utils branch 
 P4_UTILS_BRANCH="master"
@@ -296,12 +296,13 @@ function do_bmv2 {
     git checkout ${BMV2_COMMIT}
 
     # Apply the patch
-    if [ -f "../bmv2_tx_util.patch" ]; then
+    wget https://raw.githubusercontent.com/adaraiseh/p4_qos_int/refs/heads/main/installation/bmv2_tx_util.patch
+    if [ -f "bmv2_tx_util.patch" ]; then
         echo "Applying bmv2_tx_util.patch..."
-        git apply ../bmv2_tx_util.patch || { echo "Failed to apply patch"; exit 1; }
+        git apply bmv2_tx_util.patch || { echo "Failed to apply patch"; exit 1; }
         echo "Patch applied successfully."
     else
-        echo "Patch file not found: ../bmv2_tx_util.patch"
+        echo "Patch file not found: bmv2_tx_util.patch"
         exit 1
     fi
 
