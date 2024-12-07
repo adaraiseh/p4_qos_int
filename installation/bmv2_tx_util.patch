@@ -1,77 +1,110 @@
 diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
-index dcb597f..4cd5fcf 100644
+index dcb597f..7dc4beb 100644
 --- a/targets/simple_switch/simple_switch.cpp
 +++ b/targets/simple_switch/simple_switch.cpp
-@@ -644,6 +644,15 @@ void
+@@ -218,7 +218,8 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
+     }),
+     pre(new McSimplePreLAG()),
+     start(clock::now()),
+-    mirroring_sessions(new MirroringSessions()) {
++    mirroring_sessions(new MirroringSessions()),
++    dev_mgr(this) {
+   add_component<McSimplePreLAG>(pre);
+ 
+   add_required_field("standard_metadata", "ingress_port");
+@@ -644,6 +645,18 @@ void
  SimpleSwitch::egress_thread(size_t worker_id) {
    PHV *phv;
  
-+thread_local std::unordered_map<port_t, uint64_t> last_transmitted_bytes;
-+thread_local std::unordered_map<port_t, uint64_t> last_update_time_us;
++  thread_local std::unordered_map<port_t, uint64_t> last_transmitted_bytes;
++  thread_local std::unordered_map<port_t, uint64_t> last_update_time_us;
++  thread_local float updated_tx_utilization = 0;
++  // Smoothing historical utilization tracking
++  thread_local static std::unordered_map<port_t, float> historical_utilization;
++  constexpr float alpha = 0.3; // Smoothing factor
++  constexpr int UTILIZATION_SCALE = 1e6;
++  const uint64_t max_bandwidth_bps = 10 * 1e6; // 10 Mbps
 +
-+// Smoothing historical utilization tracking
-+thread_local static std::unordered_map<port_t, float> historical_utilization;
-+constexpr float alpha = 0.4; // Smoothing factor
-+constexpr int UTILIZATION_SCALE = 1e6;
-+const uint64_t max_bandwidth_bps = 10 * 1e6; // 10 Mbps
++  // Define a minimum time interval in microseconds (e.g., 50 ms)
++  const uint64_t MIN_TIME_INTERVAL_US = 50000; // 50 milliseconds
 +
    while (1) {
      std::unique_ptr<Packet> packet;
      size_t port;
-@@ -675,6 +684,56 @@ SimpleSwitch::egress_thread(size_t worker_id) {
+@@ -675,6 +688,64 @@ SimpleSwitch::egress_thread(size_t worker_id) {
      }
  
      phv->get_field("standard_metadata.egress_port").set(port);
 +    
-+    // TX Utilization Calculation
++    // Time-Based Trigger for Utilization Calculation
 +    uint64_t current_time_us = get_time_elapsed_us();
-+    auto port_stats = DevMgr::get_port_stats(port);
-+    uint64_t transmitted_bytes = port_stats.out_octets;
-+    
-+    // Calculate bytes transmitted and elapsed time since last update
-+    uint64_t last_bytes = last_transmitted_bytes[port];
 +    uint64_t last_time_us = last_update_time_us[port];
-+    
-+    // Sanity check for counter reset or anomaly
-+    if (transmitted_bytes < last_bytes) {
++    uint64_t time_since_last_update_us = current_time_us - last_time_us;
++    if (time_since_last_update_us >= MIN_TIME_INTERVAL_US) {
++      // Use the dev_mgr pointer to get port stats
++      auto port_stats = dev_mgr->get_port_stats(port);
++
++      uint64_t transmitted_bytes = port_stats.out_octets;
++
++      uint64_t last_bytes = last_transmitted_bytes[port];
++
++      // Sanity check for counter reset or anomaly
++      if (transmitted_bytes < last_bytes) {
 +        BMLOG_DEBUG("Bytes counter reset detected on port {}", port);
 +        last_bytes = 0; // Reset last bytes to prevent calculation issues
-+    }
-+    
-+    uint64_t bytes_diff = transmitted_bytes - last_bytes;
-+    uint64_t time_diff_us = current_time_us - last_time_us;
-+    
-+    // Logging for debugging
-+    BMLOG_DEBUG("Port {}: transmitted_bytes={}, last_bytes={}, bytes_diff={}",
-+        port, transmitted_bytes, last_bytes, bytes_diff);
-+    BMLOG_DEBUG("Port {}: current_time_us={}, last_time_us={}, time_diff_us={}",
-+        port, current_time_us, last_time_us, time_diff_us);
-+    
-+    if (time_diff_us > 0) {
++      }
++
++      uint64_t bytes_diff = transmitted_bytes - last_bytes;
++
++      // Logging for debugging
++      BMLOG_DEBUG("Port {}: transmitted_bytes={}, last_bytes={}, bytes_diff={}",
++          port, transmitted_bytes, last_bytes, bytes_diff);
++      BMLOG_DEBUG("Port {}: current_time_us={}, last_time_us={}, time_diff_us={}",
++          port, current_time_us, last_time_us, time_since_last_update_us);
++
++      if (time_since_last_update_us > 0) {
 +        // Calculate raw utilization
-+        float tx_utilization = (8.0 * bytes_diff * 1e6) / (time_diff_us * max_bandwidth_bps);
++        float tx_utilization = (8.0f * bytes_diff * 1e6f) / (static_cast<float>(time_since_last_update_us) * max_bandwidth_bps);
 +        tx_utilization = std::min(1.0f, tx_utilization);
-+        
++
 +        // Apply exponential moving average for smoothing
 +        float smooth_tx_utilization = 
 +            alpha * tx_utilization + 
-+            (1 - alpha) * historical_utilization[port];
++            (1.0f - alpha) * historical_utilization[port];
 +        historical_utilization[port] = smooth_tx_utilization;
-+        
++
 +        // Log the calculated utilization
 +        BMLOG_DEBUG("Port {}: TX utilization={} (smoothed: {}, scaled: {})",
 +            port, tx_utilization, smooth_tx_utilization, 
 +            static_cast<int>(smooth_tx_utilization * UTILIZATION_SCALE));
-+        
-+        // Attach smoothed TX utilization to metadata
-+        phv->get_field("queueing_metadata.tx_utilization").set(
-+            static_cast<int>(smooth_tx_utilization * UTILIZATION_SCALE)
-+        );
++
++        updated_tx_utilization = smooth_tx_utilization;
++
++        // Update the stored values
++        last_transmitted_bytes[port] = transmitted_bytes;
++        last_update_time_us[port] = current_time_us;
++      } else {
++        // Handle edge case where time_diff_us is zero
++        BMLOG_DEBUG("Port {}: time_diff_us is zero, skipping utilization update.", port);
++      }
 +    }
-+    
-+    // Update the stored values
-+    last_transmitted_bytes[port] = transmitted_bytes;
-+    last_update_time_us[port] = current_time_us;
++
++    // Attach smoothed TX utilization to metadata
++    phv->get_field("queueing_metadata.tx_utilization").set(
++        static_cast<int>(updated_tx_utilization * UTILIZATION_SCALE)
++    );
  
      Field &f_egress_spec = phv->get_field("standard_metadata.egress_spec");
      // When egress_spec == drop_port the packet will be dropped, thus
+diff --git a/targets/simple_switch/simple_switch.h b/targets/simple_switch/simple_switch.h
+index cdc751b..828c5d6 100644
+--- a/targets/simple_switch/simple_switch.h
++++ b/targets/simple_switch/simple_switch.h
+@@ -198,6 +198,7 @@ class SimpleSwitch : public Switch {
+   clock::time_point start;
+   bool with_queueing_metadata{false};
+   std::unique_ptr<MirroringSessions> mirroring_sessions;
++  bm::DevMgr* dev_mgr; // Pointer to the DevMgr instance
+ };
+ 
+ #endif  // SIMPLE_SWITCH_SIMPLE_SWITCH_H_
