@@ -45,19 +45,19 @@ def config_network(p4):
     # Connect hosts to ToR switches
     for i in range(tor_nodes):
         for j in range(2):  # Each ToR switch connects to 2 hosts
-            net.addLink(hosts[i * 2 + j], tor_switches[i], bw=1)
+            net.addLink(hosts[i * 2 + j], tor_switches[i], bw=10)
 
     # Connect ToR switches to Aggregate switches
     for i in range(4):  # Each Pod has 2 ToR switches and 2 Agg switches
         for tor in tor_switches[i * 2: i * 2 + 2]:
             for agg in agg_switches[i * 2: i * 2 + 2]:
-                net.addLink(tor, agg, bw=1)
+                net.addLink(tor, agg, bw=10)
 
     # Connect Aggregate switches to Core switches
     for i in range(4):  # Each Aggregate switch connects to all Core switches
         for agg in agg_switches[i * 2: i * 2 + 2]:
             for core in core_switches:
-                net.addLink(agg, core, bw=1)
+                net.addLink(agg, core, bw=10)
 
     # Assignment strategy
     net.mixed()
