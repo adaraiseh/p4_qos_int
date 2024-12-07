@@ -81,23 +81,31 @@ class Controller:
 
                     # Get egress port
                     egress_port = self.topo.node_to_node_port_num(sw_name, next_hop)
+                    port_smac = self.topo.node_to_node_mac(sw_name, next_hop)
 
+                    # Determine next_hop_mac, dst_prefix, and next_hop_ip
                     if next_hop == dst_host:
                         # Last hop to the host; use the host's MAC address
                         next_hop_mac = self.topo.get_host_mac(dst_host)
                         dst_prefix = f"{dst_ip}/32"
+                        next_hop_ip = dst_ip
                     else:
-                        # Transit node; set MAC address to zero
-                        next_hop_mac = "00:00:00:00:00:00"
+                        next_hop_mac = self.topo.node_to_node_mac(next_hop, sw_name)
                         dst_prefix = f"{dst_ip}/24"
-
+                        edge_data = self.net_graph.get_edge_data(sw_name, next_hop)
+                        #next_hop_ip = edge_data.get('ip', "0.0.0.0")  # Default to 0.0.0.0 if no IP is found
+                        next_hop_ip_with_prefix = self.topo.node_to_node_interface_ip(next_hop, sw_name)
+                        next_hop_ip = next_hop_ip_with_prefix.split('/')[0]
+                        
                     for dscp in dscp_list:
                         # Create forwarding entry
                         entry = {
                             'dst_prefix': dst_prefix,
                             'dscp': dscp,
                             'next_hop_mac': next_hop_mac,
-                            'egress_port': egress_port
+                            'egress_port': egress_port,
+                            'next_hop_ip': next_hop_ip,
+                            'port_smac': port_smac
                         }
 
                         if sw_name not in self.forwarding_entries:
@@ -106,6 +114,7 @@ class Controller:
                         # Avoid duplicates
                         if entry not in self.forwarding_entries[sw_name]:
                             self.forwarding_entries[sw_name].append(entry)
+
 
     def program_switches(self):
         """
@@ -119,14 +128,35 @@ class Controller:
             for entry in entries:
                 dst_prefix = entry['dst_prefix']
                 dscp = entry['dscp']
+                next_hop_ip = entry['next_hop_ip']
                 next_hop_mac = entry['next_hop_mac']
                 egress_port = entry['egress_port']
-
+                egress_port_hex = f"0x{egress_port:x}"
+                port_smac = entry['port_smac']
+                print(f"Adding entry: dst_prefix={dst_prefix}, dscp={dscp}, next_hop_mac={next_hop_mac}, "
+                f"egress_port={egress_port_hex}, next_hop_ip={next_hop_ip}, port_smac={port_smac}")
+                print("add LPM")
                 controller.table_add(
                     "l3_forward.ipv4_lpm",
                     "ipv4_forward",
                     [dst_prefix, dscp],
-                    [next_hop_mac, str(egress_port)]
+                    [next_hop_ip, str(egress_port)]
+                )
+
+                print("SWITCHING TABLE")
+                controller.table_add(
+                    "port_forward.switching_table",
+                    "set_dmac",
+                    [next_hop_ip],
+                    [next_hop_mac]
+                )
+
+                print("MAC REWRITE")
+                controller.table_add(
+                    "port_forward.mac_rewriting_table",
+                    "set_smac",
+                    [egress_port_hex],
+                    [port_smac]
                 )
 
     def print_paths(self):

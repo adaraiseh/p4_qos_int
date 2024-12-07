@@ -9,12 +9,11 @@ control l3_forward(inout headers hdr,
         mark_to_drop(standard_metadata);
     }
 
-    action ipv4_forward(mac_t dstAddr, port_t port) {
+    action ipv4_forward(ip_address_t nextHop, port_t port) {
         standard_metadata.egress_spec = port;
         standard_metadata.egress_port = port;
-        hdr.ethernet.src_addr = hdr.ethernet.dst_addr;
-        hdr.ethernet.dst_addr = dstAddr;
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+        local_metadata.routing.nhop_ipv4 = nextHop;
     }
 
     table ipv4_lpm {
@@ -53,34 +52,44 @@ control port_forward(inout headers hdr,
                        inout local_metadata_t local_metadata,
                        inout standard_metadata_t standard_metadata) {
 
-    action send_to_cpu() {
-        standard_metadata.egress_port = CPU_PORT;
-        standard_metadata.egress_spec = CPU_PORT;
-    }
-
-    action set_egress_port(port_t port) {
-        standard_metadata.egress_port = port;
-        standard_metadata.egress_spec = port;
-    }
-
     action drop(){
         mark_to_drop(standard_metadata);
     }
 
-    table tb_port_forward {
+    action set_dmac(mac_t mac) {
+        hdr.ethernet.dst_addr = mac;
+    }
+
+    action set_smac(mac_t mac) {
+        hdr.ethernet.src_addr = mac;
+    }
+
+    table switching_table {
         key = {
-            hdr.ipv4.dst_ipv4_addr: lpm;
-            hdr.ipv4.dscp: exact;
+            local_metadata.routing.nhop_ipv4 : exact;
         }
         actions = {
-            set_egress_port;
-            send_to_cpu;
+            set_dmac;
             drop;
+            NoAction;
         }
-        const default_action = drop();
+        default_action = NoAction();
+    }
+
+    table mac_rewriting_table {
+        key = {
+            standard_metadata.egress_spec: exact;
+        }
+        actions = {
+            set_smac;
+            drop;
+            NoAction;
+        }
+        default_action = NoAction();
     }
 
     apply {
-        tb_port_forward.apply();
-     }
+        switching_table.apply();
+        mac_rewriting_table.apply();
+    }
 }

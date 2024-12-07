@@ -195,11 +195,16 @@ struct int_metadata_t {
     bit<16> int_shim_len;
 }
 
+struct routing_metadata_t {
+    ip_address_t nhop_ipv4;
+}
+
 struct local_metadata_t {
     bit<16>       l4_src_port;
     bit<16>       l4_dst_port;
     int_metadata_t int_meta;
     preserving_metadata_t perserv_meta;
+    routing_metadata_t routing;
 }
 
 #endif

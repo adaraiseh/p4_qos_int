@@ -76,6 +76,8 @@ control MyEgress(inout headers hdr,
                 process_int_sink.apply(hdr, local_metadata, standard_metadata);
             }
         }
+
+        port_forward.apply(hdr, local_metadata, standard_metadata);
     }
 }
 
