@@ -211,8 +211,9 @@ class Collector:
             # egress_tx_utils
             if ins_map & EGRESS_PORT_TX_UTIL_BIT:
                 tx_util = int.from_bytes(hop_metadata.read(4), byteorder='big')
-                tx_util_normalized = round(tx_util / 10**4, 2)
-                flow_info.egress_tx_utils.append(tx_util_normalized)
+                #tx_util_normalized = round(tx_util / 10**4, 2)
+                #print("normailized tx util", tx_util_normalized)
+                flow_info.egress_tx_utils.append(tx_util)
 
     def parser_int_pkt(self,pkt):
         if INTREP not in pkt:

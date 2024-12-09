@@ -1,0 +1,51 @@
+diff --git a/p4utils/mininetlib/network_API.py b/p4utils/mininetlib/network_API.py
+index e6a3c62..836b4df 100644
+--- a/p4utils/mininetlib/network_API.py
++++ b/p4utils/mininetlib/network_API.py
+@@ -2229,6 +2229,17 @@ class NetworkAPI(Topo):
+         else:
+             raise Exception('"{}" is not a P4 switch.'.format(name))
+ 
++    def setMaxLinkBW(self, name, linkBW):
++        """Sets the *queue_num* for the ports of the P4 switch.
++        Args:
++            name (str): P4 switch name
++            queue_num (int): Number of priority queues for each port
++        """
++        if self.isP4Switch(name):
++            self.updateNode(name, max_link_bw=linkBW)
++        else:
++            raise Exception('"{}" is not a P4 switch.'.format(name))
++
+     def enableDebugger(self, name):
+         """Enables debugger for the P4 switch.
+ 
+diff --git a/p4utils/mininetlib/node.py b/p4utils/mininetlib/node.py
+index 571f4a6..05187c2 100644
+--- a/p4utils/mininetlib/node.py
++++ b/p4utils/mininetlib/node.py
+@@ -117,6 +117,7 @@ class P4Switch(Switch):
+                  log_dir='/tmp',
+                  enable_debugger=False,
+                  priority_queues_num=1,
++                 max_link_bw=10,
+                  **kwargs):
+ 
+         if isinstance(device_id, int):
+@@ -131,6 +132,7 @@ class P4Switch(Switch):
+         self.set_binary(sw_bin)
+         self.set_json(json_path)
+         self.priority_queues_num = priority_queues_num
++        self.max_link_bw = max_link_bw
+         self.pcap_dir = pcap_dir
+         self.pcap_dump = pcap_dump
+         self.enable_debugger = enable_debugger
+@@ -227,6 +229,8 @@ class P4Switch(Switch):
+         args = []
+         if self.priority_queues_num and int(self.priority_queues_num) > 1:
+             args.extend(['--priority-queues', str(self.priority_queues_num)])
++        if self.max_link_bw and int(self.max_link_bw) > 0:
++            args.extend(['--max-link-bw', str(self.max_link_bw)])
+         return args
+ 
+     def start(self, controllers=None):

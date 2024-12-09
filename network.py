@@ -16,6 +16,10 @@ def config_network(p4):
     agg_nodes = 4
     core_nodes = 2
 
+    host_tor_bw = 1
+    tor_agg_bw = 10
+    agg_core_bw = 10
+
     # Hosts
     hosts = []
     for i in range(1, host_nodes + 1):
@@ -25,47 +29,53 @@ def config_network(p4):
     # ToR (Edge) switches
     tor_switches = []
     for i in range(1, tor_nodes + 1):
-        tor_switch = net.addP4Switch(f't{i}', priority_queues_num=4, cli_input=default_rule + f't{i}-commands.txt')
+        tor_switch = net.addP4Switch(f't{i}', priority_queues_num=4,
+                                     max_link_bw=host_tor_bw,
+                                     cli_input=default_rule + f't{i}-commands.txt')
         tor_switches.append(tor_switch)
 
     # Aggregate switches
     agg_switches = []
     for i in range(1, agg_nodes + 1):
-        agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=4, cli_input=default_rule + f'a{i}-commands.txt')
+        agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=4,
+                                     max_link_bw=tor_agg_bw,
+                                     cli_input=default_rule + f'a{i}-commands.txt')
         agg_switches.append(agg_switch)
 
     # Core switches
     core_switches = []
     for i in range(1, core_nodes + 1):
-        core_switch = net.addP4Switch(f'c{i}', priority_queues_num=4, cli_input=default_rule + f'c{i}-commands.txt')
+        core_switch = net.addP4Switch(f'c{i}', priority_queues_num=4,
+                                      max_link_bw=agg_core_bw,
+                                      cli_input=default_rule + f'c{i}-commands.txt')
         core_switches.append(core_switch)
 
     net.setP4SourceAll(p4)
-    # Add links with 1 Mbps bandwidth
+    # Add links with 10 Mbps bandwidth
     # Connect hosts to ToR switches
     for i in range(tor_nodes):
         for j in range(2):  # Each ToR switch connects to 2 hosts
-            net.addLink(hosts[i * 2 + j], tor_switches[i], bw=10)
+            net.addLink(hosts[i * 2 + j], tor_switches[i], bw=host_tor_bw)
 
     # Connect ToR switches to Aggregate switches
     for i in range(4):  # Each Pod has 2 ToR switches and 2 Agg switches
         for tor in tor_switches[i * 2: i * 2 + 2]:
             for agg in agg_switches[i * 2: i * 2 + 2]:
-                net.addLink(tor, agg, bw=10)
+                net.addLink(tor, agg, bw=tor_agg_bw)
 
     # Connect Aggregate switches to Core switches
     for i in range(4):  # Each Aggregate switch connects to all Core switches
         for agg in agg_switches[i * 2: i * 2 + 2]:
             for core in core_switches:
-                net.addLink(agg, core, bw=10)
+                net.addLink(agg, core, bw=agg_core_bw)
 
     # Assignment strategy
     net.mixed()
 
     # Nodes general options
-    net.enableCpuPortAll()
-    net.enablePcapDumpAll()
-    net.enableLogAll()
+    #net.enableCpuPortAll()
+    #net.enablePcapDumpAll()
+    #net.enableLogAll()
 
     return net
 

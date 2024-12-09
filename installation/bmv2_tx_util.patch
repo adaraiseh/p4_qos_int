@@ -1,8 +1,56 @@
+diff --git a/targets/simple_switch/main.cpp b/targets/simple_switch/main.cpp
+index 53a8bfd..0bfc0d7 100644
+--- a/targets/simple_switch/main.cpp
++++ b/targets/simple_switch/main.cpp
+@@ -49,6 +49,9 @@ main(int argc, char* argv[]) {
+   simple_switch_parser.add_uint_option(
+       "priority-queues",
+       "Number of priority queues (default is 1)");
++  simple_switch_parser.add_uint_option(
++      "max-link-bw",
++      "The max link bandwidth used in mininet (default is 10)");
+ 
+   bm::OptionsParser parser;
+   parser.parse(argc, argv, &simple_switch_parser);
+@@ -78,8 +81,17 @@ main(int argc, char* argv[]) {
+       std::exit(1);
+   }
+ 
++  uint32_t max_link_bw = 0xffffffff;
++  {
++    auto rc = simple_switch_parser.get_uint_option("max-link-bw", &max_link_bw);
++    if (rc == bm::TargetParserBasic::ReturnCode::OPTION_NOT_PROVIDED)
++      max_link_bw = SimpleSwitch::default_max_link_bw;
++    else if (rc != bm::TargetParserBasic::ReturnCode::SUCCESS)
++      std::exit(1);
++  }
++
+   simple_switch = new SimpleSwitch(enable_swap_flag, drop_port,
+-                                   priority_queues);
++                                   priority_queues, max_link_bw);
+ 
+   int status = simple_switch->init_from_options_parser(parser);
+   if (status != 0) std::exit(status);
 diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
-index dcb597f..eea3247 100644
+index dcb597f..ce7d889 100644
 --- a/targets/simple_switch/simple_switch.cpp
 +++ b/targets/simple_switch/simple_switch.cpp
-@@ -218,7 +218,8 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
+@@ -199,12 +199,13 @@ class SimpleSwitch::InputBuffer {
+ };
+ 
+ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
+-                           size_t nb_queues_per_port)
++                           size_t nb_queues_per_port, size_t max_link_bw)
+   : Switch(enable_swap),
+     drop_port(drop_port),
+     input_buffer(new InputBuffer(
+         1024 /* normal capacity */, 1024 /* resubmit/recirc capacity */)),
+     nb_queues_per_port(nb_queues_per_port),
++    max_link_bw(max_link_bw),
+     egress_buffers(nb_egress_threads,
+                    64, EgressThreadMapper(nb_egress_threads),
+                    nb_queues_per_port),
+@@ -218,7 +219,8 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
      }),
      pre(new McSimplePreLAG()),
      start(clock::now()),
@@ -12,7 +60,7 @@ index dcb597f..eea3247 100644
    add_component<McSimplePreLAG>(pre);
  
    add_required_field("standard_metadata", "ingress_port");
-@@ -397,7 +398,8 @@ SimpleSwitch::transmit_thread() {
+@@ -397,7 +399,8 @@ SimpleSwitch::transmit_thread() {
  
  ts_res
  SimpleSwitch::get_ts() const {
@@ -22,7 +70,7 @@ index dcb597f..eea3247 100644
  }
  
  void
-@@ -644,6 +646,18 @@ void
+@@ -644,6 +647,18 @@ void
  SimpleSwitch::egress_thread(size_t worker_id) {
    PHV *phv;
  
@@ -33,7 +81,7 @@ index dcb597f..eea3247 100644
 +  thread_local static std::unordered_map<port_t, float> historical_utilization;
 +  constexpr float alpha = 0.3; // Smoothing factor
 +  constexpr int UTILIZATION_SCALE = 1e6;
-+  const uint64_t max_bandwidth_bps = 10 * 1e6; // 10 Mbps
++  const uint64_t max_bandwidth_bps = max_link_bw * 1e6; // Mbps
 +
 +  // Define a minimum time interval in microseconds (e.g., 50 ms)
 +  const uint64_t MIN_TIME_INTERVAL_US = 50000; // 50 milliseconds
@@ -41,7 +89,7 @@ index dcb597f..eea3247 100644
    while (1) {
      std::unique_ptr<Packet> packet;
      size_t port;
-@@ -675,6 +689,64 @@ SimpleSwitch::egress_thread(size_t worker_id) {
+@@ -675,6 +690,64 @@ SimpleSwitch::egress_thread(size_t worker_id) {
      }
  
      phv->get_field("standard_metadata.egress_port").set(port);
@@ -107,10 +155,36 @@ index dcb597f..eea3247 100644
      Field &f_egress_spec = phv->get_field("standard_metadata.egress_spec");
      // When egress_spec == drop_port the packet will be dropped, thus
 diff --git a/targets/simple_switch/simple_switch.h b/targets/simple_switch/simple_switch.h
-index cdc751b..828c5d6 100644
+index cdc751b..444a9d6 100644
 --- a/targets/simple_switch/simple_switch.h
 +++ b/targets/simple_switch/simple_switch.h
-@@ -198,6 +198,7 @@ class SimpleSwitch : public Switch {
+@@ -75,6 +75,7 @@ class SimpleSwitch : public Switch {
+ 
+   static constexpr port_t default_drop_port = 511;
+   static constexpr size_t default_nb_queues_per_port = 1;
++  static constexpr size_t default_max_link_bw = 10;
+ 
+  private:
+   using clock = std::chrono::high_resolution_clock;
+@@ -83,7 +84,8 @@ class SimpleSwitch : public Switch {
+   // by default, swapping is off
+   explicit SimpleSwitch(bool enable_swap = false,
+                         port_t drop_port = default_drop_port,
+-                        size_t nb_queues_per_port = default_nb_queues_per_port);
++                        size_t nb_queues_per_port = default_nb_queues_per_port,
++                        size_t max_link_bw = default_max_link_bw);
+ 
+   ~SimpleSwitch();
+ 
+@@ -190,6 +192,7 @@ class SimpleSwitch : public Switch {
+   // for these queues, the write operation is non-blocking and we drop the
+   // packet if the queue is full
+   size_t nb_queues_per_port;
++  size_t max_link_bw;
+   bm::QueueingLogicPriRL<std::unique_ptr<Packet>, EgressThreadMapper>
+   egress_buffers;
+   Queue<std::unique_ptr<Packet> > output_buffer;
+@@ -198,6 +201,7 @@ class SimpleSwitch : public Switch {
    clock::time_point start;
    bool with_queueing_metadata{false};
    std::unique_ptr<MirroringSessions> mirroring_sessions;
@@ -118,3 +192,79 @@ index cdc751b..828c5d6 100644
  };
  
  #endif  // SIMPLE_SWITCH_SIMPLE_SWITCH_H_
+diff --git a/targets/simple_switch_grpc/main.cpp b/targets/simple_switch_grpc/main.cpp
+index 9e87fdf..2f4c7c3 100644
+--- a/targets/simple_switch_grpc/main.cpp
++++ b/targets/simple_switch_grpc/main.cpp
+@@ -81,6 +81,9 @@ main(int argc, char* argv[]) {
+   simple_switch_parser.add_uint_option(
+     "priority-queues",
+     "Number of priority queues (default is 1)");
++  simple_switch_parser.add_uint_option(
++    "max-link-bw",
++    "Max link bandwidth used in mininet (default is 10)");
+ 
+   bm::OptionsParser parser;
+   parser.parse(argc, argv, &simple_switch_parser);
+@@ -227,6 +230,15 @@ main(int argc, char* argv[]) {
+       std::exit(1);
+   }
+ 
++  uint32_t max_link_bw = 0xffffffff;
++  {
++    auto rc = simple_switch_parser.get_uint_option("max-link-bw", &max_link_bw);
++    if (rc == bm::TargetParserBasic::ReturnCode::OPTION_NOT_PROVIDED)
++      max_link_bw = sswitch_grpc::SimpleSwitchGrpcRunner::default_max_link_bw;
++    else if (rc != bm::TargetParserBasic::ReturnCode::SUCCESS)
++      std::exit(1);
++  }
++
+   auto &runner = sswitch_grpc::SimpleSwitchGrpcRunner::get_instance(
+       !disable_swap_flag,
+       grpc_server_addr,
+diff --git a/targets/simple_switch_grpc/switch_runner.cpp b/targets/simple_switch_grpc/switch_runner.cpp
+index 6824d68..b9496e3 100644
+--- a/targets/simple_switch_grpc/switch_runner.cpp
++++ b/targets/simple_switch_grpc/switch_runner.cpp
+@@ -501,9 +501,10 @@ SimpleSwitchGrpcRunner::SimpleSwitchGrpcRunner(
+     std::string dp_grpc_server_addr,
+     bm::DevMgrIface::port_t drop_port,
+     std::shared_ptr<SSLOptions> ssl_options,
++    size_t max_link_bw,
+     size_t nb_queues_per_port)
+     : simple_switch(new SimpleSwitch(enable_swap, drop_port,
+-                                     nb_queues_per_port)),
++                                     nb_queues_per_port, max_link_bw)),
+       grpc_server_addr(grpc_server_addr), cpu_port(cpu_port),
+       dp_grpc_server_addr(dp_grpc_server_addr),
+       dp_service(nullptr),
+diff --git a/targets/simple_switch_grpc/switch_runner.h b/targets/simple_switch_grpc/switch_runner.h
+index ca52df4..acf0cb5 100644
+--- a/targets/simple_switch_grpc/switch_runner.h
++++ b/targets/simple_switch_grpc/switch_runner.h
+@@ -53,6 +53,7 @@ class SimpleSwitchGrpcRunner {
+  public:
+   static constexpr bm::DevMgrIface::port_t default_drop_port = 511;
+   static constexpr size_t default_nb_queues_per_port = 1;
++  static constexpr size_t default_max_link_bw = 10;
+ 
+   // there is no real need for a singleton here, except for the fact that we use
+   // PIGrpcServerRunAddr, ... which uses static state
+@@ -63,6 +64,7 @@ class SimpleSwitchGrpcRunner {
+       std::string dp_grpc_server_addr = "",
+       bm::DevMgrIface::port_t drop_port = default_drop_port,
+       std::shared_ptr<SSLOptions> ssl_options = nullptr,
++      size_t max_link_bw = default_max_link_bw,
+       size_t nb_queues_per_port = default_nb_queues_per_port) {
+     static SimpleSwitchGrpcRunner instance(
+         enable_swap, grpc_server_addr, cpu_port, dp_grpc_server_addr,
+@@ -87,7 +89,8 @@ class SimpleSwitchGrpcRunner {
+                          bm::DevMgrIface::port_t drop_port = default_drop_port,
+                          std::shared_ptr<SSLOptions> ssl_options = nullptr,
+                          size_t nb_queues_per_port =
+-                             default_nb_queues_per_port);
++                             default_nb_queues_per_port,
++                         size_t max_link_bw = default_max_link_bw);
+   ~SimpleSwitchGrpcRunner();
+ 
+   void port_status_cb(bm::DevMgrIface::port_t port,

@@ -31,7 +31,7 @@ DOCUMENTATION=false
 
 # p4-utils branch 
 P4_UTILS_BRANCH="master"
-
+P4_UTILS_COMMIT="83b118bbae530b31cc74e7fa32f9174f7c0a1184"
 # Software versions
 
 # PI dependencies from https://github.com/p4lang/PI#dependencies
@@ -710,7 +710,18 @@ function do_p4-utils {
     cd p4-utils
 
     # TODO: should be removed
-    git checkout ${P4_UTILS_BRANCH}
+    git checkout ${P4_UTILS_COMMIT}
+
+    # Apply the patch
+    wget https://raw.githubusercontent.com/adaraiseh/p4_qos_int/refs/heads/main/installation/p4utils.patch
+    if [ -f "p4utils.patch" ]; then
+        echo "Applying p4utils.patch..."
+        git apply p4utils.patch || { echo "Failed to apply patch"; exit 1; }
+        echo "Patch applied successfully."
+    else
+        echo "Patch file not found: p4utils.patch"
+        exit 1
+    fi
 
     # Build p4-utils    
     sudo ./install.sh
