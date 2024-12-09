@@ -568,6 +568,10 @@ function do_p4c {
         }' "$input_file"
     fi
 
+    # Change ingress_global_timestamp and egress_global_timestamp to 64-bit
+    sed -i '/@alias("intrinsic_metadata.ingress_global_timestamp")/,+1s/bit<48>/bit<64>/' "$input_file"
+    sed -i '/@alias("intrinsic_metadata.egress_global_timestamp")/,+1s/bit<48>/bit<64>/' "$input_file"
+
     # copies it to: /usr/local/share/p4c/p4include/
     dst_folder="/usr/local/share/p4c/p4include/"
     sudo cp "$input_file" "$dst_folder"

@@ -1,5 +1,5 @@
 diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
-index dcb597f..7dc4beb 100644
+index dcb597f..eea3247 100644
 --- a/targets/simple_switch/simple_switch.cpp
 +++ b/targets/simple_switch/simple_switch.cpp
 @@ -218,7 +218,8 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
@@ -12,7 +12,17 @@ index dcb597f..7dc4beb 100644
    add_component<McSimplePreLAG>(pre);
  
    add_required_field("standard_metadata", "ingress_port");
-@@ -644,6 +645,18 @@ void
+@@ -397,7 +398,8 @@ SimpleSwitch::transmit_thread() {
+ 
+ ts_res
+ SimpleSwitch::get_ts() const {
+-  return duration_cast<ts_res>(clock::now() - start);
++    auto now = std::chrono::system_clock::now();
++    return std::chrono::duration_cast<ts_res>(now.time_since_epoch());
+ }
+ 
+ void
+@@ -644,6 +646,18 @@ void
  SimpleSwitch::egress_thread(size_t worker_id) {
    PHV *phv;
  
@@ -31,7 +41,7 @@ index dcb597f..7dc4beb 100644
    while (1) {
      std::unique_ptr<Packet> packet;
      size_t port;
-@@ -675,6 +688,64 @@ SimpleSwitch::egress_thread(size_t worker_id) {
+@@ -675,6 +689,64 @@ SimpleSwitch::egress_thread(size_t worker_id) {
      }
  
      phv->get_field("standard_metadata.egress_port").set(port);

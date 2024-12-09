@@ -2,7 +2,7 @@
 
 import sys
 from scapy.all import sniff
-from colllector import *
+from collector import *
 
 def handle_pkt(pkt,c):
     if INTREP in pkt :

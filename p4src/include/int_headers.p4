@@ -174,8 +174,8 @@ struct preserving_metadata_t {
     @field_list(CLONE_FL_1)
     bit<19> deq_qdepth;
     @field_list(CLONE_FL_1)
-    bit<48> ingress_global_timestamp;
-    bit<48> egress_global_timestamp;
+    bit<64> ingress_global_timestamp;
+    bit<64> egress_global_timestamp;
     bit<32> lf_field_list;
     bit<16> mcast_grp;
     bit<32> resubmit_flag;

@@ -6,6 +6,8 @@ import time
 from scapy.all import Packet
 from scapy.all import BitField,ShortField
 from scapy.layers.inet import Ether,IP, TCP, UDP, bind_layers
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 class INTREP(Packet):
     name = "INT Report Header v2.0"
@@ -141,9 +143,12 @@ class FlowInfo():
         pass
 
 
-class Collector():
-    def __init__(self,influx_client) -> None:
+class Collector:
+    def __init__(self, influx_client, org, bucket):
         self.influx_client = influx_client
+        self.write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+        self.org = org
+        self.bucket = bucket
 
     def parse_flow_info(self,flow_info,ip_pkt):
         flow_info.src_ip = ip_pkt.src
@@ -198,13 +203,16 @@ class Collector():
             # egress_tstamps
             if ins_map & EGRESS_TSTAMP_BIT:
                 flow_info.egress_tstamps.append(int.from_bytes(hop_metadata.read(8), byteorder='big'))
+
             # l2_ingress_ports and l2_egress_ports
             if ins_map & L2_PORT_IDS_BIT:
                 flow_info.l2_ingress_ports.append(int.from_bytes(hop_metadata.read(4), byteorder='big'))
                 flow_info.l2_egress_ports.append(int.from_bytes(hop_metadata.read(4), byteorder='big'))
             # egress_tx_utils
             if ins_map & EGRESS_PORT_TX_UTIL_BIT:
-                flow_info.egress_tx_utils.append(int.from_bytes(hop_metadata.read(4), byteorder='big'))
+                tx_util = int.from_bytes(hop_metadata.read(4), byteorder='big')
+                tx_util_normalized = round(tx_util / 10**4, 2)
+                flow_info.egress_tx_utils.append(tx_util_normalized)
 
     def parser_int_pkt(self,pkt):
         if INTREP not in pkt:
@@ -222,74 +230,65 @@ class Collector():
 
         return flow_info
 
-    def export_influxdb(self,flow_info):
-        if self.influx_client is None:
-            print("collector.influx_client is Uninitialized")
-            sys.exit(0)
-        
+    def export_influxdb(self, flow_info):
         if not flow_info:
             return
-        
-        metric_timestamp = int(time.time()*1000000000)
-        metrics = []
+
+        points = []
+
+        # Add flow-level latency data if available
         if flow_info.flow_latency:
-            metrics.append({
-                    'measurement': 'flow_latency',
-                    'tags': {
-                        'src_ip': str(flow_info.src_ip),
-                        'dst_ip': str(flow_info.dst_ip),
-                        'src_port': flow_info.src_port,
-                        'dst_port': flow_info.dst_port,
-                        'protocol': flow_info.ip_proto
-                    },
-                    'time': metric_timestamp,
-                    'fields': {
-                        'value': flow_info.flow_latency
-                    }
-                })
+            points.append(
+                Point("flow_latency")
+                .tag("src_ip", str(flow_info.src_ip))
+                .tag("dst_ip", str(flow_info.dst_ip))
+                .tag("src_port", flow_info.src_port)
+                .tag("dst_port", flow_info.dst_port)
+                .tag("protocol", flow_info.ip_proto)
+                .field("value", flow_info.flow_latency)
+                .time(int(time.time() * 1_000_000_000))  # Current time in nanoseconds
+            )
 
-        if len(flow_info.switch_ids) > 0 and len(flow_info.egress_tstamps) > 0 and len(flow_info.hop_latencies) > 0:
-            for i in range(flow_info.hop_cnt):
-                metrics.append({
-                    'measurement': 'switch_latency',
-                    'tags': {
-                        'switch_id': flow_info.switch_ids[i]
-                    },
-                    'time': flow_info.egress_tstamps[i]*1000,
-                    'fields': {
-                        'value': flow_info.hop_latencies[i]
-                    }
-                })
+        # Add per-hop latency and TX utilization data
+        for i in range(flow_info.hop_cnt):
+            points.append(
+                Point("switch_latency")
+                .tag("switch_id", flow_info.switch_ids[i])
+                .field("value", flow_info.hop_latencies[i])
+                .time(flow_info.egress_tstamps[i] * 1000) 
+            )
+            points.append(
+                Point("tx_utilization")
+                .tag("switch_id", flow_info.switch_ids[i])
+                .field("value", round(flow_info.egress_tx_utils[i] / 10**4, 2))  # Normalize to 2 decimal places
+                .time(flow_info.egress_tstamps[i] * 1000)
+            )
 
+        # Add queue occupancy data
+        for i in range(flow_info.hop_cnt):
+            points.append(
+                Point("queue_occupancy")
+                .tag("switch_id", flow_info.switch_ids[i])
+                .tag("queue_id", flow_info.queue_ids[i])
+                .field("value", flow_info.queue_occups[i])
+                .time(flow_info.egress_tstamps[i] * 1000)
+            )
 
-        if len(flow_info.switch_ids) > 0 and len(flow_info.queue_ids) > 0:
-            for i in range(flow_info.hop_cnt):
-                metrics.append({
-                    'measurement': 'queue_occupancy',
-                    'tags': {
-                        'switch_id': flow_info.switch_ids[i],
-                        'queue_id': flow_info.queue_ids[i]
-                    },
-                    'time': flow_info.egress_tstamps[i]*1000,
-                    'fields': {
-                        'value': flow_info.queue_occups[i]
-                    }
-                })
+        # Add link latency data
+        for i in range(flow_info.hop_cnt - 1):
+            points.append(
+                Point("link_latency")
+                .tag("egress_switch_id", flow_info.switch_ids[i + 1])
+                .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
+                .tag("ingress_switch_id", flow_info.switch_ids[i])
+                .tag("ingress_port_id", flow_info.l1_ingress_ports[i])
+                .field("value", abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i])) # value in microseconds
+                .time(int(time.time() * 1_000_000_000))  # Current time in nanoseconds
+            )
 
-        if len(flow_info.switch_ids) > 0 and len(flow_info.l1_egress_ports) > 0 and len(flow_info.l1_ingress_ports) > 0:
-            for i in range(flow_info.hop_cnt - 1):
-                metrics.append({
-                    'measurement': 'link_latency',
-                    'tags': {
-                        'egress_switch_id': flow_info.switch_ids[i+1],
-                        'egress_port_id': flow_info.l1_egress_ports[i+1],
-                        'ingress_switch_id': flow_info.switch_ids[i],
-                        'ingress_port_id': flow_info.l1_ingress_ports[i]
-                    },
-                    'time': metric_timestamp,
-                    'fields': {
-                        'value': abs(flow_info.egress_tstamps[i+1] - flow_info.ingress_tstamps[i])
-                    }
-                })
-        
-        self.influx_client.write_points(points=metrics, protocol="json")
+        # Write all points to InfluxDB
+        try:
+            self.write_api.write(bucket=self.bucket, org=self.org, record=points)
+            print(f"Successfully wrote {len(points)} points to InfluxDB")
+        except Exception as e:
+            print(f"Failed to write data to InfluxDB: {e}")
