@@ -6,7 +6,7 @@ import time
 from scapy.all import Packet
 from scapy.all import BitField,ShortField
 from scapy.layers.inet import Ether,IP, TCP, UDP, bind_layers
-from influxdb_client import InfluxDBClient, Point
+from influxdb_client import Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 class INTREP(Packet):
@@ -290,6 +290,6 @@ class Collector:
         # Write all points to InfluxDB
         try:
             self.write_api.write(bucket=self.bucket, org=self.org, record=points)
-            print(f"Successfully wrote {len(points)} points to InfluxDB")
+            #print(f"Successfully wrote {len(points)} points to InfluxDB")
         except Exception as e:
             print(f"Failed to write data to InfluxDB: {e}")

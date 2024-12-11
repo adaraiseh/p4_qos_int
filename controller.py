@@ -92,8 +92,6 @@ class Controller:
                     else:
                         next_hop_mac = self.topo.node_to_node_mac(next_hop, sw_name)
                         dst_prefix = f"{dst_ip}/24"
-                        edge_data = self.net_graph.get_edge_data(sw_name, next_hop)
-                        #next_hop_ip = edge_data.get('ip', "0.0.0.0")  # Default to 0.0.0.0 if no IP is found
                         next_hop_ip_with_prefix = self.topo.node_to_node_interface_ip(next_hop, sw_name)
                         next_hop_ip = next_hop_ip_with_prefix.split('/')[0]
                         
@@ -124,7 +122,7 @@ class Controller:
             controller = self.controllers[sw_name]
 
             controller.table_set_default("l3_forward.ipv4_lpm", "drop")
-
+            #controller.set_queue_rate(1000)
             for entry in entries:
                 dst_prefix = entry['dst_prefix']
                 dscp = entry['dscp']

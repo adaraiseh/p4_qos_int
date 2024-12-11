@@ -315,7 +315,7 @@ function do_bmv2 {
     elif [ "$DEBUG_FLAGS" = false ] && [ "$P4_RUNTIME" = true ]; then
         ./configure --with-pi --without-nanomsg --disable-elogger --disable-logging-macros 'CFLAGS=-g -O2' 'CXXFLAGS=-g -O2'
     else
-        ./configure --without-nanomsg --disable-elogger --disable-logging-macros 'CFLAGS=-g -O2' 'CXXFLAGS=-g -O2'
+        ./configure --with-thrift --without-nanomsg --disable-logging-macros --disable-elogger 'CXXFLAGS=-g -O3' 'CFLAGS=-g -O3'
     fi
     make -j${NUM_CORES}
     sudo make install
