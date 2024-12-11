@@ -26,17 +26,22 @@ def main(args):
 
     addr = socket.gethostbyname(args.ip)
     iface = get_if()
-    tos = 184   # EF (184) , CS3 (96) , AF21 (72) , 00
-    print("sending on interface %s to %s" % (iface, str(addr)))
+    #tos = 184   # EF (184) , CS3 (96) , AF21 (72) , 00
+    #print("sending on interface %s to %s" % (iface, str(addr)))
     pkt =  Ether(src=get_if_hwaddr(iface), dst='ff:ff:ff:ff:ff:ff')
     if(args.l4 == 'tcp'):
-        pkt = pkt /IP(dst=addr, tos=tos) / TCP(dport=args.port, sport=random.randint(49152,65535)) / args.m
+        pkt = pkt /IP(dst=addr, tos=args.tos) / TCP(dport=args.port, sport=random.randint(49152,65535)) / args.m
     if(args.l4 == 'udp'):
-        pkt = pkt /IP(dst=addr, tos=tos) / UDP(dport=int(args.port), sport=random.randint(49152,65535)) / args.m
-    pkt.show2()
-    for i in range(args.c):
-        sendp(pkt, iface=iface, verbose=False)
-        sleep(1)
+        pkt = pkt /IP(dst=addr, tos=args.tos) / UDP(dport=int(args.port), sport=random.randint(49152,65535)) / args.m
+    #pkt.show2()
+    if args.c == 0:
+        while(True):
+            sendp(pkt, iface=iface, verbose=False)
+            sleep(0.4)
+    else:
+        for i in range(args.c):
+            sendp(pkt, iface=iface, verbose=False)
+            sleep(0.4)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='receiver parser')
@@ -49,6 +54,8 @@ if __name__ == '__main__':
                         action="store", required=True)
     parser.add_argument('--l4', help="layer 4 proto (tcp or udp)",
                         type=str, action="store", required=True)
+    parser.add_argument('--tos', help="Type of Service (DSCP in decimal)",
+                        type=int, action="store", required=True)
     parser.add_argument('--m', help="message", type=str,
                         action='store', required=False, default="")     
     args = parser.parse_args()

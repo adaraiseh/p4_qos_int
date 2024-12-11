@@ -174,6 +174,7 @@ class Controller:
                 print(f"  {entry}")
 
 
+'''
 if __name__ == "__main__":
     controller = Controller()
     print("\n\nSUMMARY:")
@@ -181,3 +182,4 @@ if __name__ == "__main__":
     controller.print_paths()  # Print the stored paths
     print("\nP4 Table Entries:")
     controller.print_forwarding_entries()  # Print forwarding entries
+'''

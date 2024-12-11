@@ -1,5 +1,6 @@
 import argparse
 from p4utils.mininetlib.network_API import NetworkAPI
+from controller import *
 
 default_rule = 'rules/test/'
 
@@ -8,7 +9,7 @@ def config_network(p4):
 
     # Network general options
     net.setLogLevel('info')
-    net.enableCli()
+    net.disableCli()
 
     # Network definition
     host_nodes = 8
@@ -71,6 +72,11 @@ def config_network(p4):
 
     # Assignment strategy
     net.mixed()
+    net.addTask("h8", "python3 receive.py", 2, 0, True)
+    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 184 --m "ToS is 184" --c 0', 2.1, 0, True)
+    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 96 --m "ToS is 96" --c 0', 2.2, 0, True)
+    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 72 --m "ToS is 72" --c 0', 2.3, 0, True)
+    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 0 --m "ToS is 0" --c 0', 2.4, 0, True)
 
     # Nodes general options
     #net.enableCpuPortAll()
@@ -92,7 +98,18 @@ def main():
     args = get_args()
     net = config_network(args.p4)
     net.startNetwork()
+    # start the P4 controller
+    controller = Controller()
+    print("\n\nSUMMARY:")
+    print("\nOSPF Shortest Paths:")
+    controller.print_paths()  # Print the stored paths
+    #print("\nP4 Table Entries:")
+    #controller.print_forwarding_entries()  # Print forwarding entries
 
+    net.enableCli()
+
+    
+    net.start_net_cli()
 
 if __name__ == '__main__':
     main()
