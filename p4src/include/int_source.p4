@@ -85,7 +85,6 @@ control process_int_source (
     }
 
     table tb_int_source {
-        // AMJ INT source match keys
         key = {
             // configure for each flow to be monitored
             // 4 fields identifying flow

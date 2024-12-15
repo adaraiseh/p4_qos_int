@@ -1,2 +1,26 @@
 //set up switch ID
 table_set_default process_int_transit.tb_int_insert init_metadata 2
+
+//set up process_int_source_sink (the port number where monitored packets are comming from)
+table_add process_int_source_sink.tb_set_source int_set_source 1 =>
+table_add process_int_source_sink.tb_set_source int_set_source 2 =>
+
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5030 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5031 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5032 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5033 => 11 16 0xF 0xF
+
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5040 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5041 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5042 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5043 => 11 16 0xF 0xF
+
+// set up INT sink (the monitored packets output port)
+table_add process_int_source_sink.tb_set_sink int_set_sink 1 => 
+table_add process_int_source_sink.tb_set_sink int_set_sink 2 => 
+
+// creates INT mirroring ID 500 to output port 10 (send reports to output port 10)
+mirroring_add 500 10
+
+// set up INT report encapsulation
+table_set_default tb_generate_report do_report_encapsulation 10:10:10:10:11:11 10:10:10:10:11:10 172.16.11.101 172.16.11.100 1234

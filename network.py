@@ -69,14 +69,71 @@ def config_network(p4):
         for agg in agg_switches[i * 2: i * 2 + 2]:
             for core in core_switches:
                 net.addLink(agg, core, bw=agg_core_bw)
+     
+    net.l3()
+    print("ip addresses set\n", net.ip_addresses())
+
+        # INT reciever host
+    host100 = net.addHost('h100')
+    host101 = net.addHost('h101')
+    net.addLink(host100, tor_switches[0], port1=10, port2=10)
+    net.setIntfIp(host100, tor_switches[0], "172.16.10.101/24")
+    net.setIntfIp(tor_switches[0], host100, "172.16.10.100/24")
+    net.setIntfMac(host100, tor_switches[0], "10:10:10:10:10:11")
+    net.setIntfMac(tor_switches[0], host100, "10:10:10:10:10:10")
+
+    net.addLink(host100, tor_switches[1], port1=11, port2=10)
+    net.setIntfIp(host100, tor_switches[1], "172.16.11.101/24")
+    net.setIntfIp(tor_switches[1], host100, "172.16.11.100/24")
+    net.setIntfMac(host100, tor_switches[1], "10:10:10:10:11:11")
+    net.setIntfMac(tor_switches[1], host100, "10:10:10:10:11:10")
+
+    net.addLink(host101, tor_switches[2], port1=10, port2=10)
+    net.setIntfIp(host101, tor_switches[2], "172.16.12.101/24")
+    net.setIntfIp(tor_switches[2], host101, "172.16.12.100/24")
+    net.setIntfMac(host101, tor_switches[2], "10:10:10:10:12:11")
+    net.setIntfMac(tor_switches[2], host101, "10:10:10:10:12:10")
+
+    net.addLink(host101, tor_switches[3], port1=11, port2=10)
+    net.setIntfIp(host101, tor_switches[3], "172.16.13.101/24")
+    net.setIntfIp(tor_switches[3], host101, "172.16.13.100/24")
+    net.setIntfMac(host101, tor_switches[3], "10:10:10:10:13:11")
+    net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
+    
 
     # Assignment strategy
-    net.mixed()
+    
     net.addTask("h8", "python3 receive.py", 2, 0, True)
-    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 184 --m "ToS is 184" --c 0', 2.1, 0, True)
-    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 96 --m "ToS is 96" --c 0', 2.2, 0, True)
-    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 72 --m "ToS is 72" --c 0', 2.3, 0, True)
-    net.addTask("h1", 'python3 send.py --ip 10.0.10.8 --l4 udp --port 5555 --tos 0 --m "ToS is 0" --c 0', 2.4, 0, True)
+    net.addTask("h7", "python3 receive.py", 2, 0, True)
+    net.addTask("h6", "python3 receive.py", 2, 0, True)
+    net.addTask("h5", "python3 receive.py", 2, 0, True)
+    net.addTask("h4", "python3 receive.py", 2, 0, True)
+    net.addTask("h3", "python3 receive.py", 2, 0, True)
+    net.addTask("h2", "python3 receive.py", 2, 0, True)
+    net.addTask("h1", "python3 receive.py", 2, 0, True)
+
+    hosts_ips = ["0","10.7.1.2","10.7.2.2","10.8.3.2","10.8.4.2","10.9.5.2","10.9.6.2","10.10.7.2","10.10.8.2"]
+    
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5013 --tos 184 --m "ToS is 184" --c 0', 2.1, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5012 --tos 96 --m "ToS is 96" --c 0', 2.2, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5011 --tos 72 --m "ToS is 72" --c 0', 2.3, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5010 --tos 0 --m "ToS is 0" --c 0', 2.4, 0, True)
+
+    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5023 --tos 184 --m "ToS is 184" --c 0', 2.5, 0, True)
+    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5022 --tos 96 --m "ToS is 96" --c 0', 2.6, 0, True)
+    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5021 --tos 72 --m "ToS is 72" --c 0', 2.7, 0, True)
+    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5020 --tos 0 --m "ToS is 0" --c 0', 2.8, 0, True)
+
+    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5033 --tos 184 --m "ToS is 184" --c 0', 2.9, 0, True)
+    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5032 --tos 96 --m "ToS is 96" --c 0', 3, 0, True)
+    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5031 --tos 72 --m "ToS is 72" --c 0', 3.1, 0, True)
+    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5030 --tos 0 --m "ToS is 0" --c 0', 3.2, 0, True)
+
+    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5043 --tos 184 --m "ToS is 184" --c 0', 3.3, 0, True)
+    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5042 --tos 96 --m "ToS is 96" --c 0', 3.4, 0, True)
+    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5041 --tos 72 --m "ToS is 72" --c 0', 3.5, 0, True)
+    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5040 --tos 0 --m "ToS is 0" --c 0', 3.6, 0, True)
+
 
     # Nodes general options
     #net.enableCpuPortAll()

@@ -131,9 +131,9 @@ class Controller:
                 egress_port = entry['egress_port']
                 egress_port_hex = f"0x{egress_port:x}"
                 port_smac = entry['port_smac']
-                print(f"Adding entry: dst_prefix={dst_prefix}, dscp={dscp}, next_hop_mac={next_hop_mac}, "
-                f"egress_port={egress_port_hex}, next_hop_ip={next_hop_ip}, port_smac={port_smac}")
-                print("add LPM")
+                #print(f"Adding entry: dst_prefix={dst_prefix}, dscp={dscp}, next_hop_mac={next_hop_mac}, "
+                #f"egress_port={egress_port_hex}, next_hop_ip={next_hop_ip}, port_smac={port_smac}")
+                #print("add LPM")
                 controller.table_add(
                     "l3_forward.ipv4_lpm",
                     "ipv4_forward",
@@ -141,7 +141,7 @@ class Controller:
                     [next_hop_ip, str(egress_port)]
                 )
 
-                print("SWITCHING TABLE")
+                #print("SWITCHING TABLE")
                 controller.table_add(
                     "port_forward.switching_table",
                     "set_dmac",
@@ -149,7 +149,7 @@ class Controller:
                     [next_hop_mac]
                 )
 
-                print("MAC REWRITE")
+                #print("MAC REWRITE")
                 controller.table_add(
                     "port_forward.mac_rewriting_table",
                     "set_smac",

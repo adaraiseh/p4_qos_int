@@ -49,7 +49,6 @@ control process_int_transit (
      }
    
     action int_set_header_7() { //egress_port_tx_utilization
-        // TODO: implement tx utilization support in BMv2
         hdr.int_egress_tx_util.setValid();
         hdr.int_egress_tx_util.egress_port_tx_util = standard_metadata.tx_utilization;
     }

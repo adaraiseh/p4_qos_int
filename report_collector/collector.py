@@ -191,7 +191,7 @@ class Collector:
                 flow_info.l1_egress_ports.append(int.from_bytes(hop_metadata.read(2), byteorder='big'))
             # hop_latencies
             if ins_map & HOP_LATENCY_BIT:
-                flow_info.hop_latencies.append(int.from_bytes(hop_metadata.read(4), byteorder='big'))
+                flow_info.hop_latencies.append(int.from_bytes(hop_metadata.read(4), byteorder='big') * 1000) # convert to nanoseconds
                 flow_info.flow_latency += flow_info.hop_latencies[i]
             # queue_ids and queue_occups
             if ins_map & QUEUE_BIT:
@@ -199,10 +199,10 @@ class Collector:
                 flow_info.queue_occups.append(int.from_bytes(hop_metadata.read(3), byteorder='big'))
             # ingress_tstamps
             if ins_map & INGRESS_TSTAMP_BIT:
-                flow_info.ingress_tstamps.append(int.from_bytes(hop_metadata.read(8), byteorder='big'))
+                flow_info.ingress_tstamps.append(int.from_bytes(hop_metadata.read(8), byteorder='big') * 1000) # convert to nanoseconds
             # egress_tstamps
             if ins_map & EGRESS_TSTAMP_BIT:
-                flow_info.egress_tstamps.append(int.from_bytes(hop_metadata.read(8), byteorder='big'))
+                flow_info.egress_tstamps.append(int.from_bytes(hop_metadata.read(8), byteorder='big') * 1000) # convert to nanoseconds
 
             # l2_ingress_ports and l2_egress_ports
             if ins_map & L2_PORT_IDS_BIT:
@@ -211,15 +211,14 @@ class Collector:
             # egress_tx_utils
             if ins_map & EGRESS_PORT_TX_UTIL_BIT:
                 tx_util = int.from_bytes(hop_metadata.read(4), byteorder='big')
-                #tx_util_normalized = round(tx_util / 10**4, 2)
-                #print("normailized tx util", tx_util_normalized)
-                flow_info.egress_tx_utils.append(tx_util)
+                tx_util_normalized = round(tx_util / 10**4, 2)
+                flow_info.egress_tx_utils.append(tx_util_normalized)
 
     def parser_int_pkt(self,pkt):
         if INTREP not in pkt:
             return
         int_rep_pkt = pkt[INTREP]
-        # int_rep_pkt.show()
+        #int_rep_pkt.show()
 
         flow_info = FlowInfo()
         # parse five tuple (src_ip,dst_ip,src_port,dst_port,ip_proto)
@@ -238,52 +237,65 @@ class Collector:
         points = []
 
         # Add flow-level latency data if available
+        flow_id  = (flow_info.dst_port // 10) % 100
+        qos_class = flow_info.dst_port % 10
         if flow_info.flow_latency:
             points.append(
                 Point("flow_latency")
-                .tag("src_ip", str(flow_info.src_ip))
-                .tag("dst_ip", str(flow_info.dst_ip))
-                .tag("src_port", flow_info.src_port)
-                .tag("dst_port", flow_info.dst_port)
-                .tag("protocol", flow_info.ip_proto)
-                .field("value", flow_info.flow_latency)
+                #.tag("src_ip", str(flow_info.src_ip))
+                #.tag("dst_ip", str(flow_info.dst_ip))
+                #.tag("src_port", flow_info.src_port)
+                .tag("flow_id", flow_id)
+                .tag("qos_class", qos_class)
+                #.tag("protocol", flow_info.ip_proto)
+                .field("value", flow_info.flow_latency/1000_000) # store value in milliseconds
                 .time(int(time.time() * 1_000_000_000))  # Current time in nanoseconds
             )
 
-        # Add per-hop latency and TX utilization data
+        # Add per-hop latency
         for i in range(flow_info.hop_cnt):
             points.append(
                 Point("switch_latency")
+                .tag("flow_id", flow_id)
+                .tag("qos_class", qos_class)
                 .tag("switch_id", flow_info.switch_ids[i])
-                .field("value", flow_info.hop_latencies[i])
-                .time(flow_info.egress_tstamps[i] * 1000) 
+                .field("value", flow_info.hop_latencies[i]/1000) # store value in microseconds
+                .time(flow_info.egress_tstamps[i])
             )
+        
+        # Add per-hop egress port tx utilization
+        for i in range(flow_info.hop_cnt):
             points.append(
                 Point("tx_utilization")
+                .tag("flow_id", flow_id)
                 .tag("switch_id", flow_info.switch_ids[i])
-                .field("value", round(flow_info.egress_tx_utils[i] / 10**4, 2))  # Normalize to 2 decimal places
-                .time(flow_info.egress_tstamps[i] * 1000)
+                .tag("egress_port", flow_info.l1_egress_ports[i])
+                .field("value", flow_info.egress_tx_utils[i])
+                .time(flow_info.egress_tstamps[i])
             )
 
         # Add queue occupancy data
         for i in range(flow_info.hop_cnt):
             points.append(
                 Point("queue_occupancy")
+                .tag("flow_id", flow_id)
                 .tag("switch_id", flow_info.switch_ids[i])
                 .tag("queue_id", flow_info.queue_ids[i])
                 .field("value", flow_info.queue_occups[i])
-                .time(flow_info.egress_tstamps[i] * 1000)
+                .time(flow_info.egress_tstamps[i])
             )
 
         # Add link latency data
         for i in range(flow_info.hop_cnt - 1):
             points.append(
                 Point("link_latency")
+                .tag("flow_id", flow_id)
+                .tag("qos_class", qos_class)
                 .tag("egress_switch_id", flow_info.switch_ids[i + 1])
                 .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
                 .tag("ingress_switch_id", flow_info.switch_ids[i])
                 .tag("ingress_port_id", flow_info.l1_ingress_ports[i])
-                .field("value", abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i])) # value in microseconds
+                .field("value", (abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]))/1000) # store value in microseconds
                 .time(int(time.time() * 1_000_000_000))  # Current time in nanoseconds
             )
 

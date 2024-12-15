@@ -18,7 +18,7 @@ def handle_pkt(pkt, c):
         c.export_influxdb(flow_info)
 
 def main():
-    iface = 't4-eth1'
+    iface = ['t1-eth10','t2-eth10','t3-eth10','t4-eth10']
     print("Sniffing on %s" % iface)
     sys.stdout.flush()
 
