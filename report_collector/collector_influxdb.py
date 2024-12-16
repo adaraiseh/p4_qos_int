@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import signal
 from scapy.all import sniff
 from influxdb_client import InfluxDBClient
 from collector import *
@@ -12,22 +13,34 @@ INFLUX_BUCKET = "INT"
 
 def handle_pkt(pkt, c):
     if INTREP in pkt:
-        print("\n\n********* Receiving Telemetry Report ********")
         flow_info = c.parser_int_pkt(pkt)
-        flow_info.show()
-        c.export_influxdb(flow_info)
+        if flow_info:
+            c.export_influxdb(flow_info)
+            flow_info.clear_metadata()  # Custom cleanup for FlowInfo
 
 def main():
-    iface = ['t1-eth10','t2-eth10','t3-eth10','t4-eth10']
-    print("Sniffing on %s" % iface)
+    iface = ['t1-eth10', 't2-eth10', 't3-eth10', 't4-eth10']
+    print(f"Sniffing on {iface}")
     sys.stdout.flush()
 
+    # Initialize the InfluxDB client and the Collector
     influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     c = Collector(influx_client, INFLUX_ORG, INFLUX_BUCKET)
+
+    # Graceful shutdown handler
+    def signal_handler(sig, frame):
+        print("\nStopping sniffing and shutting down...")
+        c.flush_buffer()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Start sniffing
     sniff(
         iface=iface,
         filter='inbound and tcp or udp',
-        prn=lambda x: handle_pkt(x, c)
+        prn=lambda x: handle_pkt(x, c),
+        store=False  # Avoid storing packets in memory
     )
 
 if __name__ == '__main__':

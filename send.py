@@ -37,11 +37,11 @@ def main(args):
     if args.c == 0:
         while(True):
             sendp(pkt, iface=iface, verbose=False)
-            sleep(0.4)
+            sleep(0.5)
     else:
         for i in range(args.c):
             sendp(pkt, iface=iface, verbose=False)
-            sleep(0.4)
+            sleep(0.5)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='receiver parser')

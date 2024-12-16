@@ -113,6 +113,14 @@ class Controller:
                         if entry not in self.forwarding_entries[sw_name]:
                             self.forwarding_entries[sw_name].append(entry)
 
+    def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
+        controller = self.controllers[sw_name]
+        controller.table_modify(
+            "l3_forward.ipv4_lpm",
+            "ipv4_forward",
+            [dst_prefix, dscp],
+            [next_hop_ip, str(egress_port)]
+    )
 
     def program_switches(self):
         """
