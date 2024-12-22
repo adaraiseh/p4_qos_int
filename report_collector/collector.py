@@ -171,15 +171,15 @@ class Collector:
         try:
             points = []
             flow_id = (flow_info.dst_port // 10) % 100
-            qos_class = flow_info.dst_port % 10
+            priority_queue = flow_info.dst_port % 10
 
             for i in range(flow_info.hop_cnt):
                 points.append(
                     Point("switch_latency")
                     .tag("flow_id", flow_id)
-                    .tag("qos_class", qos_class)
+                    .tag("priority_queue", priority_queue)
                     .tag("switch_id", flow_info.switch_ids[i])
-                    .field("value", flow_info.hop_latencies[i] / 1000)  # Store in microseconds
+                    .field("value", flow_info.hop_latencies[i] / 1000_000)  # Milliseconds
                     .time(flow_info.egress_tstamps[i])
                 )
                 points.append(
@@ -197,26 +197,28 @@ class Collector:
                     .tag("queue_id", flow_info.queue_ids[i])
                     .field("value", flow_info.queue_occups[i])
                     .time(flow_info.egress_tstamps[i])
-                )
+                )             
 
             for i in range(flow_info.hop_cnt - 1):
+                link_latency = abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]) / 1000_000 # Milliseconds
                 points.append(
                     Point("link_latency")
                     .tag("flow_id", flow_id)
-                    .tag("qos_class", qos_class)
+                    .tag("priority_queue", priority_queue)
                     .tag("egress_switch_id", flow_info.switch_ids[i + 1])
                     .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
                     .tag("ingress_switch_id", flow_info.switch_ids[i])
                     .tag("ingress_port_id", flow_info.l1_ingress_ports[i])
-                    .field("value", (abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i])) / 1000)  # Microseconds
+                    .field("value", link_latency)
                     .time(int(time.time() * 1_000_000_000))  # Current time in nanoseconds
                 )
 
+            flow_latency = (flow_info.ingress_tstamps[0] - flow_info.egress_tstamps[flow_info.hop_cnt - 1]) / 1000_000 # Milliseconds
             points.append(
                 Point("flow_latency")
                 .tag("flow_id", flow_id)
-                .tag("qos_class", qos_class)
-                .field("value", (flow_info.ingress_tstamps[0] - flow_info.egress_tstamps[flow_info.hop_cnt - 1]) / 1000_000)  # Milliseconds
+                .tag("priority_queue", priority_queue)
+                .field("value", flow_latency)
                 .time(flow_info.egress_tstamps[flow_info.hop_cnt - 1])
             )
 

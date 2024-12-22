@@ -89,7 +89,7 @@ control process_int_source (
             // configure for each flow to be monitored
             // 4 fields identifying flow
             hdr.ipv4.src_ipv4_addr: lpm;
-            local_metadata.l4_dst_port: exact;
+            local_metadata.l4_dst_port: ternary;
             //hdr.ipv4.dst_ipv4_addr: ternary;
             //local_metadata.l4_src_port: ternary;
             //local_metadata.l4_dst_port: ternary;

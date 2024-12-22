@@ -17,17 +17,23 @@ def handle_pkt(pkt):
     """
     Handles each packet. Replace the `pass` with packet processing logic if needed.
     """
-    pass  # Replace with processing logic if necessary
+    #print(pkt.summary())  # Print packet summary for debugging
+    pass
 
 def main():
+    # Get the network interface
     iface = get_if()
     print(f"Sniffing on {iface}")
     sys.stdout.flush()
 
+    # Define the ports to listen to
+    specific_ports = [5010, 5011, 5012, 5013, 5020, 5021, 5022, 5023, 5030, 5031, 5032, 5033, 5040, 5041, 5042, 5043, 5050, 5051, 5052, 5053, 5060, 5061, 5062, 5063]
+    port_filter = " or ".join([f"tcp port {p} or udp port {p}" for p in specific_ports])
+
     # Sniff packets and avoid retaining them in memory
     sniff(
         iface=iface,
-        filter="inbound and tcp or udp",  # Only TCP or UDP inbound traffic
+        filter=port_filter,  # Filter packets to specific TCP/UDP ports
         prn=handle_pkt,  # Call handle_pkt for each packet
         store=False  # Do not store packets in memory
     )

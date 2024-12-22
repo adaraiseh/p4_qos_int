@@ -6,15 +6,8 @@ table_set_default process_int_transit.tb_int_insert init_metadata 6
 table_add process_int_source_sink.tb_set_source int_set_source 1 =>
 table_add process_int_source_sink.tb_set_source int_set_source 2 =>
 
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5110 => 11 16 0xF 0xF
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5111 => 11 16 0xF 0xF
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5112 => 11 16 0xF 0xF
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5113 => 11 16 0xF 0xF
-
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5120 => 11 16 0xF 0xF
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5121 => 11 16 0xF 0xF
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5122 => 11 16 0xF 0xF
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5123 => 11 16 0xF 0xF
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5000&&&0xFF80 => 11 16 0xF 0xF 1
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5120&&&0xFF80 => 11 16 0xF 0xF 1
 
 // set up INT sink (the monitored packets output port)
 table_add process_int_source_sink.tb_set_sink int_set_sink 1 => 

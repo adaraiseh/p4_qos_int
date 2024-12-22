@@ -17,8 +17,8 @@ def config_network(p4):
     agg_nodes = 4
     core_nodes = 2
 
-    host_tor_bw = 1
-    tor_agg_bw = 10
+    host_tor_bw = 10
+    tor_agg_bw = 5
     agg_core_bw = 10
 
     # Hosts
@@ -30,7 +30,7 @@ def config_network(p4):
     # ToR (Edge) switches
     tor_switches = []
     for i in range(1, tor_nodes + 1):
-        tor_switch = net.addP4Switch(f't{i}', priority_queues_num=4,
+        tor_switch = net.addP4Switch(f't{i}', priority_queues_num=8,
                                      max_link_bw=host_tor_bw,
                                      cli_input=default_rule + f't{i}-commands.txt')
         tor_switches.append(tor_switch)
@@ -38,7 +38,7 @@ def config_network(p4):
     # Aggregate switches
     agg_switches = []
     for i in range(1, agg_nodes + 1):
-        agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=4,
+        agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=8,
                                      max_link_bw=tor_agg_bw,
                                      cli_input=default_rule + f'a{i}-commands.txt')
         agg_switches.append(agg_switch)
@@ -46,7 +46,7 @@ def config_network(p4):
     # Core switches
     core_switches = []
     for i in range(1, core_nodes + 1):
-        core_switch = net.addP4Switch(f'c{i}', priority_queues_num=4,
+        core_switch = net.addP4Switch(f'c{i}', priority_queues_num=8,
                                       max_link_bw=agg_core_bw,
                                       cli_input=default_rule + f'c{i}-commands.txt')
         core_switches.append(core_switch)
@@ -69,11 +69,11 @@ def config_network(p4):
         for agg in agg_switches[i * 2: i * 2 + 2]:
             for core in core_switches:
                 net.addLink(agg, core, bw=agg_core_bw)
-     
-    net.l3()
-    print("ip addresses set\n", net.ip_addresses())
 
-        # INT reciever host
+    # Assignment strategy
+    net.l3()
+
+    # INT reports reciever host
     host100 = net.addHost('h100')
     host101 = net.addHost('h101')
     net.addLink(host100, tor_switches[0], port1=10, port2=10)
@@ -99,46 +99,30 @@ def config_network(p4):
     net.setIntfIp(tor_switches[3], host101, "172.16.13.100/24")
     net.setIntfMac(host101, tor_switches[3], "10:10:10:10:13:11")
     net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
-    
 
-    # Assignment strategy
+
+    # Generate traffic
     
-    net.addTask("h8", "python3 receive.py", 2, 0, True)
-    net.addTask("h7", "python3 receive.py", 2, 0, True)
-    net.addTask("h6", "python3 receive.py", 2, 0, True)
-    net.addTask("h5", "python3 receive.py", 2, 0, True)
-    net.addTask("h4", "python3 receive.py", 2, 0, True)
-    net.addTask("h3", "python3 receive.py", 2, 0, True)
-    net.addTask("h2", "python3 receive.py", 2, 0, True)
-    net.addTask("h1", "python3 receive.py", 2, 0, True)
+    net.addTask("h8", "python3 receive.py", 1, 0, True)
+    #net.addTask("h8", "iperf3 -s -p 6017 -i 1", 1, 0, True)
+    #net.addTask("h8", "iperf3 -s -p 6016 -i 1", 1, 0, True)
+    #net.addTask("h8", "iperf3 -s -p 6010 -i 1", 1, 0, True)
 
     hosts_ips = ["0","10.7.1.2","10.7.2.2","10.8.3.2","10.8.4.2","10.9.5.2","10.9.6.2","10.10.7.2","10.10.8.2"]
     
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5013 --tos 184 --m "ToS is 184" --c 0', 2.1, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5012 --tos 96 --m "ToS is 96" --c 0', 2.2, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5011 --tos 72 --m "ToS is 72" --c 0', 2.3, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5010 --tos 0 --m "ToS is 0" --c 0', 2.4, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5017 --tos 184 --m "ToS is 184" --c 0', 5, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5016 --tos 96 --m "ToS is 96" --c 0', 5, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5010 --tos 0 --m "ToS is 0" --c 0', 5, 0, True)
+    #net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6017 -u -b 3M -l 128 --tos 184', 2.1, 0, True)
+    #net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6016 -u -b 3M -l 1250 --tos 96', 2.1, 0, True)
+    #net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6010 -u -b 4M -l 1750 --tos 0', 2.1, 0, True)
 
-    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5023 --tos 184 --m "ToS is 184" --c 0', 2.5, 0, True)
-    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5022 --tos 96 --m "ToS is 96" --c 0', 2.6, 0, True)
-    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5021 --tos 72 --m "ToS is 72" --c 0', 2.7, 0, True)
-    net.addTask("h2", f'python3 send.py --ip {hosts_ips[6]} --l4 udp --port 5020 --tos 0 --m "ToS is 0" --c 0', 2.8, 0, True)
-
-    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5033 --tos 184 --m "ToS is 184" --c 0', 2.9, 0, True)
-    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5032 --tos 96 --m "ToS is 96" --c 0', 3, 0, True)
-    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5031 --tos 72 --m "ToS is 72" --c 0', 3.1, 0, True)
-    net.addTask("h3", f'python3 send.py --ip {hosts_ips[7]} --l4 udp --port 5030 --tos 0 --m "ToS is 0" --c 0', 3.2, 0, True)
-
-    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5043 --tos 184 --m "ToS is 184" --c 0', 3.3, 0, True)
-    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5042 --tos 96 --m "ToS is 96" --c 0', 3.4, 0, True)
-    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5041 --tos 72 --m "ToS is 72" --c 0', 3.5, 0, True)
-    net.addTask("h4", f'python3 send.py --ip {hosts_ips[5]} --l4 udp --port 5040 --tos 0 --m "ToS is 0" --c 0', 3.6, 0, True)
 
 
     # Nodes general options
     #net.enableCpuPortAll()
     #net.enablePcapDumpAll()
-    #net.enableLogAll()
+    net.enableLogAll()
 
     return net
 
@@ -146,7 +130,7 @@ def config_network(p4):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--p4', help='p4 src file.',
-                        type=str, required=False, default='p4src/int_mri.p4')
+                        type=str, required=False, default='p4src/int_md.p4')
                         
     return parser.parse_args()
 

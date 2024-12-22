@@ -33,11 +33,11 @@ control l3_forward(inout headers hdr,
     apply {
         if(hdr.ipv4.isValid()) {
             if (hdr.ipv4.dscp == 0x2E) { // EF
-                standard_metadata.priority = (bit<3>)3;
+                standard_metadata.priority = (bit<3>)7;
             } else if (hdr.ipv4.dscp == 0x18) { // CS3
-                standard_metadata.priority = (bit<3>)2;
+                standard_metadata.priority = (bit<3>)6;
             } else if (hdr.ipv4.dscp == 0x12 || hdr.ipv4.dscp == 0x14 || hdr.ipv4.dscp == 0x16) { // AF21, AF22, AF23
-                standard_metadata.priority = (bit<3>)1;
+                standard_metadata.priority = (bit<3>)5;
             } else {
                 // Best Effort (default priority)
                 standard_metadata.priority = (bit<3>)0;
