@@ -91,6 +91,7 @@ class FlowInfo():
         self.hop_latencies = []
         self.queue_ids = []
         self.queue_occups = []
+        self.queue_drops = []
         self.ingress_tstamps = []
         self.egress_tstamps = []
         self.l2_ingress_ports = []
@@ -171,13 +172,13 @@ class Collector:
         try:
             points = []
             flow_id = (flow_info.dst_port // 10) % 100
-            priority_queue = flow_info.dst_port % 10
+            expected_queue_id = flow_info.dst_port % 10
 
             for i in range(flow_info.hop_cnt):
                 points.append(
                     Point("switch_latency")
                     .tag("flow_id", flow_id)
-                    .tag("priority_queue", priority_queue)
+                    .tag("queue_id", expected_queue_id)
                     .tag("switch_id", flow_info.switch_ids[i])
                     .field("value", flow_info.hop_latencies[i] / 1000_000)  # Milliseconds
                     .time(flow_info.egress_tstamps[i])
@@ -197,14 +198,22 @@ class Collector:
                     .tag("queue_id", flow_info.queue_ids[i])
                     .field("value", flow_info.queue_occups[i])
                     .time(flow_info.egress_tstamps[i])
-                )             
+                )
+                points.append(
+                    Point("queue_drop_count")
+                    .tag("flow_id", flow_id)
+                    .tag("switch_id", flow_info.switch_ids[i])
+                    .tag("queue_id", flow_info.queue_ids[i])
+                    .field("value", flow_info.queue_drops[i])
+                    .time(flow_info.egress_tstamps[i])
+                )           
 
             for i in range(flow_info.hop_cnt - 1):
                 link_latency = abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]) / 1000_000 # Milliseconds
                 points.append(
                     Point("link_latency")
                     .tag("flow_id", flow_id)
-                    .tag("priority_queue", priority_queue)
+                    .tag("queue_id", expected_queue_id)
                     .tag("egress_switch_id", flow_info.switch_ids[i + 1])
                     .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
                     .tag("ingress_switch_id", flow_info.switch_ids[i])
@@ -217,7 +226,7 @@ class Collector:
             points.append(
                 Point("flow_latency")
                 .tag("flow_id", flow_id)
-                .tag("priority_queue", priority_queue)
+                .tag("queue_id", expected_queue_id)
                 .field("value", flow_latency)
                 .time(flow_info.egress_tstamps[flow_info.hop_cnt - 1])
             )
@@ -290,8 +299,11 @@ class Collector:
             if ins_map & QUEUE_BIT:
                 flow_info.queue_ids.append(int.from_bytes(hop_metadata[offset:offset + 1], byteorder='big'))
                 offset += 1
+                print("queue_id: ", flow_info.queue_ids)
                 flow_info.queue_occups.append(int.from_bytes(hop_metadata[offset:offset + 3], byteorder='big'))
                 offset += 3
+                flow_info.queue_drops.append(int.from_bytes(hop_metadata[offset:offset + 4], byteorder='big'))
+                offset += 4
             # ingress_tstamps
             if ins_map & INGRESS_TSTAMP_BIT:
                 flow_info.ingress_tstamps.append(int.from_bytes(hop_metadata[offset:offset + 8], byteorder='big') * 1000)  # nanoseconds

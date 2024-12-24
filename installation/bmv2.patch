@@ -32,10 +32,10 @@ index 53a8bfd..0bfc0d7 100644
    int status = simple_switch->init_from_options_parser(parser);
    if (status != 0) std::exit(status);
 diff --git a/targets/simple_switch/simple_switch.cpp b/targets/simple_switch/simple_switch.cpp
-index dcb597f..d69e234 100644
+index dcb597f..952051b 100644
 --- a/targets/simple_switch/simple_switch.cpp
 +++ b/targets/simple_switch/simple_switch.cpp
-@@ -199,12 +199,13 @@ class SimpleSwitch::InputBuffer {
+@@ -199,12 +199,14 @@ class SimpleSwitch::InputBuffer {
  };
  
  SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
@@ -47,20 +47,25 @@ index dcb597f..d69e234 100644
          1024 /* normal capacity */, 1024 /* resubmit/recirc capacity */)),
      nb_queues_per_port(nb_queues_per_port),
 +    max_link_bw(max_link_bw),
++    queue_drop_counters(nb_queues_per_port),
      egress_buffers(nb_egress_threads,
                     64, EgressThreadMapper(nb_egress_threads),
                     nb_queues_per_port),
-@@ -218,7 +219,8 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
+@@ -218,7 +220,12 @@ SimpleSwitch::SimpleSwitch(bool enable_swap, port_t drop_port,
      }),
      pre(new McSimplePreLAG()),
      start(clock::now()),
 -    mirroring_sessions(new MirroringSessions()) {
 +    mirroring_sessions(new MirroringSessions()),
 +    dev_mgr(this) {
++  // Initialize all drop counters to 0:
++  for (auto &counter : queue_drop_counters) {
++    counter.store(0);
++  }
    add_component<McSimplePreLAG>(pre);
  
    add_required_field("standard_metadata", "ingress_port");
-@@ -397,7 +399,8 @@ SimpleSwitch::transmit_thread() {
+@@ -397,7 +404,8 @@ SimpleSwitch::transmit_thread() {
  
  ts_res
  SimpleSwitch::get_ts() const {
@@ -70,7 +75,27 @@ index dcb597f..d69e234 100644
  }
  
  void
-@@ -644,6 +647,21 @@ void
+@@ -414,13 +422,18 @@ SimpleSwitch::enqueue(port_t egress_port, std::unique_ptr<Packet> &&packet) {
+ 
+     size_t priority = phv->has_field(SSWITCH_PRIORITY_QUEUEING_SRC) ?
+         phv->get_field(SSWITCH_PRIORITY_QUEUEING_SRC).get<size_t>() : 0u;
++    BMLOG_DEBUG("original on packet INT {}", priority);
+     if (priority >= nb_queues_per_port) {
+       bm::Logger::get()->error("Priority out of range, dropping packet");
+       return;
+     }
+-    egress_buffers.push_front(
++    int ret;
++    ret = egress_buffers.push_front(
+         egress_port, nb_queues_per_port - 1 - priority,
+         std::move(packet));
++    if (ret == 0) {
++      queue_drop_counters[nb_queues_per_port - 1 - priority]++;
++    }
+ }
+ 
+ // used for ingress cloning, resubmit
+@@ -644,17 +657,34 @@ void
  SimpleSwitch::egress_thread(size_t worker_id) {
    PHV *phv;
  
@@ -92,13 +117,44 @@ index dcb597f..d69e234 100644
    while (1) {
      std::unique_ptr<Packet> packet;
      size_t port;
-@@ -676,6 +694,59 @@ SimpleSwitch::egress_thread(size_t worker_id) {
++    size_t queue_id;
+     size_t priority;
+-    egress_buffers.pop_back(worker_id, &port, &priority, &packet);
++    egress_buffers.pop_back(worker_id, &port, &queue_id, &packet);
+     if (packet == nullptr) break;
+-
++    priority = nb_queues_per_port - 1 - queue_id;
+     Deparser *deparser = this->get_deparser("deparser");
+     Pipeline *egress_mau = this->get_pipeline("egress");
+ 
+     phv = packet->get_phv();
++    uint32_t drop_count_for_this_queue = queue_drop_counters[queue_id].load();
+ 
+     if (phv->has_field("intrinsic_metadata.egress_global_timestamp")) {
+       phv->get_field("intrinsic_metadata.egress_global_timestamp")
+@@ -668,14 +698,74 @@ SimpleSwitch::egress_thread(size_t worker_id) {
+           get_ts().count() - enq_timestamp);
+       phv->get_field("queueing_metadata.deq_qdepth").set(
+           egress_buffers.size(port));
++      phv->get_field("queueing_metadata.queue_drop").set(
++        drop_count_for_this_queue);
+       if (phv->has_field("queueing_metadata.qid")) {
+         auto &qid_f = phv->get_field("queueing_metadata.qid");
+-        qid_f.set(nb_queues_per_port - 1 - priority);
++        qid_f.set(queue_id);
++        BMLOG_DEBUG("set QID on packet INT {}", queue_id);
++        BMLOG_DEBUG("set priority on packet INT {}", priority);
+       }
+     }
  
      phv->get_field("standard_metadata.egress_port").set(port);
  
 +    uint64_t current_time_us = get_time_elapsed_us();
 +
 +    // Access or initialize port state
++    if (port_states.find(port) == port_states.end()) {
++        port_states[port] = PortState(); // Initialize port state
++    }
 +    PortState &state = port_states[port];
 +
 +    // Calculate time since last update
@@ -153,7 +209,7 @@ index dcb597f..d69e234 100644
      // When egress_spec == drop_port the packet will be dropped, thus
      // here we initialize egress_spec to a value different from drop_port.
 diff --git a/targets/simple_switch/simple_switch.h b/targets/simple_switch/simple_switch.h
-index cdc751b..444a9d6 100644
+index cdc751b..9b67162 100644
 --- a/targets/simple_switch/simple_switch.h
 +++ b/targets/simple_switch/simple_switch.h
 @@ -75,6 +75,7 @@ class SimpleSwitch : public Switch {
@@ -174,15 +230,16 @@ index cdc751b..444a9d6 100644
  
    ~SimpleSwitch();
  
-@@ -190,6 +192,7 @@ class SimpleSwitch : public Switch {
+@@ -190,6 +192,8 @@ class SimpleSwitch : public Switch {
    // for these queues, the write operation is non-blocking and we drop the
    // packet if the queue is full
    size_t nb_queues_per_port;
 +  size_t max_link_bw;
++  std::vector<std::atomic<uint64_t>> queue_drop_counters;
    bm::QueueingLogicPriRL<std::unique_ptr<Packet>, EgressThreadMapper>
    egress_buffers;
    Queue<std::unique_ptr<Packet> > output_buffer;
-@@ -198,6 +201,7 @@ class SimpleSwitch : public Switch {
+@@ -198,6 +202,7 @@ class SimpleSwitch : public Switch {
    clock::time_point start;
    bool with_queueing_metadata{false};
    std::unique_ptr<MirroringSessions> mirroring_sessions;

@@ -104,25 +104,26 @@ def config_network(p4):
     # Generate traffic
     
     net.addTask("h8", "python3 receive.py", 1, 0, True)
-    #net.addTask("h8", "iperf3 -s -p 6017 -i 1", 1, 0, True)
-    #net.addTask("h8", "iperf3 -s -p 6016 -i 1", 1, 0, True)
-    #net.addTask("h8", "iperf3 -s -p 6010 -i 1", 1, 0, True)
+    net.addTask("h8", "iperf3 -s -p 6010 -i 1", 1, 0, True)
+    net.addTask("h8", "iperf3 -s -p 6011 -i 1", 1, 0, True)
+    net.addTask("h8", "iperf3 -s -p 6017 -i 1", 1, 0, True)
 
     hosts_ips = ["0","10.7.1.2","10.7.2.2","10.8.3.2","10.8.4.2","10.9.5.2","10.9.6.2","10.10.7.2","10.10.8.2"]
     
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5017 --tos 184 --m "ToS is 184" --c 0', 5, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5016 --tos 96 --m "ToS is 96" --c 0', 5, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5010 --tos 0 --m "ToS is 0" --c 0', 5, 0, True)
-    #net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6017 -u -b 3M -l 128 --tos 184', 2.1, 0, True)
-    #net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6016 -u -b 3M -l 1250 --tos 96', 2.1, 0, True)
-    #net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6010 -u -b 4M -l 1750 --tos 0', 2.1, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5010 --tos 184 --m "ToS is 184" --c 0', 5, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5011 --tos 96 --m "ToS is 96" --c 0', 5, 0, True)
+    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5017 --tos 0 --m "ToS is 0" --c 0', 5, 0, True)
+    
+    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6010 -u -b 0.1M -l 128 --tos 184', 2.1, 0, True)
+    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6011 -u -b 10M -l 1250 --tos 96', 2.1, 0, True)
+    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6017 -u -b 3M -l 128 --tos 0', 2.1, 0, True)
 
 
 
     # Nodes general options
     #net.enableCpuPortAll()
     #net.enablePcapDumpAll()
-    net.enableLogAll()
+    #net.enableLogAll()
 
     return net
 

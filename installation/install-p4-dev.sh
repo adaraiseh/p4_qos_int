@@ -296,13 +296,13 @@ function do_bmv2 {
     git checkout ${BMV2_COMMIT}
 
     # Apply the patch
-    wget https://raw.githubusercontent.com/adaraiseh/p4_qos_int/refs/heads/main/installation/bmv2_tx_util.patch
-    if [ -f "bmv2_tx_util.patch" ]; then
-        echo "Applying bmv2_tx_util.patch..."
-        git apply bmv2_tx_util.patch || { echo "Failed to apply patch"; exit 1; }
+    wget https://raw.githubusercontent.com/adaraiseh/p4_qos_int/refs/heads/main/installation/bmv2.patch
+    if [ -f "bmv2.patch" ]; then
+        echo "Applying bmv2.patch..."
+        git apply bmv2.patch || { echo "Failed to apply patch"; exit 1; }
         echo "Patch applied successfully."
     else
-        echo "Patch file not found: bmv2_tx_util.patch"
+        echo "Patch file not found: bmv2.patch"
         exit 1
     fi
 
@@ -553,7 +553,17 @@ function do_p4c {
             /}/i\
         // queue used info at egress\
         @alias("queueing_metadata.qid")\
-        bit<5> qid;
+        bit<8> qid;
+        }' "$input_file"
+    fi
+
+    if ! grep -q "@alias(\"queueing_metadata.queue_drop\")" "$input_file"; then
+        # If it doesn't exist, insert it before the closing brace
+        sed -i '/struct standard_metadata_t {/,/}/{ 
+            /}/i\
+        // queue drop count at egress\
+        @alias("queueing_metadata.queue_drop")\
+        bit<32> queue_drop;
         }' "$input_file"
     fi
 

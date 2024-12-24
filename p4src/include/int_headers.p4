@@ -54,6 +54,7 @@ header int_hop_latency_t {
 header int_q_occupancy_t {
     bit<8> q_id;
     bit<24> q_occupancy;
+    bit<32> q_drop;
 }
 header int_ingress_tstamp_t {
     bit<64> ingress_tstamp;

@@ -25,10 +25,10 @@ control process_int_transit (
     }
   
     action int_set_header_3() { //q_occupancy
-        // TODO: Support egress queue ID
         hdr.int_q_occupancy.setValid();
         hdr.int_q_occupancy.q_id = (bit<8>) standard_metadata.qid;
         hdr.int_q_occupancy.q_occupancy = (bit<24>) standard_metadata.deq_qdepth;
+        hdr.int_q_occupancy.q_drop = (bit<32>) standard_metadata.queue_drop;
     }
   
     action int_set_header_4() { //ingress_tstamp
@@ -100,7 +100,7 @@ control process_int_transit (
     
      action int_set_header_0003_i1() {
         int_set_header_3();
-        add_1();
+        add_2();
     }
     
     action int_set_header_0003_i2() {
@@ -111,7 +111,7 @@ control process_int_transit (
     action int_set_header_0003_i3() {
         int_set_header_3();
         int_set_header_2();
-        add_2();
+        add_3();
     }
     
     action int_set_header_0003_i4() {
@@ -122,7 +122,7 @@ control process_int_transit (
     action int_set_header_0003_i5() {
         int_set_header_3();
         int_set_header_1();
-        add_2();
+        add_3();
     }
     
     action int_set_header_0003_i6() {
@@ -135,7 +135,7 @@ control process_int_transit (
         int_set_header_3();
         int_set_header_2();
         int_set_header_1();
-        add_3();
+        add_4();
     }
     
     action int_set_header_0003_i8() {
@@ -146,7 +146,7 @@ control process_int_transit (
     action int_set_header_0003_i9() {
         int_set_header_3();
         int_set_header_0();
-        add_2();
+        add_3();
     }
     
     action int_set_header_0003_i10() {
@@ -159,7 +159,7 @@ control process_int_transit (
         int_set_header_3();
         int_set_header_2();
         int_set_header_0();
-        add_3();
+        add_4();
     }
     
     action int_set_header_0003_i12() {
@@ -172,7 +172,7 @@ control process_int_transit (
         int_set_header_3();
         int_set_header_1();
         int_set_header_0();
-        add_3();
+        add_4();
     }
     
     action int_set_header_0003_i14() {
@@ -187,7 +187,7 @@ control process_int_transit (
         int_set_header_2();
         int_set_header_1();
         int_set_header_0();
-        add_4();
+        add_5();
     }
 
      /* action function for bits 4-7 combinations, 4 is msb, 7 is lsb */
