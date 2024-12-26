@@ -115,12 +115,18 @@ class Controller:
 
     def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
         controller = self.controllers[sw_name]
-        controller.table_modify(
+        controller.table_modify_match(
             "l3_forward.ipv4_lpm",
             "ipv4_forward",
             [dst_prefix, dscp],
             [next_hop_ip, str(egress_port)]
-    )
+            )
+        
+        ### helper functions:
+        #def table_modify(self, table_name, action_name, entry_handle, action_params=[]):
+        #def table_modify_match(self, table_name, action_name, match_keys, action_params=[]):
+        #def table_delete_match(self, table_name, match_keys):
+        #def table_add(self, table_name, action_name, match_keys, action_params=[], prio=0):
 
     def program_switches(self):
         """

@@ -8,6 +8,7 @@ from scapy.all import BitField,ShortField
 from scapy.layers.inet import Ether,IP, TCP, UDP, bind_layers
 from influxdb_client import Point
 from influxdb_client.client.write_api import SYNCHRONOUS
+import math
 
 class INTREP(Packet):
     name = "INT Report Header v2.0"
@@ -165,6 +166,42 @@ class Collector:
         self.bucket = bucket
         self.batch_size = batch_size
         self.buffer = []  # Buffer to hold points
+        self.last_drop_data = {}  # Store (drop_count, timestamp)
+
+    def record_100ms_drop_count(self, flow_id, switch_id, queue_id, drop_count, last_egress_timestamp):
+        # Unique key for the current tag combination
+        tag_key = (flow_id, switch_id, queue_id)
+        current_time = time.time()  # Current time in seconds
+
+        # Retrieve last state for this tag combination
+        if tag_key in self.last_drop_data:
+            last_drop_count, last_timestamp = self.last_drop_data[tag_key]
+            elapsed_time = (current_time - last_timestamp) * 1000  # Convert to milliseconds
+
+            if elapsed_time >= 500:  # If at least 500ms interval has elapsed
+                # Calculate total drop difference and derive average per 100ms
+                drop_diff = drop_count - last_drop_count
+                avg_drop_per_100ms = math.ceil(drop_diff / (elapsed_time / 100))
+
+                # Record data points for each 100ms interval
+                intervals = int(elapsed_time / 100)  # Number of 100ms intervals
+                for i in range(intervals):
+                    interval_time = last_egress_timestamp + i * 100_000_000  # Add 100ms in nanoseconds
+                    self.buffer.append(
+                        Point("100ms_q_drop_count")
+                        .tag("flow_id", flow_id)
+                        .tag("switch_id", switch_id)
+                        .tag("queue_id", queue_id)
+                        .field("value", avg_drop_per_100ms)
+                        .time(interval_time)
+                    )
+
+                # Flush buffer if necessary
+                if len(self.buffer) >= self.batch_size:
+                    self.flush_buffer()
+
+        # Update the last drop data for this tag combination
+        self.last_drop_data[tag_key] = (drop_count, current_time)
 
     def export_influxdb(self, flow_info):
         if not flow_info:
@@ -180,7 +217,7 @@ class Collector:
                     .tag("flow_id", flow_id)
                     .tag("queue_id", expected_queue_id)
                     .tag("switch_id", flow_info.switch_ids[i])
-                    .field("value", flow_info.hop_latencies[i] / 1000_000)  # Milliseconds
+                    .field("value", flow_info.hop_latencies[i] / 1000)  # convert Micro to Milliseconds
                     .time(flow_info.egress_tstamps[i])
                 )
                 points.append(
@@ -199,14 +236,21 @@ class Collector:
                     .field("value", flow_info.queue_occups[i])
                     .time(flow_info.egress_tstamps[i])
                 )
-                points.append(
+                '''points.append(
                     Point("queue_drop_count")
                     .tag("flow_id", flow_id)
                     .tag("switch_id", flow_info.switch_ids[i])
                     .tag("queue_id", flow_info.queue_ids[i])
                     .field("value", flow_info.queue_drops[i])
                     .time(flow_info.egress_tstamps[i])
-                )           
+                )'''
+                self.record_100ms_drop_count(
+                    flow_id,
+                    flow_info.switch_ids[i],
+                    flow_info.queue_ids[i],
+                    flow_info.queue_drops[i],
+                    flow_info.egress_tstamps[i],
+                )      
 
             for i in range(flow_info.hop_cnt - 1):
                 link_latency = abs(flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]) / 1000_000 # Milliseconds
@@ -293,13 +337,12 @@ class Collector:
                 offset += 2
             # hop_latencies
             if ins_map & HOP_LATENCY_BIT:
-                flow_info.hop_latencies.append(int.from_bytes(hop_metadata[offset:offset + 4], byteorder='big') * 1000)  # nanoseconds
+                flow_info.hop_latencies.append(int.from_bytes(hop_metadata[offset:offset + 4], byteorder='big'))  # microseconds
                 offset += 4
             # queue_ids and queue_occups
             if ins_map & QUEUE_BIT:
                 flow_info.queue_ids.append(int.from_bytes(hop_metadata[offset:offset + 1], byteorder='big'))
                 offset += 1
-                print("queue_id: ", flow_info.queue_ids)
                 flow_info.queue_occups.append(int.from_bytes(hop_metadata[offset:offset + 3], byteorder='big'))
                 offset += 3
                 flow_info.queue_drops.append(int.from_bytes(hop_metadata[offset:offset + 4], byteorder='big'))

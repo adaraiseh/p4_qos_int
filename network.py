@@ -114,9 +114,9 @@ def config_network(p4):
     net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5011 --tos 96 --m "ToS is 96" --c 0', 5, 0, True)
     net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5017 --tos 0 --m "ToS is 0" --c 0', 5, 0, True)
     
-    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6010 -u -b 0.1M -l 128 --tos 184', 2.1, 0, True)
-    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6011 -u -b 10M -l 1250 --tos 96', 2.1, 0, True)
-    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6017 -u -b 3M -l 128 --tos 0', 2.1, 0, True)
+    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6010 -u -b 1M -l 1250 --tos 184', 2.1, 0, True)
+    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6011 -u -b 2M -l 1250 --tos 96', 2.1, 0, True)
+    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6017 -u -b 2M -l 1250 --tos 0', 2.1, 0, True)
 
 
 
