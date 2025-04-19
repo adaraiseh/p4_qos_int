@@ -44,25 +44,30 @@ This is an example of how you may give instructions on setting up your project l
 
 1. Clone the repo
    ```sh
-   git clone github.com/laofan13/P4-INT.git
+   git clone https://github.com/adaraiseh/p4_qos_int.git
    ```
-2. run
-   ```sh
-   make run
+2. run the network
    ```
-3. in mininet terminal
+   make
+   ```
+3. start the influxdb collector:
+   ```
+   sudo python3 report_collector/influxdb_export.py
+   ```
+4. start RL_Agent:
+   ```
+   python3 rl_agent_3.py
+   ```
+# Hosts terminal tests:
+1. in mininet terminal
    ```sh
    xterm h1 h2
    ```
-4. open other desktop terminal,start collector
-    ```
-    sudo python3 ./receive_report.py
-    ```
-5. in xterm h2
+2. in xterm h2
     ```sh
     python3 ./receive.py
     ```
-6. in xterm h1 
+3. in xterm h1 
     ```sh
    python3 ./send.py --ip 10.0.1.1 --l4 udp --port 8080 --m "hello world !" --c 1    
    ```
