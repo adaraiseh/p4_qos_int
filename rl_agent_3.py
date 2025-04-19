@@ -177,6 +177,20 @@ class DuelingDQNAgent:
         loss.backward()
         self.optimizer.step()
 
+    def save_weights(self, filename):
+        torch.save({
+            'online_net': self.online_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'optimizer': self.optimizer.state_dict()
+        }, filename)
+        print(f"Weights saved to {filename}")
+    
+    def load_weights(self, filename):
+        checkpoint = torch.load(filename)
+        self.online_net.load_state_dict(checkpoint['online_net'])
+        self.target_net.load_state_dict(checkpoint['target_net'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        print(f"Weights loaded from {filename}")
 
 # =========================================
 #       ROUTING RL SYSTEM (ENV)
@@ -279,9 +293,9 @@ class RoutingRLSystem:
         # In real code, build a flux query with qid filter. 
         # Here, random:
         data_dict = {
-            "worst_node_id": random.randint(1, 12),
-            "penalty_worst_node": round(random.uniform(0, 10), 2),
-            "flow_latency": round(random.uniform(50, 300), 2),
+            "worst_node_id": random.randint(1, 12),                 # ID of the node with the highest violation for this queue
+            "penalty_worst_node": round(random.uniform(0, 10), 2),  # how severe that node's violation is
+            "flow_latency": round(random.uniform(50, 300), 2),      # end-to-end flow latency for this queue
             "max_link_latency": round(random.uniform(0, 80), 2),
             "max_switch_latency": round(random.uniform(0, 2), 2),
             "max_tx_util": round(random.uniform(0, 100), 2),
@@ -319,16 +333,16 @@ class RoutingRLSystem:
           9) other_queues_threshold (0 or 1)
         """
         state = np.zeros(self.state_dim, dtype=np.float32)
-        state[0] = float(qid)
-        state[1] = float(data["worst_node_id"])
-        state[2] = data["penalty_worst_node"]
-        state[3] = data["flow_latency"]
-        state[4] = 1.0 if data["near_sla"] else 0.0
-        state[5] = data["max_link_latency"]
-        state[6] = data["max_switch_latency"]
-        state[7] = data["max_tx_util"]
-        state[8] = data["sum_drop_counts"]
-        state[9] = 1.0 if data["other_queues_threshold"] else 0.0
+        state[0] = float(qid)                                           # (float) which queue class this agent is controlling
+        state[1] = float(data["worst_node_id"])                         # ID of the node with the highest violation for this queue
+        state[2] = data["penalty_worst_node"]                           # how severe that node's violation is
+        state[3] = data["flow_latency"]                                 # end-to-end flow latency for this queue
+        state[4] = 1.0 if data["near_sla"] else 0.0                     # boolean (0/1) if we are near the SLA boundary
+        state[5] = data["max_link_latency"]                             # maximum link latency across all queues
+        state[6] = data["max_switch_latency"]                           # maximum switch latency across all queues
+        state[7] = data["max_tx_util"]                                  # maximum tx_util across all queues
+        state[8] = data["sum_drop_counts"]                              # sum of drop counts across all queues
+        state[9] = 1.0 if data["other_queues_threshold"] else 0.0       # boolean (0/1) if any other queue is near threshold
         return state
 
     def compute_reward(self, qid, data, action):
@@ -408,7 +422,7 @@ class RoutingRLSystem:
 # =========================================
 if __name__ == "__main__":
     INFLUX_URL = "http://localhost:8086"
-    INFLUX_TOKEN = "YOUR_INFLUXDB_TOKEN"
+    INFLUX_TOKEN = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA=="
     INFLUX_ORG = "research"
     INFLUX_BUCKET = "INT"
 
@@ -417,12 +431,14 @@ if __name__ == "__main__":
                           org=INFLUX_ORG,
                           url=INFLUX_URL)
 
-    # Example continuous training loop
-    # We step in a round-robin over queue=0 (voice), queue=1 (video), queue=7 (best-effort)
-    # so each second, each agent gets 1 step.
-    # Adjust as needed for your scenario.
+    total_episodes = 10000
+    save_points = {
+        int(total_episodes * 0.5): "50%",
+        int(total_episodes * 0.9): "90%",
+        total_episodes: "final"
+    }
 
-    for episode in range(10000):
+    for episode in range(1, total_episodes + 1):
         ns0, r0, d0 = env.step(0)
         ns1, r1, d1 = env.step(1)
         ns7, r7, d7 = env.step(7)
@@ -430,5 +446,14 @@ if __name__ == "__main__":
         # Sleep 1s to allow "last second" data to gather
         time.sleep(1)
 
+        # Print progress every 10 episodes
         if episode % 10 == 0:
             print(f"[Episode {episode}] Rewards => voice={r0:.2f}, video={r1:.2f}, best_effort={r7:.2f}")
+
+        # Save weights at designated milestones
+        if episode in save_points:
+            checkpoint_name = save_points[episode]
+            env.agent_voice.save_weights(f"training_files/agent_voice_weights_{checkpoint_name}.pth")
+            env.agent_video.save_weights(f"training_files/agent_video_weights_{checkpoint_name}.pth")
+            env.agent_best_effort.save_weights(f"training_files/agent_best_effort_weights_{checkpoint_name}.pth")
+            print(f"[INFO] Weights saved at {checkpoint_name} completion.")

@@ -7,7 +7,7 @@ from influxdb_client import InfluxDBClient
 from collector import *
 
 INFLUX_URL = "http://localhost:8086"
-INFLUX_TOKEN = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA=="  # Replace with your InfluxDB 2 token
+INFLUX_TOKEN = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA=="
 INFLUX_ORG = "research"
 INFLUX_BUCKET = "INT"
 

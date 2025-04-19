@@ -168,7 +168,7 @@ class Collector:
         self.buffer = []  # Buffer to hold points
         self.last_drop_data = {}  # Store (drop_count, timestamp)
 
-    def record_100ms_drop_count(self, flow_id, switch_id, queue_id, drop_count, last_egress_timestamp):
+    def record_100ms_drop_count(self, flow_id, switch_id, egress_port, queue_id, drop_count, last_egress_timestamp):
         # Unique key for the current tag combination
         tag_key = (flow_id, switch_id, queue_id)
         current_time = time.time()  # Current time in seconds
@@ -191,6 +191,7 @@ class Collector:
                         Point("100ms_q_drop_count")
                         .tag("flow_id", flow_id)
                         .tag("switch_id", switch_id)
+                        .tag("egress_port", egress_port)
                         .tag("queue_id", queue_id)
                         .field("value", avg_drop_per_100ms)
                         .time(interval_time)
@@ -208,14 +209,14 @@ class Collector:
             return
         try:
             points = []
-            flow_id = (flow_info.dst_port // 10) % 100
-            expected_queue_id = flow_info.dst_port % 10
+            flow_id = (flow_info.dst_port // 10) % 100 # digit 2 and 3 for the dst port
+            expected_queue_id = flow_info.dst_port % 10 # digit 4 of the dst port
 
             for i in range(flow_info.hop_cnt):
                 points.append(
                     Point("switch_latency")
                     .tag("flow_id", flow_id)
-                    .tag("queue_id", expected_queue_id)
+                    .tag("queue_id", flow_info.queue_ids[i])
                     .tag("switch_id", flow_info.switch_ids[i])
                     .field("value", flow_info.hop_latencies[i] / 1000)  # convert Micro to Milliseconds
                     .time(flow_info.egress_tstamps[i])
@@ -225,9 +226,13 @@ class Collector:
                     .tag("flow_id", flow_id)
                     .tag("switch_id", flow_info.switch_ids[i])
                     .tag("egress_port", flow_info.l1_egress_ports[i])
+                    .tag("queue_id", flow_info.queue_ids[i])
                     .field("value", flow_info.egress_tx_utils[i])
                     .time(flow_info.egress_tstamps[i])
                 )
+
+                # if flow_info.queue_ids[i] != expected_queue_id:
+                #     print(f"switch id={flow_info.switch_ids[i]} expected_queue={expected_queue_id} and queue id={flow_info.queue_ids[i]}")
                 points.append(
                     Point("queue_occupancy")
                     .tag("flow_id", flow_id)
@@ -247,6 +252,7 @@ class Collector:
                 self.record_100ms_drop_count(
                     flow_id,
                     flow_info.switch_ids[i],
+                    flow_info.l1_egress_ports[i],
                     flow_info.queue_ids[i],
                     flow_info.queue_drops[i],
                     flow_info.egress_tstamps[i],
