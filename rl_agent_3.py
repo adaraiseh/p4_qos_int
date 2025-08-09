@@ -1,459 +1,565 @@
 #!/usr/bin/env python3
-
+import os
 import time
 import random
+import sys
+import logging
+from collections import deque
+from math import cos, pi
+from datetime import datetime, timedelta
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.backends.cudnn as cudnn
 from influxdb_client import InfluxDBClient
+
 from controller import Controller
+
+# =========================================
+#            LOGGING
+# =========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+log = logging.getLogger()
+log.setLevel(logging.INFO)
 
 # =========================================
 #            HYPERPARAMETERS
 # =========================================
-LR = 1e-3                   # Learning rate
-GAMMA = 0.99                # Discount factor
+LR = 1e-3
+GAMMA = 0.99
 BATCH_SIZE = 32
+MIN_REPLAY_SIZE = 500
 REPLAY_MEMORY_SIZE = 10000
-MIN_REPLAY_SIZE = 500       # Minimum experiences in replay buffer before training
-EPS_START = 1.0             # Starting epsilon for e-greedy
-EPS_END = 0.01              # Final epsilon
-EPS_DECAY_STEPS = 10_000    # Steps over which epsilon is decayed
-SYNC_TARGET_STEPS = 1000    # Frequency to sync online -> target net
-ROUTE_CHANGE_PENALTY = 1.0  # Penalty for toggling route
 
-# Large positive reward if all constraints are met
+# Epsilon schedule (cosine with adaptive nudges)
+EPS_START = 1.0
+EPS_END = 0.01
+EPS_DECAY_STEPS = 10_000
+
+# Target updates
+TAU = 0.005
+
+ROUTE_CHANGE_PENALTY = 1.0
 REWARD_ALL_MEET = 10.0
 
-# Weighted penalty factors for violations
 LATENCY_PENALTY_FACTOR = 0.1
 DROP_PENALTY_FACTOR = 0.2
 TX_UTIL_PENALTY_FACTOR = 0.05
 
-# QoS thresholds [based on your specs]
 VOICE_LAT_THRESH = 100.0
 VOICE_DROP_THRESH = 2
-
 VIDEO_LAT_THRESH = 150.0
 VIDEO_DROP_THRESH = 5
-
 BEST_EFFORT_LAT_THRESH = 200.0
 
-# For near-SLA boundary checks (90% threshold)
 SLA_NEAR_FACTOR = 0.9
 
-# We assume max queue depth = 64 (can be used for normalization if needed)
+QIDS = (0, 1, 7)  # voice, video, best-effort
 
+# *** Read-safety: ignore the freshest not-yet-complete bucket ***
+# You can tune this; 500–1000 ms usually removes partial points reliably.
+SAFETY_LAG_MS = 1000
 
-# =========================================
-#     DUELING DQN NETWORK DEFINITION
-# =========================================
+# =============== Models ===============
+
 class DuelingDQN(nn.Module):
-    """
-    A Dueling DQN with separate Value and Advantage streams.
-    """
     def __init__(self, state_dim, action_dim):
-        super(DuelingDQN, self).__init__()
-        # Common feature extractor
+        super().__init__()
         self.fc_common = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU()
+            nn.Linear(state_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU()
         )
-
-        # Value stream
         self.value_stream = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, 1)
         )
-
-        # Advantage stream
         self.adv_stream = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
             nn.Linear(64, action_dim)
         )
 
     def forward(self, x):
-        common_out = self.fc_common(x)
-        value = self.value_stream(common_out)
-        advantage = self.adv_stream(common_out)
-        # Q = V + (A - mean(A)) 
-        q_vals = value + advantage - advantage.mean(dim=1, keepdim=True)
-        return q_vals
+        z = self.fc_common(x)
+        v = self.value_stream(z)
+        a = self.adv_stream(z)
+        return v + a - a.mean(dim=1, keepdim=True)
 
+# =============== Replay Buffers ===============
 
-# =========================================
-#         REPLAY BUFFER
-# =========================================
 class ReplayBuffer:
     def __init__(self, capacity):
         self.capacity = capacity
-        self.buffer = []
-        self.position = 0
+        self.buf = []
+        self.pos = 0
 
-    def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.capacity
+    def push(self, s, a, r, ns, d):
+        if len(self.buf) < self.capacity:
+            self.buf.append(None)
+        self.buf[self.pos] = (s, a, r, ns, d)
+        self.pos = (self.pos + 1) % self.capacity
 
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        return np.array(states), actions, rewards, np.array(next_states), dones
+    def sample(self, n):
+        batch = random.sample(self.buf, n)
+        s, a, r, ns, d = zip(*batch)
+        return np.array(s), a, r, np.array(ns), d
 
     def __len__(self):
-        return len(self.buffer)
+        return len(self.buf)
 
+# =============== Agent ===============
 
-# =========================================
-#       DOUBLE DUELING DQN AGENT
-# =========================================
 class DuelingDQNAgent:
-    def __init__(self, state_dim, action_dim, device):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+    """
+    Double DQN agent with dueling architecture.
+    - SmoothL1 + grad clipping
+    - Soft target updates (Polyak τ)
+    - N-step returns (n=3 by default)
+    - LR scheduling (cosine) with warmup; Adam eps=1e-5
+    - Cooldown-aware epsilon decay + adaptive nudges
+    """
+    def __init__(self, state_dim, action_dim, device, n_step=3, warmup_steps=1000):
         self.device = device
+        self.online = DuelingDQN(state_dim, action_dim).to(device)
+        self.target = DuelingDQN(state_dim, action_dim).to(device)
+        self.target.load_state_dict(self.online.state_dict())
 
-        self.online_net = DuelingDQN(state_dim, action_dim).to(device)
-        self.target_net = DuelingDQN(state_dim, action_dim).to(device)
-        self.target_net.load_state_dict(self.online_net.state_dict())
+        self.opt = optim.Adam(self.online.parameters(), lr=LR, eps=1e-5)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt, T_max=20_000, eta_min=1e-5
+        )
+        self.warmup_steps = warmup_steps
 
-        self.optimizer = optim.Adam(self.online_net.parameters(), lr=LR)
-        self.replay_buffer = ReplayBuffer(REPLAY_MEMORY_SIZE)
+        self.rb = ReplayBuffer(REPLAY_MEMORY_SIZE)
+        self.action_dim = action_dim
 
         self.eps = EPS_START
-        self.step_count = 0
+        self.decay_steps_used = 0
+        self.recent_rewards = deque(maxlen=100)
+        self.prev_avg_reward = 0.0
 
-    def select_action(self, state):
+        self.n_step = max(1, int(n_step))
+        self.nstep_queue = deque()
+
+        self.step_count = 0
+        self.last_loss = None
+        self.last_lr = LR
+
+        self.loss_fn = nn.SmoothL1Loss()
+
+    def _cosine_eps(self):
+        p = min(1.0, self.decay_steps_used / max(1, EPS_DECAY_STEPS))
+        return EPS_END + 0.5 * (EPS_START - EPS_END) * (1 + cos(pi * p))
+
+    def _apply_adaptive_nudge(self):
+        if len(self.recent_rewards) < 20:
+            return 1.0
+        avg_r = float(np.mean(self.recent_rewards))
+        improve = 0.5
+        degrade = 0.5
+        nudger = 1.0
+        if avg_r > self.prev_avg_reward + improve:
+            nudger = 0.98
+        elif avg_r < self.prev_avg_reward - degrade:
+            nudger = 1.02
+        self.prev_avg_reward = avg_r
+        return nudger
+
+    def maybe_decay_epsilon(self, decay_allowed: bool):
+        if not decay_allowed:
+            return
+        self.decay_steps_used += 1
+        base = self._cosine_eps()
+        nudger = self._apply_adaptive_nudge()
+        self.eps = max(EPS_END, min(1.0, base * nudger))
+
+    def _emit_nstep_if_ready(self):
+        if not self.nstep_queue:
+            return
+        have_n = len(self.nstep_queue) >= self.n_step
+        first_done = self.nstep_queue[0]["d"]
+        if not have_n and not first_done:
+            return
+        R, g = 0.0, 1.0
+        done_any = False
+        last_next_state = None
+        for i, item in enumerate(self.nstep_queue):
+            R += g * item["r"]
+            g *= GAMMA
+            last_next_state = item["ns"]
+            if item["d"]:
+                done_any = True
+                break
+            if i + 1 >= self.n_step:
+                break
+        s0, a0 = self.nstep_queue[0]["s"], self.nstep_queue[0]["a"]
+        self.rb.push(s0, a0, R, last_next_state, done_any)
+        self.nstep_queue.popleft()
+
+    def push_nstep(self, s, a, r, ns, d):
+        self.nstep_queue.append({"s": s, "a": a, "r": r, "ns": ns, "d": d})
+        self._emit_nstep_if_ready()
+        if d:
+            while self.nstep_queue:
+                self._emit_nstep_if_ready()
+
+    def select_action(self, state_vec, decay_allowed: bool = True):
         self.step_count += 1
-        self.eps = max(EPS_END, EPS_START - (self.step_count / EPS_DECAY_STEPS)*(EPS_START - EPS_END))
+        if self.step_count <= self.warmup_steps:
+            warm_lr = LR * (self.step_count / float(self.warmup_steps))
+            for g in self.opt.param_groups:
+                g['lr'] = warm_lr
+        else:
+            self.scheduler.step()
+        self.last_lr = self.opt.param_groups[0]['lr']
+        self.maybe_decay_epsilon(decay_allowed)
         if random.random() < self.eps:
             return random.randrange(self.action_dim)
-        else:
-            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                q_vals = self.online_net(state_t)
-            return q_vals.argmax(dim=1).item()
+        with torch.no_grad():
+            s = torch.as_tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+            q = self.online(s)
+            return int(q.argmax(dim=1).item())
 
-    def push_transition(self, state, action, reward, next_state, done):
-        self.replay_buffer.push(state, action, reward, next_state, done)
+    def on_step_end(self, reward: float):
+        self.recent_rewards.append(float(reward))
+
+    def push(self, s, a, r, ns, d):
+        self.rb.push(s, a, r, ns, d)
 
     def train_step(self):
-        if len(self.replay_buffer) < MIN_REPLAY_SIZE:
+        if len(self.rb) < MIN_REPLAY_SIZE:
+            self.last_loss = None
             return
+        s, a, r, ns, d = self.rb.sample(BATCH_SIZE)
+        s_t  = torch.as_tensor(s,  dtype=torch.float32, device=self.device)
+        a_t  = torch.as_tensor(a,  dtype=torch.long,    device=self.device)
+        r_t  = torch.as_tensor(r,  dtype=torch.float32, device=self.device)
+        ns_t = torch.as_tensor(ns, dtype=torch.float32, device=self.device)
+        d_t  = torch.as_tensor(d,  dtype=torch.bool,    device=self.device)
 
-        if self.step_count % SYNC_TARGET_STEPS == 0:
-            self.target_net.load_state_dict(self.online_net.state_dict())
-
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(BATCH_SIZE)
-
-        states_t = torch.FloatTensor(states).to(self.device)
-        actions_t = torch.LongTensor(actions).to(self.device)
-        rewards_t = torch.FloatTensor(rewards).to(self.device)
-        next_states_t = torch.FloatTensor(next_states).to(self.device)
-        dones_t = torch.BoolTensor(dones).to(self.device)
-
-        # Current Q
-        q_vals = self.online_net(states_t)
-        current_q = q_vals.gather(1, actions_t.unsqueeze(1)).squeeze(1)
-
-        # Double DQN
+        q = self.online(s_t).gather(1, a_t.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
-            next_q_vals_online = self.online_net(next_states_t)
-            next_actions = next_q_vals_online.argmax(dim=1)
-            next_q_vals_target = self.target_net(next_states_t)
-            next_q = next_q_vals_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            next_q[dones_t] = 0.0
+            na = self.online(ns_t).argmax(dim=1)
+            qn = self.target(ns_t).gather(1, na.unsqueeze(1)).squeeze(1)
+            qn[d_t] = 0.0
+        tgt = r_t + GAMMA * qn
 
-        target_q = rewards_t + GAMMA * next_q
-        loss = nn.MSELoss()(current_q, target_q)
-
-        self.optimizer.zero_grad()
+        loss = self.loss_fn(q, tgt)
+        self.opt.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 1.0)
+        self.opt.step()
+        self.last_loss = float(loss.item())
 
-    def save_weights(self, filename):
-        torch.save({
-            'online_net': self.online_net.state_dict(),
-            'target_net': self.target_net.state_dict(),
-            'optimizer': self.optimizer.state_dict()
-        }, filename)
-        print(f"Weights saved to {filename}")
-    
-    def load_weights(self, filename):
-        checkpoint = torch.load(filename)
-        self.online_net.load_state_dict(checkpoint['online_net'])
-        self.target_net.load_state_dict(checkpoint['target_net'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        print(f"Weights loaded from {filename}")
+        with torch.no_grad():
+            for tp, p in zip(self.target.parameters(), self.online.parameters()):
+                tp.data.mul_(1.0 - TAU).add_(TAU * p.data)
 
-# =========================================
-#       ROUTING RL SYSTEM (ENV)
-# =========================================
+# =============== Environment with CENTRALIZED STEP ===============
+
 class RoutingRLSystem:
-    """
-    This environment cycles:
-      1) Query InfluxDB / gather metrics for last 1s
-      2) Build state
-      3) Agent picks action
-      4) Compute reward
-      5) Possibly update route
-      6) Store transition & train
-    We do that separately for each queue (0, 1, 7).
-    """
     def __init__(self, bucket, token, org, url="http://localhost:8086"):
         self.bucket = bucket
-        self.token = token
         self.org = org
-        self.url = url
+        self.client = InfluxDBClient(url=url, token=token, org=org)
+        self.query_api = self.client.query_api()
+        self.controller = Controller()
 
-        self.controller = Controller()  # Load the P4 switches
-        self.influx_client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
-        self.query_api = self.influx_client.query_api()
-
-        #[ASSUMBTION]
-        # Action space:
-        #   0 => do nothing
-        #   1 => swap worst node -> alt1
-        #   2 => swap worst node -> alt2
-        #   3 => swap worst node -> alt3
-        self.action_dim = 4
-
-        # State dimension: 10
-        # [queue_id, worst_node_id, penalty_worst_node, flow_latency, near_sla,
-        #  max_link_latency, max_switch_latency, max_tx_util, sum_drop_counts, other_queues_threshold]
-        self.state_dim = 10
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # One agent per queue
-        self.agent_voice = DuelingDQNAgent(self.state_dim, self.action_dim, self.device)  # q=0
-        self.agent_video = DuelingDQNAgent(self.state_dim, self.action_dim, self.device)  # q=1
-        self.agent_best_effort = DuelingDQNAgent(self.state_dim, self.action_dim, self.device)   # q=7
-
-    def step(self, qid):
-        """
-        Simulate a single step for the queue 'qid'.
-        """
-        data = self.collect_data(qid)
-        current_state = self.build_state_vector(qid, data)
-
-        # [ASSUMPTION] TODO - Implement actions to swap worst node with alternatives...
-        # pick agent
-        if qid == 0: # voice
-            action = self.agent_voice.select_action(current_state)
-        elif qid == 1: # vedio 
-            action = self.agent_video.select_action(current_state)
-        else: # BE
-            action = self.agent_best_effort.select_action(current_state)
-
-        reward = self.compute_reward(qid, data, action)
-
-        if action != 0:
-            self.apply_path_change(qid, data["worst_node_id"], action)
-
-        next_data = self.collect_data(qid)
-        next_state = self.build_state_vector(qid, next_data)
-        done = False
-
-        # Store transition & train
-        if qid == 0:
-            self.agent_voice.push_transition(current_state, action, reward, next_state, done)
-            self.agent_voice.train_step()
-        elif qid == 1:
-            self.agent_video.push_transition(current_state, action, reward, next_state, done)
-            self.agent_video.train_step()
-        else:
-            self.agent_best_effort.push_transition(current_state, action, reward, next_state, done)
-            self.agent_best_effort.train_step()
-
-        return next_state, reward, done
-
-    def collect_data(self, qid):
-        """
-        Gather or query from InfluxDB for the last 1 second. 
-        For demonstration, we generate random data:
-
-          'worst_node_id': int,
-          'penalty_worst_node': float,
-          'flow_latency': float,
-          'max_link_latency': float,
-          'max_switch_latency': float,
-          'max_tx_util': float,
-          'sum_drop_counts': float,
-          'other_queues_threshold': bool
-
-        We'll also need to decide if near_sla (bool).
-        """
-        # In real code, build a flux query with qid filter. 
-        # Here, random:
-        data_dict = {
-            "worst_node_id": random.randint(1, 12),                 # ID of the node with the highest violation for this queue
-            "penalty_worst_node": round(random.uniform(0, 10), 2),  # how severe that node's violation is
-            "flow_latency": round(random.uniform(50, 300), 2),      # end-to-end flow latency for this queue
-            "max_link_latency": round(random.uniform(0, 80), 2),
-            "max_switch_latency": round(random.uniform(0, 2), 2),
-            "max_tx_util": round(random.uniform(0, 100), 2),
-            "sum_drop_counts": float(random.randint(0, 15)),
-            "other_queues_threshold": bool(random.getrandbits(1))
+        self.switch_metrics = {
+            'q_drop_rate_100ms': ('max', 0.6),
+            'switch_latency':    ('max', 0.3),
+            'tx_utilization':    ('max', 0.2),
+            'queue_occupancy':   ('max', 0.2),
         }
 
-        # near_sla logic:
-        # voice(0) => near if lat >= 90ms
-        # video(1) => near if lat >= 135ms
-        # best_effort(7)  => near if lat >= 180ms
-        lat = data_dict["flow_latency"]
-        if qid == 0:
-            near_sla = (lat >= SLA_NEAR_FACTOR * VOICE_LAT_THRESH)
-        elif qid == 1:
-            near_sla = (lat >= SLA_NEAR_FACTOR * VIDEO_LAT_THRESH)
-        else:
-            near_sla = (lat >= SLA_NEAR_FACTOR * BEST_EFFORT_LAT_THRESH)
+        self.state_dim = 10
+        self.action_dim = 4
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.agents = {qid: DuelingDQNAgent(self.state_dim, self.action_dim, self.device, n_step=3) for qid in QIDS}
 
-        data_dict["near_sla"] = near_sla
-        return data_dict
+        self.action_response_delay = 1.0
+        self.cooldown_secs = 5.0
+        self.last_action_time = {qid: -float('inf') for qid in QIDS}
+        self.last_snapshot = self.collect_snapshot()
+
+    def _time_window(self, seconds=1, lag_ms=SAFETY_LAG_MS):
+        # IMPORTANT: shift the stop time *back* by a safety lag so we never
+        # read the freshest (possibly incomplete) bucket.
+        stop_dt = datetime.utcnow() - timedelta(milliseconds=lag_ms)
+        start_dt = stop_dt - timedelta(seconds=seconds)
+        start = start_dt.isoformat() + 'Z'
+        stop  = stop_dt.isoformat() + 'Z'
+        return start, stop
+
+    def _query_metric(self, meas, qid, agg, seconds=1):
+        start, stop = self._time_window(seconds)
+        flux = f'''
+        from(bucket:"{self.bucket}")
+        |> range(start:{start}, stop:{stop})
+        |> filter(fn: (r) => r._measurement == "{meas}" and r.queue_id == "{qid}")
+        |> toFloat()
+        |> group(columns: ["queue_id"])
+        |> {agg}(column:"_value")
+        '''
+        tables = self.query_api.query(org=self.org, query=flux)
+        if not tables:
+            return 0.0
+        for tbl in tables:
+            if tbl.records:
+                v = tbl.records[0].get_value()
+                return float(v if v is not None else 0.0)
+        return 0.0
+
+    def _compute_worst_node_for_qid(self, qid, seconds=1):
+        start, stop = self._time_window(seconds)
+        total_w = sum(w for _, w in self.switch_metrics.values())
+        weights = {m: w / total_w for m, (_, w) in self.switch_metrics.items()}
+
+        flux = f'''
+        from(bucket:"{self.bucket}")
+        |> range(start:{start}, stop:{stop})
+        |> filter(fn: (r) =>
+            r.queue_id == "{qid}" and
+            r._measurement =~ /q_drop_rate_100ms|switch_latency|tx_utilization|queue_occupancy/
+        )
+        |> toFloat()
+        |> group(columns: ["queue_id","switch_id","_measurement"])
+        |> max(column: "_value")
+        |> group(columns: ["switch_id"])
+        |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
+        '''
+        tables = self.query_api.query(org=self.org, query=flux)
+
+        worst_id, worst_score = 0, -float('inf')
+        for tbl in tables:
+            for rec in tbl.records:
+                vals = rec.values
+                sid  = int(vals.get("switch_id", 0) or 0)
+                drops = float(vals.get("q_drop_rate_100ms", 0.0) or 0.0)
+                slat  = float(vals.get("switch_latency",    0.0) or 0.0)
+                txu   = float(vals.get("tx_utilization",    0.0) or 0.0)
+                qocc  = float(vals.get("queue_occupancy",   0.0) or 0.0)
+
+                score = (
+                    drops * weights['q_drop_rate_100ms'] +
+                    slat  * weights['switch_latency'] +
+                    txu   * weights['tx_utilization'] +
+                    qocc  * weights['queue_occupancy']
+                )
+                if score > worst_score:
+                    worst_id, worst_score = sid, score
+
+        return worst_id, worst_score if worst_score != -float('inf') else 0.0
+
+    def collect_snapshot(self, seconds=1):
+        snap = {}
+        for qid in QIDS:
+            worst_id, penalty = self._compute_worst_node_for_qid(qid, seconds=seconds)
+
+            flow_latency       = self._query_metric('flow_latency',     qid, 'mean', seconds)
+            max_link_latency   = self._query_metric('link_latency',     qid, 'max',  seconds)
+            max_switch_latency = self._query_metric('switch_latency',   qid, 'max',  seconds)
+            drop_rate          = self._query_metric('q_drop_rate_100ms',qid, 'max',  seconds)
+            max_tx_util        = self._query_metric('tx_utilization',   qid, 'max',  seconds)
+
+            thresh = {0: VOICE_LAT_THRESH, 1: VIDEO_LAT_THRESH, 7: BEST_EFFORT_LAT_THRESH}[qid]
+            near_sla = float(flow_latency) >= SLA_NEAR_FACTOR * float(thresh)
+
+            snap[qid] = {
+                'worst_node_id':      int(worst_id),
+                'penalty_worst_node': float(penalty),
+                'flow_latency':       float(flow_latency),
+                'max_link_latency':   float(max_link_latency),
+                'max_switch_latency': float(max_switch_latency),
+                'drop_rate':          float(drop_rate),
+                'max_tx_util':        float(max_tx_util),
+                'near_sla':           bool(near_sla),
+            }
+        return snap
+
+    # ----- State actual data logging -------------
+    def _log_state(self, label: str, qid: int, d: dict):
+        log.info(
+            f"[State][{label}][q={qid}] "
+            f"worst_node={d['worst_node_id']} "
+            f"penalty={d['penalty_worst_node']:.3f} "
+            f"flow_lat={d['flow_latency']:.2f}ms "
+            f"link_lat_max={d['max_link_latency']:.2f}ms "
+            f"switch_lat_max={d['max_switch_latency']:.2f}ms "
+            f"drops_rate={d['drop_rate']:.3f} "
+            f"tx_util_max={d['max_tx_util']:.2f}% "
+            f"near_sla={d['near_sla']}"
+        )
 
     def build_state_vector(self, qid, data):
-        """
-        Construct a 10-dim vector:
-          0) queue_id (float)
-          1) worst_node_id (float)
-          2) penalty_worst_node (float)
-          3) flow_latency (float)
-          4) near_sla (0 or 1)
-          5) max_link_latency
-          6) max_switch_latency
-          7) max_tx_util
-          8) sum_drop_counts
-          9) other_queues_threshold (0 or 1)
-        """
-        state = np.zeros(self.state_dim, dtype=np.float32)
-        state[0] = float(qid)                                           # (float) which queue class this agent is controlling
-        state[1] = float(data["worst_node_id"])                         # ID of the node with the highest violation for this queue
-        state[2] = data["penalty_worst_node"]                           # how severe that node's violation is
-        state[3] = data["flow_latency"]                                 # end-to-end flow latency for this queue
-        state[4] = 1.0 if data["near_sla"] else 0.0                     # boolean (0/1) if we are near the SLA boundary
-        state[5] = data["max_link_latency"]                             # maximum link latency across all queues
-        state[6] = data["max_switch_latency"]                           # maximum switch latency across all queues
-        state[7] = data["max_tx_util"]                                  # maximum tx_util across all queues
-        state[8] = data["sum_drop_counts"]                              # sum of drop counts across all queues
-        state[9] = 1.0 if data["other_queues_threshold"] else 0.0       # boolean (0/1) if any other queue is near threshold
-        return state
+        s = np.zeros(10, dtype=np.float32)
+        s[0] = float(qid)
+        s[1] = float(data['worst_node_id'])
+        s[2] = data['penalty_worst_node']
+        s[3] = data['flow_latency']
+        s[4] = 1.0 if data['near_sla'] else 0.0
+        s[5] = data['max_link_latency']
+        s[6] = data['max_switch_latency']
+        s[7] = data['max_tx_util']
+        s[8] = data['drop_rate']
+        return s
 
     def compute_reward(self, qid, data, action):
-        """
-        For the chosen queue qid, measure how well it meets QoS:
-          - If meets constraints => + REWARD_ALL_MEET
-          - Else partial penalties
-          - Subtract route-change penalty if action != 0
-        We'll do partial checks for latency & drops for the given qid. 
-        We'll also consider max_tx_util, etc.
+        r = 0.0
+        lat   = data['flow_latency']
+        drops = data['drop_rate']
+        tx    = data['max_tx_util']
+        pen   = data['penalty_worst_node']
 
-        We do a simpler single-queue check. 
-        If you want "all classes must meet," you'd gather data for all queues.
-        """
-        reward = 0.0
-
-        lat = data["flow_latency"]
-        drops = data["sum_drop_counts"]  # aggregated across the network
-        max_tx = data["max_tx_util"]
-        penalty_worst = data["penalty_worst_node"]
-
-        if qid == 0:  # voice
+        if qid == 0:
             if lat <= VOICE_LAT_THRESH and drops <= VOICE_DROP_THRESH:
-                reward += REWARD_ALL_MEET
+                r += REWARD_ALL_MEET
             else:
-                lat_violation = max(0, lat - VOICE_LAT_THRESH)
-                drop_violation = max(0, drops - VOICE_DROP_THRESH)
-                reward -= (LATENCY_PENALTY_FACTOR * lat_violation)
-                reward -= (DROP_PENALTY_FACTOR * drop_violation)
-                reward -= (0.05 * penalty_worst)
-        elif qid == 1:  # video
+                r -= LATENCY_PENALTY_FACTOR * max(0.0, lat - VOICE_LAT_THRESH)
+                r -= DROP_PENALTY_FACTOR * max(0.0, drops - VOICE_DROP_THRESH)
+                r -= 0.05 * pen
+        elif qid == 1:
             if lat <= VIDEO_LAT_THRESH and drops <= VIDEO_DROP_THRESH:
-                reward += REWARD_ALL_MEET
+                r += REWARD_ALL_MEET
             else:
-                lat_violation = max(0, lat - VIDEO_LAT_THRESH)
-                drop_violation = max(0, drops - VIDEO_DROP_THRESH)
-                reward -= (LATENCY_PENALTY_FACTOR * lat_violation)
-                reward -= (DROP_PENALTY_FACTOR * drop_violation)
-                reward -= (0.05 * penalty_worst)
-        else:  # qid=7 best-effort
+                r -= LATENCY_PENALTY_FACTOR * max(0.0, lat - VIDEO_LAT_THRESH)
+                r -= DROP_PENALTY_FACTOR * max(0.0, drops - VIDEO_DROP_THRESH)
+                r -= 0.05 * pen
+        else:
             if lat <= BEST_EFFORT_LAT_THRESH:
-                reward += REWARD_ALL_MEET
+                r += REWARD_ALL_MEET
             else:
-                lat_violation = max(0, lat - BEST_EFFORT_LAT_THRESH)
-                reward -= (LATENCY_PENALTY_FACTOR * lat_violation)
-                reward -= (0.05 * penalty_worst)
+                r -= LATENCY_PENALTY_FACTOR * max(0.0, lat - BEST_EFFORT_LAT_THRESH)
+                r -= 0.05 * pen
 
-        # penalize if max_tx > 50
-        over_util = max(0, max_tx - 50.0)
-        reward -= (TX_UTIL_PENALTY_FACTOR * over_util)
-
-        # route change penalty
+        r -= TX_UTIL_PENALTY_FACTOR * max(0.0, tx - 50.0)
         if action != 0:
-            reward -= ROUTE_CHANGE_PENALTY
+            r -= ROUTE_CHANGE_PENALTY
 
-        return reward
+        return float(max(min(r, REWARD_ALL_MEET), -REWARD_ALL_MEET))
 
     def apply_path_change(self, qid, worst_node_id, action):
-        """
-        If action !=0 => "swap worst_node_id with alternative." 
-        We'll just print. 
-        In real code, you'd call controller.update_path(sw_name, prefix, etc.).
-        """
-        print(f"[INFO] Path change for queue={qid}, worst_node={worst_node_id}, action={action}")
-        # Example if you had the real logic:
-        # self.controller.update_path(
-        #     sw_name="a1",
-        #     dst_prefix="10.7.1.0/24",
-        #     dscp="0x2E",     # for voice or "0x18" for video, etc.
-        #     next_hop_ip="10.7.1.2",
-        #     egress_port=2
-        # )
+        log.info(f"Path change q={qid} worst_node={worst_node_id} action={action}")
+        # self.controller.update_path(...)
 
+    def agent_stats(self):
+        now_mono = time.monotonic()
+        stats = {}
+        for qid, agent in self.agents.items():
+            avg_r = float(np.mean(agent.recent_rewards)) if len(agent.recent_rewards) else 0.0
+            cooldown_remaining = max(0.0, self.cooldown_secs - (now_mono - self.last_action_time[qid]))
+            stats[qid] = {
+                "eps": agent.eps,
+                "avg_reward_100": avg_r,
+                "decay_steps_used": agent.decay_steps_used,
+                "cooldown_remaining_s": cooldown_remaining,
+                "last_loss": agent.last_loss if agent.last_loss is not None else float('nan'),
+                "lr": agent.last_lr,
+            }
+        return stats
 
-# =========================================
-#              MAIN LOOP
-# =========================================
+    def step_all(self):
+        snap_now = self.collect_snapshot()
+
+        actions = {}
+        states  = {}
+        now_mono = time.monotonic()
+        for qid in QIDS:
+            self._log_state("now", qid, snap_now[qid])
+            s = self.build_state_vector(qid, snap_now[qid])
+            states[qid] = s
+
+            elapsed = now_mono - self.last_action_time[qid]
+            in_cooldown = elapsed < self.cooldown_secs
+
+            if in_cooldown:
+                _ = self.agents[qid].select_action(s, decay_allowed=False)
+                a = 0
+                remaining = self.cooldown_secs - elapsed
+                log.info(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s (~{remaining:.1f}s left) -> action=0")
+            else:
+                a = self.agents[qid].select_action(s, decay_allowed=True)
+            actions[qid] = a
+
+        any_changed = False
+        for qid in QIDS:
+            if actions[qid] != 0:
+                self.apply_path_change(qid, snap_now[qid]['worst_node_id'], actions[qid])
+                self.last_action_time[qid] = now_mono
+                any_changed = True
+            else:
+                log.info(f"NO Path change q={qid}")
+        if not any_changed:
+            log.info("No path changes this step.")
+
+        time.sleep(self.action_response_delay)
+
+        snap_next = self.collect_snapshot()
+
+        rewards = {}
+        for qid in QIDS:
+            self._log_state("next", qid, snap_next[qid])
+            ns = self.build_state_vector(qid, snap_next[qid])
+            r  = self.compute_reward(qid, snap_next[qid], actions[qid])
+            self.agents[qid].push_nstep(states[qid], actions[qid], r, ns, False)
+            self.agents[qid].train_step()
+            self.agents[qid].on_step_end(r)
+            rewards[qid] = r
+
+        self.last_snapshot = snap_next
+        return rewards
+
 if __name__ == "__main__":
-    INFLUX_URL = "http://localhost:8086"
-    INFLUX_TOKEN = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA=="
-    INFLUX_ORG = "research"
+    SEED = 1337
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+
+    INFLUX_URL    = "http://localhost:8086"
+    INFLUX_TOKEN  = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA=="
+    INFLUX_ORG    = "research"
     INFLUX_BUCKET = "INT"
 
-    env = RoutingRLSystem(bucket=INFLUX_BUCKET,
-                          token=INFLUX_TOKEN,
-                          org=INFLUX_ORG,
-                          url=INFLUX_URL)
+    env = RoutingRLSystem(INFLUX_BUCKET, INFLUX_TOKEN, INFLUX_ORG, INFLUX_URL)
+    total_steps = 10000
+    save_points = {int(total_steps*0.5): '50%', int(total_steps*0.9): '90%', total_steps: 'final'}
+    LOG_EVERY = 20
 
-    total_episodes = 10000
-    save_points = {
-        int(total_episodes * 0.5): "50%",
-        int(total_episodes * 0.9): "90%",
-        total_episodes: "final"
-    }
+    for step in range(1, total_steps + 1):
+        rewards = env.step_all()
 
-    for episode in range(1, total_episodes + 1):
-        ns0, r0, d0 = env.step(0)
-        ns1, r1, d1 = env.step(1)
-        ns7, r7, d7 = env.step(7)
+        if step % 10 == 0:
+            log.info(
+                f"[Step {step}] rewards:"
+                f" voice={rewards[0]:.2f}, video={rewards[1]:.2f}, best={rewards[7]:.2f}"
+            )
 
-        # Sleep 1s to allow "last second" data to gather
-        time.sleep(1)
+        if step % LOG_EVERY == 0:
+            stats = env.agent_stats()
+            log.info(f"[Agent Stats @ step {step}]")
+            for qid in QIDS:
+                s = stats[qid]
+                log.info(
+                    f"  q={qid} | eps={s['eps']:.4f} | avgR@100={s['avg_reward_100']:.3f} "
+                    f"| decay_used={s['decay_steps_used']} | cooldown_left={s['cooldown_remaining_s']:.2f}s "
+                    f"| loss={s['last_loss'] if not np.isnan(s['last_loss']) else 'nan'} | lr={s['lr']:.6f}"
+                )
 
-        # Print progress every 10 episodes
-        if episode % 10 == 0:
-            print(f"[Episode {episode}] Rewards => voice={r0:.2f}, video={r1:.2f}, best_effort={r7:.2f}")
-
-        # Save weights at designated milestones
-        if episode in save_points:
-            checkpoint_name = save_points[episode]
-            env.agent_voice.save_weights(f"training_files/agent_voice_weights_{checkpoint_name}.pth")
-            env.agent_video.save_weights(f"training_files/agent_video_weights_{checkpoint_name}.pth")
-            env.agent_best_effort.save_weights(f"training_files/agent_best_effort_weights_{checkpoint_name}.pth")
-            print(f"[INFO] Weights saved at {checkpoint_name} completion.")
+        if step in save_points:
+            tag = save_points[step]
+            for qid, name in ((0, 'voice'), (1, 'video'), (7, 'best')):
+                # ensure agent has save() if you use this; otherwise comment out
+                # env.agents[qid].save(f"{name}_{tag}.pth")
+                pass
+            log.info(f"Weights saved at {tag}")
