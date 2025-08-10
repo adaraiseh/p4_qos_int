@@ -8,6 +8,10 @@ from collections import deque
 from math import cos, pi
 from datetime import datetime, timedelta
 
+import glob
+import re
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -287,6 +291,16 @@ class RoutingRLSystem:
         print("switch names ", self.switch_names)
         print("switch count ", self.switch_count)
 
+        # === Build a map: INT switch_id -> role ('tor'|'agg'|'core'|'other') ===
+        # We infer from the rule filenames used to program init_metadata, e.g. rules/test/t1-commands.txt
+        self.rules_dir = Path("rules/test")
+        self.switch_id_role = self._load_switch_id_roles(self.rules_dir)
+        self.tor_ids = {sid for sid, role in self.switch_id_role.items() if role == "tor"}
+        if not self.switch_id_role:
+            log.warning("Could not map any switch_id to roles; worst-node filtering for ToRs disabled.")
+        else:
+            log.info("Role map loaded for INT switch_ids. ToR IDs filtered: %s", sorted(list(self.tor_ids)))
+
         # Switch-level metric weights
         self.switch_metrics = {
             'q_drop_rate_100ms': ('max', 0.6),
@@ -375,6 +389,45 @@ class RoutingRLSystem:
 
     # ----- Aggregations -----
 
+    def _load_switch_id_roles(self, rules_dir: Path):
+        """
+        Parse rules_dir/*-commands.txt for:
+        table_set_default process_int_transit.tb_int_insert init_metadata <ID>
+        Infer role from filename prefix: t*=ToR, a*=Agg, c*=Core, else 'other'.
+        Returns dict: { switch_id:int -> role:str }
+        """
+        mapping = {}
+        if not rules_dir.exists():
+            return mapping
+
+        pattern = re.compile(
+            r"table_set_default\s+process_int_transit\.tb_int_insert\s+init_metadata\s+(\d+)",
+            re.IGNORECASE
+        )
+
+        for path in glob.glob(str(rules_dir / "*-commands.txt")):
+            fname = Path(path).name  # e.g., t1-commands.txt
+            role = "other"
+            if fname.startswith("t"):
+                role = "tor"
+            elif fname.startswith("a"):
+                role = "agg"
+            elif fname.startswith("c"):
+                role = "core"
+
+            try:
+                with open(path, "r") as f:
+                    text = f.read()
+                m = pattern.search(text)
+                if m:
+                    sid = int(m.group(1))
+                    mapping[sid] = role
+            except Exception as e:
+                log.warning("Failed to parse %s: %s", path, e)
+
+        return mapping
+
+
     def _compute_worst_node_for_qid(self, qid, seconds=1):
         start, stop = self._time_window(seconds)
         total_w = sum(w for _, w in self.switch_metrics.values())
@@ -399,7 +452,12 @@ class RoutingRLSystem:
         for tbl in tables:
             for rec in tbl.records:
                 vals = rec.values
-                sid  = int(vals.get("switch_id", 0) or 0)
+                sid = int(vals.get("switch_id", 0) or 0)
+
+                # Skip ToR switches if we know the mapping
+                if self.switch_id_role and sid in self.tor_ids:
+                    continue
+
                 drops = float(vals.get("q_drop_rate_100ms", 0.0) or 0.0)
                 slat  = float(vals.get("switch_latency",    0.0) or 0.0)
                 txu   = float(vals.get("tx_utilization",    0.0) or 0.0)
@@ -414,7 +472,11 @@ class RoutingRLSystem:
                 if score > worst_score:
                     worst_id, worst_score = sid, score
 
-        return worst_id, worst_score if worst_score != -float('inf') else 0.0
+        # Edge case: if everything was filtered out (e.g., only ToRs present)
+        if worst_score == -float('inf'):
+            return 0, 0.0
+
+        return worst_id, worst_score
 
     def collect_snapshot(self, seconds=1):
         snap = {}
