@@ -68,6 +68,14 @@ QIDS = (0, 1, 7)  # voice, video, best-effort
 # You can tune this; 500–1000 ms usually removes partial points reliably.
 SAFETY_LAG_MS = 1000
 
+# Normalization caps
+DROP_RATE_CAP_PER_100MS = 20.0   # tune if you see frequent clipping
+PENALTY_CAP = 1.0                # penalty is built from weighted, normalized metrics; keep 0..1
+LATENCY_RATIO_CLIP = 2.0         # up to 200% of SLA considered; >200% clipped
+
+# One-hot vocabulary size for worst_node_id (0 = none, 1..256 = raw id clamped)
+WORST_ID_BUCKETS = 257
+
 # =============== Models ===============
 
 class DuelingDQN(nn.Module):
@@ -272,6 +280,14 @@ class RoutingRLSystem:
         self.query_api = self.client.query_api()
         self.controller = Controller()
 
+        # Topology info (for reference/logging if you ever want to map IDs to names)
+        self.switch_names = list(self.controller.topo.get_p4switches().keys())
+        self.switch_count = len(self.switch_names)
+        
+        print("switch names ", self.switch_names)
+        print("switch count ", self.switch_count)
+
+        # Switch-level metric weights
         self.switch_metrics = {
             'q_drop_rate_100ms': ('max', 0.6),
             'switch_latency':    ('max', 0.3),
@@ -279,7 +295,11 @@ class RoutingRLSystem:
             'queue_occupancy':   ('max', 0.2),
         }
 
-        self.state_dim = 10
+        # State space:
+        #  - 3-dim one-hot for qid
+        #  - WORST_ID_BUCKETS for worst_node_id one-hot (0..256)
+        #  - 7 continuous features (penalty, flowr, linkr, swr, txn, drn, near)
+        self.state_dim = 3 + WORST_ID_BUCKETS + 7
         self.action_dim = 4
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.agents = {qid: DuelingDQNAgent(self.state_dim, self.action_dim, self.device, n_step=3) for qid in QIDS}
@@ -288,6 +308,8 @@ class RoutingRLSystem:
         self.cooldown_secs = 5.0
         self.last_action_time = {qid: -float('inf') for qid in QIDS}
         self.last_snapshot = self.collect_snapshot()
+
+    # ----- Query helpers -----
 
     def _time_window(self, seconds=1, lag_ms=SAFETY_LAG_MS):
         # IMPORTANT: shift the stop time *back* by a safety lag so we never
@@ -316,6 +338,42 @@ class RoutingRLSystem:
                 v = tbl.records[0].get_value()
                 return float(v if v is not None else 0.0)
         return 0.0
+
+    # ----- Normalization helpers -----
+
+    def _one_hot(self, idx: int, size: int) -> np.ndarray:
+        v = np.zeros(size, dtype=np.float32)
+        if 0 <= idx < size:
+            v[idx] = 1.0
+        return v
+
+    def _qid_one_hot(self, qid: int) -> np.ndarray:
+        # map (0,1,7) -> (0,1,2)
+        order = {0:0, 1:1, 7:2}
+        return self._one_hot(order.get(qid, 2), 3)
+
+    def _worst_switch_one_hot(self, switch_id: int) -> np.ndarray:
+        # 0 => slot 0, otherwise 1..256 by raw ID clamped (no modulo collisions)
+        idx = 0 if switch_id <= 0 else min(int(switch_id), WORST_ID_BUCKETS - 1)
+        v = np.zeros(WORST_ID_BUCKETS, dtype=np.float32)
+        v[idx] = 1.0
+        return v
+
+    def _latency_ratio(self, value_ms: float, qid: int) -> float:
+        sla = {0: VOICE_LAT_THRESH, 1: VIDEO_LAT_THRESH, 7: BEST_EFFORT_LAT_THRESH}[qid]
+        ratio = 0.0 if sla <= 0 else float(value_ms) / float(sla)
+        return float(min(max(ratio, 0.0), LATENCY_RATIO_CLIP)) / LATENCY_RATIO_CLIP
+
+    def _norm_tx_util(self, v: float) -> float:
+        return float(min(max(v, 0.0), 100.0)) / 100.0
+
+    def _norm_drop_rate(self, v: float) -> float:
+        return float(min(max(v, 0.0), DROP_RATE_CAP_PER_100MS)) / DROP_RATE_CAP_PER_100MS
+
+    def _norm_penalty(self, v: float) -> float:
+        return float(min(max(v, 0.0), PENALTY_CAP))
+
+    # ----- Aggregations -----
 
     def _compute_worst_node_for_qid(self, qid, seconds=1):
         start, stop = self._time_window(seconds)
@@ -384,7 +442,8 @@ class RoutingRLSystem:
             }
         return snap
 
-    # ----- State actual data logging -------------
+    # ----- Logging -----
+
     def _log_state(self, label: str, qid: int, d: dict):
         log.info(
             f"[State][{label}][q={qid}] "
@@ -398,18 +457,26 @@ class RoutingRLSystem:
             f"near_sla={d['near_sla']}"
         )
 
+    # ----- State construction -----
+
     def build_state_vector(self, qid, data):
-        s = np.zeros(10, dtype=np.float32)
-        s[0] = float(qid)
-        s[1] = float(data['worst_node_id'])
-        s[2] = data['penalty_worst_node']
-        s[3] = data['flow_latency']
-        s[4] = 1.0 if data['near_sla'] else 0.0
-        s[5] = data['max_link_latency']
-        s[6] = data['max_switch_latency']
-        s[7] = data['max_tx_util']
-        s[8] = data['drop_rate']
-        return s
+        # one-hots
+        qid_oh   = self._qid_one_hot(qid)
+        worst_oh = self._worst_switch_one_hot(int(data['worst_node_id']))
+
+        # normalized continuous features
+        pen   = self._norm_penalty(data['penalty_worst_node'])
+        flowr = self._latency_ratio(data['flow_latency'], qid)
+        linkr = self._latency_ratio(data['max_link_latency'], qid)
+        swr   = self._latency_ratio(data['max_switch_latency'], qid)
+        txn   = self._norm_tx_util(data['max_tx_util'])
+        drn   = self._norm_drop_rate(data['drop_rate'])
+        near  = 1.0 if data['near_sla'] else 0.0
+
+        cont = np.array([pen, flowr, linkr, swr, txn, drn, near], dtype=np.float32)
+        return np.concatenate([qid_oh, worst_oh, cont], axis=0)
+
+    # ----- Reward -----
 
     def compute_reward(self, qid, data, action):
         r = 0.0
@@ -445,9 +512,13 @@ class RoutingRLSystem:
 
         return float(max(min(r, REWARD_ALL_MEET), -REWARD_ALL_MEET))
 
+    # ----- Actions -----
+
     def apply_path_change(self, qid, worst_node_id, action):
         log.info(f"Path change q={qid} worst_node={worst_node_id} action={action}")
-        # self.controller.update_path(...)
+        # TODO: wire to self.controller.update_path(...)
+
+    # ----- Diagnostics -----
 
     def agent_stats(self):
         now_mono = time.monotonic()
@@ -464,6 +535,8 @@ class RoutingRLSystem:
                 "lr": agent.last_lr,
             }
         return stats
+
+    # ----- Main step -----
 
     def step_all(self):
         snap_now = self.collect_snapshot()
@@ -516,6 +589,9 @@ class RoutingRLSystem:
         self.last_snapshot = snap_next
         return rewards
 
+# ============================
+#            MAIN
+# ============================
 if __name__ == "__main__":
     SEED = 1337
     random.seed(SEED)
