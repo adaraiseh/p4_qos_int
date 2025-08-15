@@ -247,8 +247,12 @@ class DuelingDQNAgent:
         self.nstep_queue.append({"s": s, "a": a, "r": r, "ns": ns, "d": d})
         self._emit_nstep_if_ready()
         if d:
-            while self.nstep_queue:
+            # Flush any remaining emit-able prefixes
+            while len(self.nstep_queue) >= self.n_step or (self.nstep_queue and self.nstep_queue[0]["d"]):
                 self._emit_nstep_if_ready()
+            # Discard leftover tail across episode boundary to avoid infinite loop
+            self.nstep_queue.clear()
+
 
     def select_action(self, state_vec, decay_allowed: bool = True):
         self.step_count += 1
@@ -730,7 +734,13 @@ class RoutingRLSystem:
             self._log_state("next", qid, snap_next[qid])
             ns = self.build_state_vector(qid, snap_next[qid])
             r  = self.compute_reward(qid, snap_next[qid], actions[qid])
-            self.agents[qid].push_nstep(states[qid], actions[qid], r, ns, False)
+
+            # >>> End episode on route change to stop bootstrapping across topology shifts
+            done = (actions[qid] != 0)
+            if done:
+                log.info(f"[EP END] q={qid}: route changed (action={actions[qid]}) -> done=True (stop bootstrap)")
+
+            self.agents[qid].push_nstep(states[qid], actions[qid], r, ns, done)
             self.agents[qid].train_step()
             self.agents[qid].on_step_end(r)
             rewards[qid] = r
@@ -788,7 +798,7 @@ if __name__ == "__main__":
             for qid, name in ((0, 'voice'), (1, 'video'), (7, 'best')):
                 # save checkpoints (change 9)
                 try:
-                    env.agents[qid].save(f"{name}_{tag}.pth")
+                    env.agents[qid].save(f"training_files/{name}_{tag}.pth")
                 except Exception as e:
                     log.warning("Failed to save %s checkpoint: %s", name, e)
             log.info(f"Weights saved at {tag}")
