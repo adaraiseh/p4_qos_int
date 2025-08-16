@@ -536,6 +536,22 @@ class RoutingRLSystem:
             }
         return snap
 
+    # ----- Shutdown ----
+    def shutdown(self):
+        try:
+            # Ensure pending metrics are flushed then stop background worker
+            self.write_api.flush()
+        except Exception:
+            pass
+        try:
+            self.write_api.close()
+        except Exception:
+            pass
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
     # ----- Logging -----
 
     def _log_state(self, label: str, qid: int, d: dict):
@@ -766,39 +782,47 @@ if __name__ == "__main__":
     INFLUX_ORG    = "research"
     INFLUX_BUCKET = "INT"
 
-    env = RoutingRLSystem(INFLUX_BUCKET, INFLUX_TOKEN, INFLUX_ORG, INFLUX_URL)
     total_steps = 10000
     save_points = {int(total_steps*0.5): '50%', int(total_steps*0.9): '90%', total_steps: 'final'}
     LOG_EVERY = 20
 
-    for step in range(1, total_steps + 1):
-        rewards = env.step_all()
+    env = None
+    try:
+        env = RoutingRLSystem(INFLUX_BUCKET, INFLUX_TOKEN, INFLUX_ORG, INFLUX_URL)
 
-        if step % 10 == 0:
-            log.info(
-                f"[Step {step}] rewards:"
-                f" voice={rewards[0]:.2f}, video={rewards[1]:.2f}, best={rewards[7]:.2f}"
-            )
+        for step in range(1, total_steps + 1):
+            rewards = env.step_all()
 
-        if step % LOG_EVERY == 0:
-            stats = env.agent_stats()
-            log.info(f"[Agent Stats @ step {step}]")
-            for qid in QIDS:
-                s = stats[qid]
+            if step % 10 == 0:
                 log.info(
-                    f"  q={qid} | eps={s['eps']:.4f} | avgR@100={s['avg_reward_100']:.3f} "
-                    f"| decay_used={s['decay_steps_used']} | cooldown_left={s['cooldown_remaining_s']:.2f}s "
-                    f"| loss={s['last_loss'] if not np.isnan(s['last_loss']) else 'nan'} | lr={s['lr']:.6f}"
+                    f"[Step {step}] rewards:"
+                    f" voice={rewards[0]:.2f}, video={rewards[1]:.2f}, best={rewards[7]:.2f}"
                 )
-            # Write training metrics to Influx (change 9)
-            env.write_training_metrics(step, stats)
 
-        if step in save_points:
-            tag = save_points[step]
-            for qid, name in ((0, 'voice'), (1, 'video'), (7, 'best')):
-                # save checkpoints (change 9)
-                try:
-                    env.agents[qid].save(f"training_files/{name}_{tag}.pth")
-                except Exception as e:
-                    log.warning("Failed to save %s checkpoint: %s", name, e)
-            log.info(f"Weights saved at {tag}")
+            if step % LOG_EVERY == 0:
+                stats = env.agent_stats()
+                log.info(f"[Agent Stats @ step {step}]")
+                for qid in (0, 1, 7):
+                    s = stats[qid]
+                    log.info(
+                        f"  q={qid} | eps={s['eps']:.4f} | avgR@100={s['avg_reward_100']:.3f} "
+                        f"| decay_used={s['decay_steps_used']} | cooldown_left={s['cooldown_remaining_s']:.2f}s "
+                        f"| loss={s['last_loss'] if not np.isnan(s['last_loss']) else 'nan'} | lr={s['lr']:.6f}"
+                    )
+                env.write_training_metrics(step, stats)
+
+            if step in save_points:
+                tag = save_points[step]
+                for qid, name in ((0, 'voice'), (1, 'video'), (7, 'best')):
+                    try:
+                        os.makedirs("training_files", exist_ok=True)
+                        env.agents[qid].save(f"training_files/{name}_{tag}.pth")
+                    except Exception as e:
+                        log.warning("Failed to save %s checkpoint: %s", name, e)
+                log.info(f"Weights saved at {tag}")
+
+    except KeyboardInterrupt:
+        log.info("Interrupted by user. Shutting down gracefully...")
+    finally:
+        if env is not None:
+            env.shutdown()
