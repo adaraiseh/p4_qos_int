@@ -44,83 +44,77 @@ class Controller:
                     self.net_graph.add_edge(node, neighbor, weight=1)
 
     def compute_forwarding_entries(self):
-        """
-        Compute forwarding entries based on shortest paths between hosts.
-        """
         hosts = list(self.topo.get_hosts().keys())
-        #           EF(184), CS3(96), AF21(72), 00
         dscp_list = ["0x2E", "0x18", "0x12", "0x00"]
+
+        # Per-switch, per-table structures
+        # lpm: {(dst_prefix, dscp): (next_hop_ip, egress_port)}
+        # switching: {next_hop_ip: next_hop_mac}
+        # mac: {egress_port: port_smac}
+        self.forwarding_entries = {}  # reset to structured maps
 
         for src_host in hosts:
             for dst_host in hosts:
                 if src_host == dst_host:
                     continue
 
-                # Compute the shortest path between src_host and dst_host
                 try:
                     path = nx.shortest_path(self.net_graph, src_host, dst_host, weight='weight')
                 except nx.NetworkXNoPath:
                     print(f"No path between {src_host} and {dst_host}")
                     continue
 
-                # Store the path in the list
-                path_str = f"Path from {src_host} to {dst_host}: {' -> '.join(path)}"
-                self.paths.append(path_str)
+                self.paths.append(f"Path from {src_host} to {dst_host}: {' -> '.join(path)}")
 
-                # Iterate over the path and generate forwarding entries
-                for i in range(1, len(path) - 1):  # Exclude src_host and dst_host
+                dst_ip = self.topo.get_host_ip(dst_host).split('/')[0]
+
+                for i in range(1, len(path) - 1):  # switches only
                     sw_name = path[i]
                     next_hop = path[i + 1]
-
-                    # Ensure the node is a P4 switch
                     if sw_name not in self.topo.get_p4switches().keys():
                         continue
 
-                    # Get destination IP
-                    dst_ip = self.topo.get_host_ip(dst_host).split('/')[0]
-
-                    # Get egress port
                     egress_port = self.topo.node_to_node_port_num(sw_name, next_hop)
-                    port_smac = self.topo.node_to_node_mac(sw_name, next_hop)
+                    port_smac   = self.topo.node_to_node_mac(sw_name, next_hop)
 
-                    # Determine next_hop_mac, dst_prefix, and next_hop_ip
                     if next_hop == dst_host:
-                        # Last hop to the host; use the host's MAC address
                         next_hop_mac = self.topo.get_host_mac(dst_host)
-                        dst_prefix = f"{dst_ip}/32"
-                        next_hop_ip = dst_ip
+                        dst_prefix   = f"{dst_ip}/32"
+                        next_hop_ip  = dst_ip
                     else:
                         next_hop_mac = self.topo.node_to_node_mac(next_hop, sw_name)
-                        dst_prefix = f"{dst_ip}/24"
-                        next_hop_ip_with_prefix = self.topo.node_to_node_interface_ip(next_hop, sw_name)
-                        next_hop_ip = next_hop_ip_with_prefix.split('/')[0]
-                        
-                    for dscp in dscp_list:
-                        # Create forwarding entry
-                        entry = {
-                            'dst_prefix': dst_prefix,
-                            'dscp': dscp,
-                            'next_hop_mac': next_hop_mac,
-                            'egress_port': egress_port,
-                            'next_hop_ip': next_hop_ip,
-                            'port_smac': port_smac
+                        dst_prefix   = f"{dst_ip}/24"
+                        next_hop_ip  = self.topo.node_to_node_interface_ip(next_hop, sw_name).split('/')[0]
+
+                    # init per-switch maps
+                    if sw_name not in self.forwarding_entries:
+                        self.forwarding_entries[sw_name] = {
+                            'lpm': {},
+                            'switching': {},
+                            'mac': {}
                         }
 
-                        if sw_name not in self.forwarding_entries:
-                            self.forwarding_entries[sw_name] = []
+                    # Record unique switching and mac keys once
+                    self.forwarding_entries[sw_name]['switching'][next_hop_ip] = next_hop_mac
+                    self.forwarding_entries[sw_name]['mac'][egress_port] = port_smac
 
-                        # Avoid duplicates
-                        if entry not in self.forwarding_entries[sw_name]:
-                            self.forwarding_entries[sw_name].append(entry)
+                    # LPM entries per DSCP
+                    for dscp in dscp_list:
+                        self.forwarding_entries[sw_name]['lpm'][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
+
 
     def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
         controller = self.controllers[sw_name]
+        # Update LPM entry
         controller.table_modify_match(
             "l3_forward.ipv4_lpm",
             "ipv4_forward",
             [dst_prefix, dscp],
             [next_hop_ip, str(egress_port)]
-            )
+        )
+        # (Optionally) ensure aux tables have the needed keys only once:
+        # controller.table_add(...) guarded by a read/exists check if your API supports it,
+        # or keep a small in-memory set per switch to avoid re-adding.
         
         ### helper functions:
         #def table_modify(self, table_name, action_name, entry_handle, action_params=[]):
@@ -129,33 +123,14 @@ class Controller:
         #def table_add(self, table_name, action_name, match_keys, action_params=[], prio=0):
 
     def program_switches(self):
-        """
-        Program each switch with the computed forwarding entries.
-        """
-        for sw_name, entries in self.forwarding_entries.items():
+        for sw_name, tables in self.forwarding_entries.items():
             controller = self.controllers[sw_name]
 
-            controller.table_set_default("l3_forward.ipv4_lpm", "drop")
-            #controller.set_queue_rate(1000)
-            for entry in entries:
-                dst_prefix = entry['dst_prefix']
-                dscp = entry['dscp']
-                next_hop_ip = entry['next_hop_ip']
-                next_hop_mac = entry['next_hop_mac']
-                egress_port = entry['egress_port']
-                egress_port_hex = f"0x{egress_port:x}"
-                port_smac = entry['port_smac']
-                #print(f"Adding entry: dst_prefix={dst_prefix}, dscp={dscp}, next_hop_mac={next_hop_mac}, "
-                #f"egress_port={egress_port_hex}, next_hop_ip={next_hop_ip}, port_smac={port_smac}")
-                #print("add LPM")
-                controller.table_add(
-                    "l3_forward.ipv4_lpm",
-                    "ipv4_forward",
-                    [dst_prefix, dscp],
-                    [next_hop_ip, str(egress_port)]
-                )
+            # If your P4 has a real drop action, set it here; otherwise, remove this line.
+            # controller.table_set_default("l3_forward.ipv4_lpm", "drop_pkt")
 
-                #print("SWITCHING TABLE")
+            # 1) Switching table: unique next_hop_ip
+            for next_hop_ip, next_hop_mac in tables['switching'].items():
                 controller.table_add(
                     "port_forward.switching_table",
                     "set_dmac",
@@ -163,13 +138,25 @@ class Controller:
                     [next_hop_mac]
                 )
 
-                #print("MAC REWRITE")
+            # 2) MAC rewriting: unique egress_port
+            for egress_port, port_smac in tables['mac'].items():
+                egress_port_hex = f"0x{egress_port:x}"
                 controller.table_add(
                     "port_forward.mac_rewriting_table",
                     "set_smac",
                     [egress_port_hex],
                     [port_smac]
                 )
+
+            # 3) LPM forwarding: unique (dst_prefix, dscp)
+            for (dst_prefix, dscp), (next_hop_ip, egress_port) in tables['lpm'].items():
+                controller.table_add(
+                    "l3_forward.ipv4_lpm",
+                    "ipv4_forward",
+                    [dst_prefix, dscp],
+                    [next_hop_ip, str(egress_port)]
+                )
+
 
     def print_paths(self):
         """

@@ -1,8 +1,151 @@
-import argparse
+import argparse 
 from p4utils.mininetlib.network_API import NetworkAPI
 from controller import *
 
 default_rule = 'rules/test/'
+
+# ----------------------------
+# Helpers for traffic creation
+# ----------------------------
+
+# Fixed mapping you asked for: qid -> ToS(DSCP)
+QID_TOS = {
+    0: 184,   # voice
+    1: 96,    # video
+    7: 0,     # best effort
+}
+
+ALL_QUEUES = [0, 1, 7]
+
+def _ensure_dict_per_queue(val, queues):
+    """Allow single scalar or per-queue dict; return dict{qid: val}."""
+    if isinstance(val, dict):
+        return {qid: val.get(qid, list(val.values())[0]) for qid in queues}
+    return {qid: val for qid in queues}
+
+def _traffic_dst_port(flow_id: int, qid: int, base: int = 6000) -> int:
+    """
+    Build dst port so that:
+      flow_id = (port // 10) % 100
+      expected_queue_id = port % 10
+    Using scheme: base + flow_id*10 + qid
+    """
+    if not (0 <= flow_id <= 99):
+        raise ValueError("flow_id must be 0..99")
+    if not (0 <= qid <= 9):
+        raise ValueError("queue_id must be 0..9")
+    return base + flow_id * 10 + qid
+
+def _probe_dst_port(flow_id: int, qid: int, base: int = 5000) -> int:
+    """
+    Build dst port so that:
+      flow_id = (port // 10) % 100
+      expected_queue_id = port % 10
+    Using scheme: base + flow_id*10 + qid
+    """
+    if not (0 <= flow_id <= 99):
+        raise ValueError("flow_id must be 0..99")
+    if not (0 <= qid <= 9):
+        raise ValueError("queue_id must be 0..9")
+    return base + flow_id * 10 + qid
+
+def _host_to_ip(hostname: str, hosts_ips: list[str]) -> str:
+    """
+    Map 'hN' -> hosts_ips[N]. Keeps your existing static map to avoid
+    reliance on getHostIp(), which you mentioned is not correct.
+    """
+    if not hostname.startswith('h'):
+        raise ValueError("Hostnames must look like 'h1', 'h2', ...")
+    idx = int(hostname[1:])
+    if idx < 1 or idx >= len(hosts_ips):
+        raise IndexError(f"No IP for {hostname} in hosts_ips")
+    return hosts_ips[idx]
+
+def generate_traffic(
+    net: NetworkAPI,
+    src_host: str,
+    dst_host: str,
+    flow_id: int,
+    queue_id: int | str = "all",
+    per_queue_bw: float | int | dict = 2.0,
+    per_queue_len: int | dict = 0,
+):
+    """
+    Schedule receiver(s) on dst and sender(s) on src according to:
+      - src_host, dst_host: e.g., 'h1', 'h8'
+      - flow_id: 0..99 (encoded into dst ports)
+      - queue_id: int (0..9) or 'all' (== [0,1,7] per your mapping)
+      - per_queue_bw: Mbps as float/int or dict{qid: Mbps}
+      - per_queue_len: iperf3 -t duration seconds as int or dict{qid: seconds} (0 = continuous)
+    Creates both:
+      - iperf3 UDP streams (with --tos corresponding to queue)
+      - your send.py UDP control messages (matching port & ToS)
+    """
+
+    # exactly the three queues you requested when "all"
+    queues = ALL_QUEUES if queue_id == "all" else [int(queue_id)]
+
+    # Per-queue params normalized to dicts
+    bw_map = _ensure_dict_per_queue(per_queue_bw, queues)       # Mbps
+    len_map = _ensure_dict_per_queue(per_queue_len, queues)     # seconds
+
+    # Your static IP map used elsewhere in this file
+    hosts_ips = [
+        "0",                 # dummy index 0
+        "10.7.1.2",          # h1
+        "10.7.2.2",          # h2
+        "10.8.3.2",          # h3
+        "10.8.4.2",          # h4
+        "10.9.5.2",          # h5
+        "10.9.6.2",          # h6
+        "10.10.7.2",         # h7
+        "10.10.8.2",         # h8
+        "10.11.9.2",         # h9
+        "10.11.10.2",        # h10
+        "10.12.11.2",        # h11
+        "10.12.12.2",        # h12
+        "10.13.13.2",        # h13
+        "10.13.14.2",        # h14
+        "10.14.15.2",        # h15
+        "10.14.16.2"         # h16
+    ]
+
+    dst_ip = _host_to_ip(dst_host, hosts_ips)
+
+    # Start iperf3 servers for each selected queue/port
+    for qid in queues:
+        probe_port = _probe_dst_port(flow_id, qid)
+        traffic_port = _traffic_dst_port(flow_id, qid)
+        net.addTask(dst_host, f"python3 receive.py --proto all --ports {probe_port}", 1, 0, True)
+        net.addTask(dst_host, f"iperf3 -s -p {traffic_port} -i 1", 1, 0, True)
+
+    # Send traffic from src -> dst for each selected queue
+    for qid in queues:
+        tos = QID_TOS.get(qid)
+        if tos is None:
+            raise ValueError(f"No ToS mapping defined for queue {qid}")
+
+        probe_port = _probe_dst_port(flow_id, qid)
+        traffic_port = _traffic_dst_port(flow_id, qid)
+        bw_mbps = bw_map[qid]
+        length = len_map[qid]
+
+        # Your lightweight sender (control/marker packets), matches ToS and port
+        net.addTask(
+            src_host,
+            f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
+            1.5, 0, True
+        )
+
+        # iperf3 UDP stream
+        # -t 0 means run until stopped
+        # -b {bw_mbps}M
+        # -l {packet length}
+        net.addTask(
+            src_host,
+            f'iperf3 -c {dst_ip} -i 1 -t 0 -p {traffic_port} -u -b {bw_mbps}M -l {length} --tos {tos}',
+            2.0, 0, True
+        )
 
 def config_network(p4):
     net = NetworkAPI()
@@ -52,7 +195,7 @@ def config_network(p4):
         core_switches.append(core_switch)
 
     net.setP4SourceAll(p4)
-    # Add links with 10 Mbps bandwidth
+
     # Connect hosts to ToR switches
     for i in range(tor_nodes):
         for j in range(2):  # Each ToR switch connects to 2 hosts
@@ -73,7 +216,7 @@ def config_network(p4):
     # Assignment strategy
     net.l3()
 
-    # INT reports reciever host
+    # INT reports receiver hosts
     host100 = net.addHost('h100')
     host101 = net.addHost('h101')
     net.addLink(host100, tor_switches[0], port1=10, port2=10)
@@ -100,25 +243,28 @@ def config_network(p4):
     net.setIntfMac(host101, tor_switches[3], "10:10:10:10:13:11")
     net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
 
-
+    # -----------------
     # Generate traffic
-    
-    net.addTask("h8", "python3 receive.py", 1, 0, True)
-    net.addTask("h8", "iperf3 -s -p 6010 -i 1", 1, 0, True)
-    net.addTask("h8", "iperf3 -s -p 6011 -i 1", 1, 0, True)
-    net.addTask("h8", "iperf3 -s -p 6017 -i 1", 1, 0, True)
+    # -----------------
+    generate_traffic(
+        net=net,
+        src_host="h1",
+        dst_host="h8",
+        flow_id=18,
+        queue_id="all",
+        per_queue_bw={0: 1.5, 1: 1.0, 7: 1.0},   # Mbps
+        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
+    )
 
-    hosts_ips = ["0","10.7.1.2","10.7.2.2","10.8.3.2","10.8.4.2","10.9.5.2","10.9.6.2","10.10.7.2","10.10.8.2"]
-    
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5010 --tos 184 --m "ToS is 184" --c 0', 5, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5011 --tos 96 --m "ToS is 96" --c 0', 5, 0, True)
-    net.addTask("h1", f'python3 send.py --ip {hosts_ips[8]} --l4 udp --port 5017 --tos 0 --m "ToS is 0" --c 0', 5, 0, True)
-    
-    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6010 -u -b 1M -l 1250 --tos 184', 2.1, 0, True)
-    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6011 -u -b 2M -l 1250 --tos 96', 2.1, 0, True)
-    net.addTask("h1", f'iperf3 -c {hosts_ips[8]} -i 1 -t 0 -p 6017 -u -b 2M -l 1250 --tos 0', 2.1, 0, True)
-
-
+    generate_traffic(
+        net=net,
+        src_host="h3",
+        dst_host="h1",
+        flow_id=31,
+        queue_id="all",
+        per_queue_bw={0: 1.0, 1: 0.5, 7: 0.5},   # Mbps
+        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
+    )
 
     # Nodes general options
     #net.enableCpuPortAll()
@@ -144,13 +290,9 @@ def main():
     controller = Controller()
     print("\n\nSUMMARY:")
     print("\nOSPF Shortest Paths:")
-    controller.print_paths()  # Print the stored paths
-    #print("\nP4 Table Entries:")
-    #controller.print_forwarding_entries()  # Print forwarding entries
+    controller.print_paths()
 
     net.enableCli()
-
-    
     net.start_net_cli()
 
 if __name__ == '__main__':

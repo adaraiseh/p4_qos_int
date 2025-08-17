@@ -347,9 +347,25 @@ class RoutingRLSystem:
         #  - WORST_ID_BUCKETS for worst_node_id one-hot (0..256)
         #  - 7 continuous features (penalty, flowr, linkr, swr, txn, drn, near)
         self.state_dim = 3 + WORST_ID_BUCKETS + 7
-        self.action_dim = 4
+
+        # Build role → ids and compute MAX_ALTS once (exclude ToR)
+        self.role_to_ids = {}
+        for sid, role in self.switch_id_role.items():
+            self.role_to_ids.setdefault(role, []).append(int(sid))
+
+        def _compute_max_alts():
+            candidates = [len(ids) - 1 for role, ids in self.role_to_ids.items() if role != "tor"]
+            # Fallback if mapping missing
+            return max(candidates) if candidates else 3
+
+        self.MAX_ALTS = _compute_max_alts()
+        self.action_dim = 1 + self.MAX_ALTS
+        log.info(f"Action space sized: MAX_ALTS={self.MAX_ALTS} ⇒ action_dim={self.action_dim}")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.agents = {qid: DuelingDQNAgent(self.state_dim, self.action_dim, self.device, n_step=3) for qid in QIDS}
+        self.agents = {
+            qid: DuelingDQNAgent(self.state_dim, self.action_dim, self.device, n_step=3)
+            for qid in QIDS
+        }
 
         self.action_response_delay = 1.0
         self.cooldown_secs = 5.0
@@ -459,6 +475,26 @@ class RoutingRLSystem:
                 log.warning("Failed to parse %s: %s", path, e)
 
         return mapping
+
+    # No controller dependency; purely uses your parsed rules/test/*-commands.txt mapping.
+    def _get_ordered_alternates(self, qid: int, worst_id: int):
+        """
+        Deterministic list of alternates for the worst node:
+        - Same tier as worst_id (agg ↔ agg, core ↔ core), ToR excluded
+        - Excludes worst_id itself
+        - Sorted by switch_id for stability
+        Returns: [{'target_node_id': <int>}, ...] capped to MAX_ALTS
+        """
+        if worst_id <= 0:
+            return []
+        role = self.switch_id_role.get(int(worst_id))
+        if not role or role == "tor":
+            return []
+
+        ids = [sid for sid in self.role_to_ids.get(role, []) if sid != int(worst_id)]
+        ids.sort()
+        alts = [{"target_node_id": sid} for sid in ids]
+        return alts[: self.MAX_ALTS]
 
 
     def _compute_worst_node_for_qid(self, qid, seconds=1):
@@ -623,37 +659,44 @@ class RoutingRLSystem:
     # ----- Actions -----
 
     def apply_path_change(self, qid, worst_node_id, action):
-        log.info(f"Path change q={qid} worst_node={worst_node_id} action={action}")
-        # TODO: wire to self.controller.update_path(...)
+        if action == 0:
+            log.info("NO change (action 0)")
+            return
+
+        alts = self._get_ordered_alternates(qid, int(worst_node_id))
+        idx = action - 1
+        if idx < 0 or idx >= len(alts):
+            log.warning(f"Chosen action {action} has no mapped alternate for worst_id={worst_node_id}; skipping.")
+            return
+
+        alt = alts[idx]
+        alt_sid = alt["target_node_id"]
+        # TODO: wire this to controller.update_path(...) for your fabric.
+        # Keep this log rich so you can verify decisions during training.
+        log.info(
+            f"Path change q={qid} worst_node_id={worst_node_id} → alt_idx={idx} (alt_sid={alt_sid})"
+        )
+
 
     # ----- Action masking -----
     def valid_action_mask(self, qid, data):
         """
-        Returns a boolean mask of shape [action_dim].
+        Boolean mask of shape [action_dim].
         a0 = no-op (always valid)
-        a1.. = alternates; uses controller.count_alternates if available.
+        a1.. = alternates for (qid, worst_id) capped by MAX_ALTS.
         """
         mask = np.zeros(self.action_dim, dtype=bool)
-        # a0 always valid
-        mask[0] = True
+        mask[0] = True  # no-op
 
         worst_id = int(data.get('worst_node_id', 0) or 0)
         if worst_id == 0:
-            return mask  # only no-op valid
+            return mask
 
-        # Try to query alternates; if controller lacks method, allow all alternates optimistically.
-        n_alts = None
-        if hasattr(self.controller, "count_alternates"):
-            try:
-                n_alts = int(max(0, self.controller.count_alternates(qid, worst_id)))
-            except Exception as e:
-                log.warning("count_alternates failed: %s", e)
-                n_alts = None
-
-        max_alt = (self.action_dim - 1) if n_alts is None else min(n_alts, self.action_dim - 1)
-        for a in range(1, 1 + max_alt):
-            mask[a] = True
+        alts = self._get_ordered_alternates(qid, worst_id)
+        for i in range(len(alts)):
+            mask[1 + i] = True
         return mask
+
 
     # ----- Diagnostics -----
 
@@ -709,7 +752,7 @@ class RoutingRLSystem:
         states  = {}
         now_mono = time.monotonic()
         for qid in QIDS:
-            self._log_state("now", qid, snap_now[qid])
+            #self._log_state("now", qid, snap_now[qid])
             s = self.build_state_vector(qid, snap_now[qid])
             states[qid] = s
 
@@ -722,7 +765,7 @@ class RoutingRLSystem:
                 _ = self.agents[qid].select_action(s, decay_allowed=False)
                 a = 0
                 remaining = self.cooldown_secs - elapsed
-                log.info(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s (~{remaining:.1f}s left) -> action=0")
+                #log.info(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s (~{remaining:.1f}s left) -> action=0")
             else:
                 a = self.agents[qid].select_action(s, decay_allowed=True)
                 # Enforce mask: if chosen action invalid, fall back to no-op
@@ -738,8 +781,8 @@ class RoutingRLSystem:
                 any_changed = True
             else:
                 log.info(f"NO Path change q={qid}")
-        if not any_changed:
-            log.info("No path changes this step.")
+        # if not any_changed:
+        #     log.info("No path changes this step.")
 
         time.sleep(self.action_response_delay)
 
@@ -747,7 +790,7 @@ class RoutingRLSystem:
 
         rewards = {}
         for qid in QIDS:
-            self._log_state("next", qid, snap_next[qid])
+            #self._log_state("next", qid, snap_next[qid])
             ns = self.build_state_vector(qid, snap_next[qid])
             r  = self.compute_reward(qid, snap_next[qid], actions[qid])
 

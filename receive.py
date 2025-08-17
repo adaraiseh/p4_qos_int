@@ -1,6 +1,7 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import sys
 import os
+import argparse
 from scapy.all import sniff
 
 def get_if():
@@ -13,29 +14,61 @@ def get_if():
         sys.exit(1)
     return interfaces[0]
 
+def parse_ports(val: str):
+    """
+    Parse a port value: either a single number or a START-END range.
+    Returns a tuple (start, end).
+    """
+    if '-' in val:
+        start, end = val.split('-', 1)
+        return int(start), int(end)
+    else:
+        p = int(val)
+        return p, p
+
+def build_bpf(proto: str, port_range: tuple[int, int]):
+    """
+    Build BPF filter string based on proto and port range.
+    """
+    if proto == "tcp":
+        proto_expr = "tcp"
+    elif proto == "udp":
+        proto_expr = "udp"
+    else:
+        proto_expr = "tcp or udp"
+
+    start, end = port_range
+    if start == end:
+        return f"{proto_expr} and port {start}"
+    else:
+        return f"{proto_expr} and portrange {start}-{end}"
+
 def handle_pkt(pkt):
     """
-    Handles each packet. Replace the `pass` with packet processing logic if needed.
+    Handles each packet (print summary).
     """
-    #print(pkt.summary())  # Print packet summary for debugging
-    pass
+    print(pkt.summary())
 
 def main():
-    # Get the network interface
+    ap = argparse.ArgumentParser(description="Simple packet receiver")
+    ap.add_argument("--proto", choices=["tcp", "udp", "all"], default="all",
+                    help="Protocol to sniff (default: all).")
+    ap.add_argument("--ports", type=str, default="5000-5999",
+                    help="Port number or range (default: 5000-5999).")
+    args = ap.parse_args()
+
+    port_range = parse_ports(args.ports)
+    bpf = build_bpf(args.proto, port_range)
+
     iface = get_if()
-    print(f"Sniffing on {iface}")
+    print(f"Sniffing on {iface} with filter: {bpf}")
     sys.stdout.flush()
 
-    # Define the ports to listen to
-    specific_ports = [5010, 5011, 5012, 5013, 5020, 5021, 5022, 5023, 5030, 5031, 5032, 5033, 5040, 5041, 5042, 5043, 5050, 5051, 5052, 5053, 5060, 5061, 5062, 5063]
-    port_filter = " or ".join([f"tcp port {p} or udp port {p}" for p in specific_ports])
-
-    # Sniff packets and avoid retaining them in memory
     sniff(
         iface=iface,
-        filter=port_filter,  # Filter packets to specific TCP/UDP ports
-        prn=handle_pkt,  # Call handle_pkt for each packet
-        store=False  # Do not store packets in memory
+        filter=bpf,
+        prn=handle_pkt,
+        store=False
     )
 
 if __name__ == "__main__":

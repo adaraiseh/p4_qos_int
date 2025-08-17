@@ -133,6 +133,7 @@ class FlowInfo():
             print("l2_egress_ports %s" % (self.l2_egress_ports))
         if len(self.egress_tx_utils) > 0:
             print("egress_tx_utils %s" % (self.egress_tx_utils))
+        print("\n")
 
     def clear_metadata(self):
         self.switch_ids.clear()
@@ -369,5 +370,8 @@ class Collector:
         self.parse_flow_info(flow_info, int_rep_pkt[IP])
         int_shim_pkt = INTShim(int_rep_pkt.load)
         self.parse_int_metadata(flow_info, int_shim_pkt)
+
+        # flow_info.show()
+
         sys.stdout.flush()
         return flow_info
