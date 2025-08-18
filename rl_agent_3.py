@@ -32,7 +32,7 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger()
-log.setLevel(logging.INFO)
+log.setLevel(logging.DEBUG)
 
 # =========================================
 #            HYPERPARAMETERS
@@ -70,6 +70,9 @@ QIDS = (0, 1, 7)  # voice, video, best-effort
 
 # *** Read-safety: ignore the freshest not-yet-complete bucket ***
 SAFETY_LAG_MS = 1000
+DELAY_NO_ACTION = 0.7
+DELAY_AFTER_ACTION = 1.0
+ACTION_COOLDOWN_SECS = 5.0
 
 # Normalization caps
 DROP_RATE_CAP_PER_100MS = 20.0
@@ -78,6 +81,9 @@ LATENCY_RATIO_CLIP = 2.0
 
 # One-hot vocabulary size for worst_node_id (0 = none, 1..256 = raw id clamped)
 WORST_ID_BUCKETS = 257
+
+def _perf_t():  # perf timer
+    return time.perf_counter()
 
 # =============== Models ===============
 
@@ -337,7 +343,7 @@ class RoutingRLSystem:
         # Switch-level metric weights
         self.switch_metrics = {
             'q_drop_rate_100ms': ('max', 0.6),
-            'switch_latency':    ('max', 0.3),
+            'switch_latency':    ('max', 0.4),
             'tx_utilization':    ('max', 0.2),
             'queue_occupancy':   ('max', 0.2),
         }
@@ -367,8 +373,11 @@ class RoutingRLSystem:
             for qid in QIDS
         }
 
-        self.action_response_delay = 1.0
-        self.cooldown_secs = 5.0
+        # Adaptive delays: faster when no change, slower when we changed routes
+        self.action_response_delay_no_change = DELAY_NO_ACTION
+        self.action_response_delay_change = DELAY_AFTER_ACTION
+
+        self.cooldown_secs = ACTION_COOLDOWN_SECS
         self.last_action_time = {qid: -float('inf') for qid in QIDS}
         self.last_snapshot = self.collect_snapshot()
 
@@ -382,25 +391,6 @@ class RoutingRLSystem:
         start = start_dt.isoformat() + 'Z'
         stop  = stop_dt.isoformat() + 'Z'
         return start, stop
-
-    def _query_metric(self, meas, qid, agg, seconds=1):
-        start, stop = self._time_window(seconds)
-        flux = f'''
-        from(bucket:"{self.bucket}")
-        |> range(start:{start}, stop:{stop})
-        |> filter(fn: (r) => r._measurement == "{meas}" and r.queue_id == "{qid}")
-        |> toFloat()
-        |> group(columns: ["queue_id"])
-        |> {agg}(column:"_value")
-        '''
-        tables = self.query_api.query(org=self.org, query=flux)
-        if not tables:
-            return 0.0
-        for tbl in tables:
-            if tbl.records:
-                v = tbl.records[0].get_value()
-                return float(v if v is not None else 0.0)
-        return 0.0
 
     # ----- Normalization helpers -----
 
@@ -496,86 +486,118 @@ class RoutingRLSystem:
         alts = [{"target_node_id": sid} for sid in ids]
         return alts[: self.MAX_ALTS]
 
+    # ---------------- Batched per-qid metrics (single Flux for aggs + one for worst) ----------------
 
-    def _compute_worst_node_for_qid(self, qid, seconds=1):
+    def _collect_metrics_for_qid(self, qid: int, seconds=1):
         start, stop = self._time_window(seconds)
-        total_w = sum(w for _, w in self.switch_metrics.values())
-        weights = {m: w / total_w for m, (_, w) in self.switch_metrics.items()}
 
-        flux = f'''
-        from(bucket:"{self.bucket}")
-        |> range(start:{start}, stop:{stop})
-        |> filter(fn: (r) =>
-            r.queue_id == "{qid}" and
-            r._measurement =~ /q_drop_rate_100ms|switch_latency|tx_utilization|queue_occupancy/
-        )
-        |> toFloat()
-        |> group(columns: ["queue_id","switch_id","_measurement"])
-        |> max(column: "_value")
-        |> group(columns: ["switch_id"])
-        |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
+        # Single query for all simple aggregates
+        flux_agg = f'''
+        qid = "{qid}"
+        base = from(bucket:"{self.bucket}")
+          |> range(start:{start}, stop:{stop})
+          |> filter(fn: (r) => r.queue_id == qid)
+          |> toFloat()
+
+        flow = base
+          |> filter(fn: (r) => r._measurement == "flow_latency")
+          |> mean(column:"_value")
+          |> set(key:"_measurement", value:"flow_latency_agg")
+
+        link = base
+          |> filter(fn: (r) => r._measurement == "link_latency")
+          |> mean(column:"_value")
+          |> set(key:"_measurement", value:"link_latency_agg")
+
+        swlat = base
+          |> filter(fn: (r) => r._measurement == "switch_latency")
+          |> mean(column:"_value")
+          |> set(key:"_measurement", value:"switch_latency_agg")
+
+        drop = base
+          |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms")
+          |> mean(column:"_value")
+          |> set(key:"_measurement", value:"drop_rate_agg")
+
+        txu = base
+          |> filter(fn: (r) => r._measurement == "tx_utilization")
+          |> mean(column:"_value")
+          |> set(key:"_measurement", value:"tx_util_agg")
+
+        union(tables: [flow, link, swlat, drop, txu])
         '''
-        tables = self.query_api.query(org=self.org, query=flux)
+
+        tables = self.query_api.query(org=self.org, query=flux_agg)
+        agg = {"flow_latency_agg":0.0, "link_latency_agg":0.0,
+               "switch_latency_agg":0.0, "drop_rate_agg":0.0, "tx_util_agg":0.0}
+        for tbl in tables or []:
+            for rec in tbl.records:
+                m = rec.get_measurement()
+                if m in agg:
+                    v = rec.get_value()
+                    if v is not None:
+                        agg[m] = float(v)
+
+        # Separate query for worst-node (pivot across switch_id)
+        flux_worst = f'''
+        from(bucket:"{self.bucket}")
+          |> range(start:{start}, stop:{stop})
+          |> filter(fn: (r) => r.queue_id == "{qid}"
+             and r._measurement =~ /q_drop_rate_100ms|switch_latency|tx_utilization|queue_occupancy/)
+          |> toFloat()
+          |> group(columns:["queue_id","switch_id","_measurement"])
+          |> max(column:"_value")
+          |> group(columns:["switch_id"])
+          |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
+        '''
+        wtables = self.query_api.query(org=self.org, query=flux_worst)
 
         worst_id, worst_score = 0, -float('inf')
-        for tbl in tables:
+        total_w = sum(w for _, w in self.switch_metrics.values())
+        weights = {m: w/total_w for m, (_, w) in self.switch_metrics.items()}
+
+        for tbl in wtables or []:
             for rec in tbl.records:
                 vals = rec.values
                 sid = int(vals.get("switch_id", 0) or 0)
-
-                # Skip ToR switches if we know the mapping
                 if self.switch_id_role and sid in self.tor_ids:
                     continue
-
                 drops = float(vals.get("q_drop_rate_100ms", 0.0) or 0.0)
                 slat  = float(vals.get("switch_latency",    0.0) or 0.0)
                 txu   = float(vals.get("tx_utilization",    0.0) or 0.0)
                 qocc  = float(vals.get("queue_occupancy",   0.0) or 0.0)
 
-                score = (
-                    drops * weights['q_drop_rate_100ms'] +
-                    slat  * weights['switch_latency'] +
-                    txu   * weights['tx_utilization'] +
-                    qocc  * weights['queue_occupancy']
-                )
+                score = (drops*weights['q_drop_rate_100ms'] +
+                         slat *weights['switch_latency'] +
+                         txu  *weights['tx_utilization'] +
+                         qocc *weights['queue_occupancy'])
                 if score > worst_score:
                     worst_id, worst_score = sid, score
 
-        if worst_score == -float('inf'):
-            return 0, 0.0
-
-        return worst_id, worst_score
+        d = {
+            'worst_node_id':      int(worst_id),
+            'penalty_worst_node': float(0.0 if worst_score == -float('inf') else max(0.0, worst_score)),
+            'flow_latency':       float(agg["flow_latency_agg"]),
+            'mean_link_latency':   float(agg["link_latency_agg"]),
+            'mean_switch_latency': float(agg["switch_latency_agg"]),
+            'drop_rate':          float(agg["drop_rate_agg"]),
+            'mean_tx_util':        float(agg["tx_util_agg"]),
+        }
+        return d
 
     def collect_snapshot(self, seconds=1):
         snap = {}
         for qid in QIDS:
-            worst_id, penalty = self._compute_worst_node_for_qid(qid, seconds=seconds)
-
-            flow_latency       = self._query_metric('flow_latency',     qid, 'mean', seconds)
-            max_link_latency   = self._query_metric('link_latency',     qid, 'max',  seconds)
-            max_switch_latency = self._query_metric('switch_latency',   qid, 'max',  seconds)
-            drop_rate          = self._query_metric('q_drop_rate_100ms',qid, 'max',  seconds)
-            max_tx_util        = self._query_metric('tx_utilization',   qid, 'max',  seconds)
-
+            d = self._collect_metrics_for_qid(qid, seconds)
             thresh = {0: VOICE_LAT_THRESH, 1: VIDEO_LAT_THRESH, 7: BEST_EFFORT_LAT_THRESH}[qid]
-            near_sla = float(flow_latency) >= SLA_NEAR_FACTOR * float(thresh)
-
-            snap[qid] = {
-                'worst_node_id':      int(worst_id),
-                'penalty_worst_node': float(penalty),
-                'flow_latency':       float(flow_latency),
-                'max_link_latency':   float(max_link_latency),
-                'max_switch_latency': float(max_switch_latency),
-                'drop_rate':          float(drop_rate),
-                'max_tx_util':        float(max_tx_util),
-                'near_sla':           bool(near_sla),
-            }
+            d["near_sla"] = bool(d["flow_latency"] >= SLA_NEAR_FACTOR * float(thresh))
+            d["worst_node_id"] = int(d["worst_node_id"])
+            snap[qid] = d
         return snap
 
     # ----- Shutdown ----
     def shutdown(self):
         try:
-            # Ensure pending metrics are flushed then stop background worker
             self.write_api.flush()
         except Exception:
             pass
@@ -591,15 +613,15 @@ class RoutingRLSystem:
     # ----- Logging -----
 
     def _log_state(self, label: str, qid: int, d: dict):
-        log.info(
+        log.debug(
             f"[State][{label}][q={qid}] "
             f"worst_node={d['worst_node_id']} "
             f"penalty={d['penalty_worst_node']:.3f} "
             f"flow_lat={d['flow_latency']:.2f}ms "
-            f"link_lat_max={d['max_link_latency']:.2f}ms "
-            f"switch_lat_max={d['max_switch_latency']:.2f}ms "
+            f"link_lat_max={d['mean_link_latency']:.2f}ms "
+            f"switch_lat_max={d['mean_switch_latency']:.2f}ms "
             f"drops_rate={d['drop_rate']:.3f} "
-            f"tx_util_max={d['max_tx_util']:.2f}% "
+            f"tx_util_max={d['mean_tx_util']:.2f}% "
             f"near_sla={d['near_sla']}"
         )
 
@@ -611,9 +633,9 @@ class RoutingRLSystem:
 
         pen   = self._norm_penalty(data['penalty_worst_node'])
         flowr = self._latency_ratio(data['flow_latency'], qid)
-        linkr = self._latency_ratio(data['max_link_latency'], qid)
-        swr   = self._latency_ratio(data['max_switch_latency'], qid)
-        txn   = self._norm_tx_util(data['max_tx_util'])
+        linkr = self._latency_ratio(data['mean_link_latency'], qid)
+        swr   = self._latency_ratio(data['mean_switch_latency'], qid)
+        txn   = self._norm_tx_util(data['mean_tx_util'])
         drn   = self._norm_drop_rate(data['drop_rate'])
         near  = 1.0 if data['near_sla'] else 0.0
 
@@ -626,7 +648,7 @@ class RoutingRLSystem:
         r = 0.0
         lat   = data['flow_latency']
         drops = data['drop_rate']
-        tx    = data['max_tx_util']
+        tx    = data['mean_tx_util']
         pen   = data['penalty_worst_node']
 
         if qid == 0:
@@ -660,7 +682,7 @@ class RoutingRLSystem:
 
     def apply_path_change(self, qid, worst_node_id, action):
         if action == 0:
-            log.info("NO change (action 0)")
+            log.debug("NO change (action 0)")
             return
 
         alts = self._get_ordered_alternates(qid, int(worst_node_id))
@@ -673,7 +695,7 @@ class RoutingRLSystem:
         alt_sid = alt["target_node_id"]
         # TODO: wire this to controller.update_path(...) for your fabric.
         # Keep this log rich so you can verify decisions during training.
-        log.info(
+        log.debug(
             f"Path change q={qid} worst_node_id={worst_node_id} → alt_idx={idx} (alt_sid={alt_sid})"
         )
 
@@ -716,7 +738,7 @@ class RoutingRLSystem:
             }
         return stats
 
-    # ----- Training metrics writer (change 9) -----
+    # ----- Training metrics writer -----
 
     def write_training_metrics(self, step, stats):
         ts = datetime.utcnow()
@@ -743,35 +765,39 @@ class RoutingRLSystem:
         except Exception as e:
             log.warning("Failed to write training metrics: %s", e)
 
-    # ----- Main step -----
+    # ----- Main step with instrumentation & adaptive delay -----
 
     def step_all(self):
-        snap_now = self.collect_snapshot()
+        t0 = _perf_t()
+        snap_now = self.collect_snapshot(); t_snap_now = _perf_t()
 
         actions = {}
         states  = {}
         now_mono = time.monotonic()
+        log.info("step")
         for qid in QIDS:
-            #self._log_state("now", qid, snap_now[qid])
+            self._log_state("now", qid, snap_now[qid])
             s = self.build_state_vector(qid, snap_now[qid])
             states[qid] = s
 
             elapsed = now_mono - self.last_action_time[qid]
             in_cooldown = elapsed < self.cooldown_secs
 
-            mask = self.valid_action_mask(qid, snap_now[qid])  # <-- action mask (change 3)
+            mask = self.valid_action_mask(qid, snap_now[qid])
 
             if in_cooldown:
                 _ = self.agents[qid].select_action(s, decay_allowed=False)
                 a = 0
                 remaining = self.cooldown_secs - elapsed
-                #log.info(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s (~{remaining:.1f}s left) -> action=0")
+                log.debug(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s (~{remaining:.1f}s left) -> action=0")
             else:
                 a = self.agents[qid].select_action(s, decay_allowed=True)
                 # Enforce mask: if chosen action invalid, fall back to no-op
                 if not mask[a]:
                     a = 0
             actions[qid] = a
+
+        t_decide = _perf_t()
 
         any_changed = False
         for qid in QIDS:
@@ -780,17 +806,19 @@ class RoutingRLSystem:
                 self.last_action_time[qid] = now_mono
                 any_changed = True
             else:
-                log.info(f"NO Path change q={qid}")
-        # if not any_changed:
-        #     log.info("No path changes this step.")
+                log.debug(f"NO Path change q={qid}")
 
-        time.sleep(self.action_response_delay)
+        t_apply = _perf_t()
 
-        snap_next = self.collect_snapshot()
+        # Adaptive delay: longer when routes changed to allow propagation
+        delay = self.action_response_delay_change if any_changed else self.action_response_delay_no_change
+        time.sleep(delay); t_sleep = _perf_t()
+
+        snap_next = self.collect_snapshot(); t_snap_next = _perf_t()
 
         rewards = {}
         for qid in QIDS:
-            #self._log_state("next", qid, snap_next[qid])
+            self._log_state("next", qid, snap_next[qid])
             ns = self.build_state_vector(qid, snap_next[qid])
             r  = self.compute_reward(qid, snap_next[qid], actions[qid])
 
@@ -803,6 +831,13 @@ class RoutingRLSystem:
             self.agents[qid].train_step()
             self.agents[qid].on_step_end(r)
             rewards[qid] = r
+
+        t_train = _perf_t()
+        log.debug(
+            "[STEP TIMINGS] collect_now=%.3fs decide=%.3fs apply=%.3fs sleep=%.3fs collect_next=%.3fs train=%.3fs total=%.3fs",
+            t_snap_now - t0, t_decide - t_snap_now, t_apply - t_decide, t_sleep - t_apply,
+            t_snap_next - t_sleep, t_train - t_snap_next, t_train - t0
+        )
 
         self.last_snapshot = snap_next
         return rewards

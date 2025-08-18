@@ -169,7 +169,7 @@ class Collector:
     def flush_buffer(self):
         return
 
-    def record_drop_rate_instant(self, flow_id, switch_id, egress_port, queue_id,
+    def record_drop_rate_instant(self, flow_id, src_ip, dst_ip, switch_id, egress_port, queue_id,
                                  drop_count, report_time_ns):
         """
         Emit a per-100ms instantaneous drop rate for every report.
@@ -201,6 +201,8 @@ class Collector:
         return (
             Point("q_drop_rate_100ms")
             .tag("flow_id", flow_id)
+            .tag("src_ip", src_ip)
+            .tag("dst_ip", dst_ip)
             .tag("switch_id", switch_id)
             .tag("egress_port", egress_port)
             .tag("queue_id", queue_id)
@@ -224,6 +226,8 @@ class Collector:
                 points.append(
                     Point("switch_latency")
                     .tag("flow_id", flow_id)
+                    .tag("src_ip", flow_info.src_ip)
+                    .tag("dst_ip", flow_info.dst_ip)
                     .tag("queue_id", flow_info.queue_ids[i])
                     .tag("switch_id", flow_info.switch_ids[i])
                     .field("value", flow_info.hop_latencies[i] / 1000.0)
@@ -232,6 +236,8 @@ class Collector:
                 points.append(
                     Point("tx_utilization")
                     .tag("flow_id", flow_id)
+                    .tag("src_ip", flow_info.src_ip)
+                    .tag("dst_ip", flow_info.dst_ip)
                     .tag("switch_id", flow_info.switch_ids[i])
                     .tag("egress_port", flow_info.l1_egress_ports[i])
                     .tag("queue_id", flow_info.queue_ids[i])
@@ -241,6 +247,8 @@ class Collector:
                 points.append(
                     Point("queue_occupancy")
                     .tag("flow_id", flow_id)
+                    .tag("src_ip", flow_info.src_ip)
+                    .tag("dst_ip", flow_info.dst_ip)
                     .tag("switch_id", flow_info.switch_ids[i])
                     .tag("queue_id", flow_info.queue_ids[i])
                     .field("value", flow_info.queue_occups[i])
@@ -250,6 +258,8 @@ class Collector:
                 # NEW: emit a drop-rate point on every report (except first sample)
                 drp = self.record_drop_rate_instant(
                     flow_id,
+                    flow_info.src_ip,
+                    flow_info.dst_ip,
                     flow_info.switch_ids[i],
                     flow_info.l1_egress_ports[i],
                     flow_info.queue_ids[i],
@@ -267,6 +277,8 @@ class Collector:
                 points.append(
                     Point("link_latency")
                     .tag("flow_id", flow_id)
+                    .tag("src_ip", flow_info.src_ip)
+                    .tag("dst_ip", flow_info.dst_ip)
                     .tag("queue_id", expected_queue_id)
                     .tag("egress_switch_id", flow_info.switch_ids[i + 1])
                     .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
@@ -284,6 +296,8 @@ class Collector:
             points.append(
                 Point("flow_latency")
                 .tag("flow_id", flow_id)
+                .tag("src_ip", flow_info.src_ip)
+                .tag("dst_ip", flow_info.dst_ip)
                 .tag("queue_id", expected_queue_id)
                 .field("value", flow_latency)
                 .time(report_time)
@@ -371,7 +385,7 @@ class Collector:
         int_shim_pkt = INTShim(int_rep_pkt.load)
         self.parse_int_metadata(flow_info, int_shim_pkt)
 
-        # flow_info.show()
+        #flow_info.show()
 
         sys.stdout.flush()
         return flow_info
