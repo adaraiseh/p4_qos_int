@@ -116,8 +116,27 @@ def generate_traffic(
     for qid in queues:
         probe_port = _probe_dst_port(flow_id, qid)
         traffic_port = _traffic_dst_port(flow_id, qid)
-        net.addTask(dst_host, f"python3 receive.py --proto all --ports {probe_port}", 1, 0, True)
-        net.addTask(dst_host, f"iperf3 -s -p {traffic_port} -i 1", 1, 0, True)
+        #net.addTask(dst_host, f"python3 receive.py --proto all --ports {probe_port}", 1, 0, True)
+        net.addTask(
+            dst_host,
+            f"""nohup sh -c 'while true; do \
+            python3 receive.py --proto all --ports {probe_port} >>/tmp/recv_{probe_port}.log 2>&1 || true; \
+            echo "[watchdog] receive.py {probe_port} exited — restarting in 2s" >>/tmp/recv_{probe_port}.log; \
+            sleep 2; \
+            done' >/dev/null 2>&1 &""",
+            1, 0, True
+        )
+        # iperf3 server: keep it running forever, restart if it dies
+        net.addTask(
+            dst_host,
+            f"""nohup sh -c 'while true; do \
+            iperf3 -s -p {traffic_port} -i 1 --logfile /tmp/iperf3_s_{traffic_port}.log; \
+            echo "[watchdog] server {traffic_port} exited (rc=$?) — restarting in 2s" >>/tmp/iperf3_s_{traffic_port}.log; \
+            sleep 2; \
+            done' >/dev/null 2>&1 &""",
+            1, 0, True
+        )
+
 
     # Send traffic from src -> dst for each selected queue
     for qid in queues:
@@ -131,9 +150,20 @@ def generate_traffic(
         length = len_map[qid]
 
         # Your lightweight sender (control/marker packets), matches ToS and port
+        # net.addTask(
+        #     src_host,
+        #     f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
+        #     1.5, 0, True
+        # )
         net.addTask(
             src_host,
-            f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
+            f"""nohup bash -lc 'while true; do \
+            python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} \
+                            --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0 \
+                >>/tmp/send_{probe_port}.log 2>&1 || true; \
+            echo "[watchdog] send.py {probe_port} exited (rc=$?) — restarting in 2s" >>/tmp/send_{probe_port}.log; \
+            sleep 2; \
+            done' >/dev/null 2>&1 &""",
             1.5, 0, True
         )
 
@@ -141,11 +171,18 @@ def generate_traffic(
         # -t 0 means run until stopped
         # -b {bw_mbps}M
         # -l {packet length}
+        # iperf3 client: run forever, auto-restart on any exit, keep logs
         net.addTask(
             src_host,
-            f'iperf3 -c {dst_ip} -i 1 -t 0 -p {traffic_port} -u -b {bw_mbps}M -l {length} --tos {tos}',
+            f"""nohup sh -c 'while true; do \
+            iperf3 -c {dst_ip} -p {traffic_port} -u -b {bw_mbps}M -l {length} --tos {tos} \
+                    -i 1 -t 3600 --connect-timeout 5000 >>/tmp/iperf3_c_{traffic_port}.log 2>&1; \
+            echo "[watchdog] client {traffic_port} exited (rc=$?) — restarting in 2s" >>/tmp/iperf3_c_{traffic_port}.log; \
+            sleep 2; \
+            done' >/dev/null 2>&1 &""",
             2.0, 0, True
         )
+
 
 def config_network(p4):
     net = NetworkAPI()
@@ -252,7 +289,7 @@ def config_network(p4):
         dst_host="h8",
         flow_id=18,
         queue_id="all",
-        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
+        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
         per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
     )
 
@@ -262,7 +299,7 @@ def config_network(p4):
         dst_host="h7",
         flow_id=17,
         queue_id="all",
-        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
+        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
         per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
     )
 
@@ -272,7 +309,7 @@ def config_network(p4):
         dst_host="h7",
         flow_id=27,
         queue_id="all",
-        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
+        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
         per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
     )
 
@@ -282,7 +319,7 @@ def config_network(p4):
         dst_host="h8",
         flow_id=28,
         queue_id="all",
-        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
+        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
         per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
     )
 
