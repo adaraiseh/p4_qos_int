@@ -82,6 +82,14 @@ LATENCY_RATIO_CLIP = 2.0
 # One-hot vocabulary size for worst_node_id (0 = none, 1..256 = raw id clamped)
 WORST_ID_BUCKETS = 257
 
+# Worst-case fallbacks when no INT data is seen in the window
+MISSING_FLOW_LAT_MS    = 2000.0
+MISSING_LINK_LAT_MS    = 1000.0
+MISSING_SWITCH_LAT_MS  = 200.0
+MISSING_DROP_PER_100MS = DROP_RATE_CAP_PER_100MS  # 20.0 by default
+MISSING_TX_UTIL_PCT    = 100.0
+MISSING_Q_OCC_PCT      = 100.0
+
 def _perf_t():  # perf timer
     return time.perf_counter()
 
@@ -465,45 +473,46 @@ class RoutingRLSystem:
     def _collect_metrics_for_qid(self, qid: int, seconds=1):
         start, stop = self._time_window(seconds)
 
-        # Single query for all simple aggregates
+        # ---------- Aggregates (single query) ----------
         flux_agg = f'''
         qid = "{qid}"
         base = from(bucket:"{self.bucket}")
-          |> range(start:{start}, stop:{stop})
-          |> filter(fn: (r) => r.queue_id == qid)
-          |> toFloat()
+        |> range(start:{start}, stop:{stop})
+        |> filter(fn: (r) => r.queue_id == qid)
+        |> toFloat()
 
         flow = base
-          |> filter(fn: (r) => r._measurement == "flow_latency")
-          |> mean(column:"_value")
-          |> set(key:"_measurement", value:"flow_latency_agg")
+        |> filter(fn: (r) => r._measurement == "flow_latency")
+        |> mean(column:"_value")
+        |> set(key:"_measurement", value:"flow_latency_agg")
 
         link = base
-          |> filter(fn: (r) => r._measurement == "link_latency")
-          |> mean(column:"_value")
-          |> set(key:"_measurement", value:"link_latency_agg")
+        |> filter(fn: (r) => r._measurement == "link_latency")
+        |> mean(column:"_value")
+        |> set(key:"_measurement", value:"link_latency_agg")
 
         swlat = base
-          |> filter(fn: (r) => r._measurement == "switch_latency")
-          |> mean(column:"_value")
-          |> set(key:"_measurement", value:"switch_latency_agg")
+        |> filter(fn: (r) => r._measurement == "switch_latency")
+        |> mean(column:"_value")
+        |> set(key:"_measurement", value:"switch_latency_agg")
 
         drop = base
-          |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms")
-          |> mean(column:"_value")
-          |> set(key:"_measurement", value:"drop_rate_agg")
+        |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms")
+        |> mean(column:"_value")
+        |> set(key:"_measurement", value:"drop_rate_agg")
 
         txu = base
-          |> filter(fn: (r) => r._measurement == "tx_utilization")
-          |> mean(column:"_value")
-          |> set(key:"_measurement", value:"tx_util_agg")
+        |> filter(fn: (r) => r._measurement == "tx_utilization")
+        |> mean(column:"_value")
+        |> set(key:"_measurement", value:"tx_util_agg")
 
         union(tables: [flow, link, swlat, drop, txu])
         '''
 
         tables = self.query_api.query(org=self.org, query=flux_agg)
-        agg = {"flow_latency_agg":0.0, "link_latency_agg":0.0,
-               "switch_latency_agg":0.0, "drop_rate_agg":0.0, "tx_util_agg":0.0}
+        agg = {"flow_latency_agg":None, "link_latency_agg":None,
+            "switch_latency_agg":None, "drop_rate_agg":None, "tx_util_agg":None}
+        agg_rows = 0
         for tbl in tables or []:
             for rec in tbl.records:
                 m = rec.get_measurement()
@@ -511,27 +520,30 @@ class RoutingRLSystem:
                     v = rec.get_value()
                     if v is not None:
                         agg[m] = float(v)
+                        agg_rows += 1
 
-        # Separate query for worst-node (pivot across switch_id)
+        # ---------- Worst-node (pivot) ----------
         flux_worst = f'''
         from(bucket:"{self.bucket}")
-          |> range(start:{start}, stop:{stop})
-          |> filter(fn: (r) => r.queue_id == "{qid}"
-             and r._measurement =~ /q_drop_rate_100ms|switch_latency|tx_utilization|queue_occupancy/)
-          |> toFloat()
-          |> group(columns:["queue_id","switch_id","_measurement"])
-          |> max(column:"_value")
-          |> group(columns:["switch_id"])
-          |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
+        |> range(start:{start}, stop:{stop})
+        |> filter(fn: (r) => r.queue_id == "{qid}"
+            and r._measurement =~ /q_drop_rate_100ms|switch_latency|tx_utilization|queue_occupancy/)
+        |> toFloat()
+        |> group(columns:["queue_id","switch_id","_measurement"])
+        |> max(column:"_value")
+        |> group(columns:["switch_id"])
+        |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
         '''
         wtables = self.query_api.query(org=self.org, query=flux_worst)
 
         worst_id, worst_score = 0, -float('inf')
+        worst_rows = 0
         total_w = sum(w for _, w in self.switch_metrics.values())
         weights = {m: w/total_w for m, (_, w) in self.switch_metrics.items()}
 
         for tbl in wtables or []:
             for rec in tbl.records:
+                worst_rows += 1
                 vals = rec.values
                 sid = int(vals.get("switch_id", 0) or 0)
                 if self.switch_id_role and sid in self.tor_ids:
@@ -542,19 +554,49 @@ class RoutingRLSystem:
                 qocc  = float(vals.get("queue_occupancy",   0.0) or 0.0)
 
                 score = (drops*weights['q_drop_rate_100ms'] +
-                         slat *weights['switch_latency'] +
-                         txu  *weights['tx_utilization'] +
-                         qocc *weights['queue_occupancy'])
+                        slat *weights['switch_latency'] +
+                        txu  *weights['tx_utilization'] +
+                        qocc *weights['queue_occupancy'])
                 if score > worst_score:
                     worst_id, worst_score = sid, score
 
+        # ---------- If no data, set WORST-CASE values ----------
+        agg_missing = (agg_rows == 0)
+        worst_missing = (worst_rows == 0)
+
+        if agg_missing:
+            log.warning("[INT GAP] No agg data for qid=%s between %s and %s; using worst-case fallback.", qid, start, stop)
+            agg = {
+                "flow_latency_agg":  MISSING_FLOW_LAT_MS,
+                "link_latency_agg":  MISSING_LINK_LAT_MS,
+                "switch_latency_agg":MISSING_SWITCH_LAT_MS,
+                "drop_rate_agg":     MISSING_DROP_PER_100MS,
+                "tx_util_agg":       MISSING_TX_UTIL_PCT,
+            }
+        else:
+            # Fill any individual missing series with a conservative worst-case too
+            if agg["flow_latency_agg"]     is None: agg["flow_latency_agg"]     = MISSING_FLOW_LAT_MS
+            if agg["link_latency_agg"]     is None: agg["link_latency_agg"]     = MISSING_LINK_LAT_MS
+            if agg["switch_latency_agg"]   is None: agg["switch_latency_agg"]   = MISSING_SWITCH_LAT_MS
+            if agg["drop_rate_agg"]        is None: agg["drop_rate_agg"]        = MISSING_DROP_PER_100MS
+            if agg["tx_util_agg"]          is None: agg["tx_util_agg"]          = MISSING_TX_UTIL_PCT
+
+        if worst_missing:
+            # No per-switch data either; fabricate a penalty from worst-case components
+            log.warning("[INT GAP] No worst-node data for qid=%s; synthesizing worst penalty.", qid)
+            worst_id = 0  # unknown
+            worst_score = (MISSING_DROP_PER_100MS * weights['q_drop_rate_100ms'] +
+                        MISSING_SWITCH_LAT_MS  * weights['switch_latency'] +
+                        MISSING_TX_UTIL_PCT    * weights['tx_utilization'] +
+                        MISSING_Q_OCC_PCT      * weights['queue_occupancy'])
+
         d = {
             'worst_node_id':      int(worst_id),
-            'penalty_worst_node': float(0.0 if worst_score == -float('inf') else max(0.0, worst_score)),
-            'flow_latency':       float(agg["flow_latency_agg"]),
+            'penalty_worst_node': float(max(0.0, worst_score if worst_score != -float('inf') else 0.0)),
+            'flow_latency':        float(agg["flow_latency_agg"]),
             'mean_link_latency':   float(agg["link_latency_agg"]),
             'mean_switch_latency': float(agg["switch_latency_agg"]),
-            'drop_rate':          float(agg["drop_rate_agg"]),
+            'drop_rate':           float(agg["drop_rate_agg"]),
             'mean_tx_util':        float(agg["tx_util_agg"]),
         }
         return d
