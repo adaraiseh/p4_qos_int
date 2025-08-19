@@ -218,11 +218,37 @@ class Collector:
             flow_id = (flow_info.dst_port // 10) % 100  # digit 2 & 3
             expected_queue_id = flow_info.dst_port % 10  # digit 4
 
-            # Use sink-hop egress timestamp as unified time for this report
-            report_time = int(flow_info.egress_tstamps[flow_info.hop_cnt - 1])
+            # ---- Robust guard for partial/empty hop metadata ----
+            # Determine a safe number of hops present across all arrays.
+            arrays = [
+                flow_info.switch_ids,
+                flow_info.l1_ingress_ports,
+                flow_info.l1_egress_ports,
+                flow_info.hop_latencies,
+                flow_info.queue_ids,
+                flow_info.queue_occups,
+                flow_info.queue_drops,
+                flow_info.ingress_tstamps,
+                flow_info.egress_tstamps,
+                flow_info.egress_tx_utils,
+            ]
+            present_lengths = [len(a) for a in arrays]
+            safe_hops = min([flow_info.hop_cnt] + present_lengths) if flow_info.hop_cnt else min(present_lengths + [0])
+
+            if safe_hops <= 0:
+                # Nothing consistent to write; just drop this report.
+                return
+
+            # Use sink-hop egress timestamp as unified time if available; else fallback
+            if len(flow_info.egress_tstamps) >= safe_hops:
+                report_time = int(flow_info.egress_tstamps[safe_hops - 1])
+            elif len(flow_info.ingress_tstamps) >= safe_hops:
+                report_time = int(flow_info.ingress_tstamps[safe_hops - 1])
+            else:
+                report_time = int(time.time_ns())
 
             # Per-hop metrics
-            for i in range(flow_info.hop_cnt):
+            for i in range(safe_hops):
                 points.append(
                     Point("switch_latency")
                     .tag("flow_id", flow_id)
@@ -270,38 +296,42 @@ class Collector:
                     points.append(drp)
 
             # Link latency (device stamps), same unified time
-            for i in range(flow_info.hop_cnt - 1):
-                link_latency = abs(
-                    flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]
+            link_pairs = max(safe_hops - 1, 0)
+            for i in range(link_pairs):
+                # Guard against mismatched stamp lengths
+                if i + 1 < len(flow_info.egress_tstamps) and i < len(flow_info.ingress_tstamps):
+                    link_latency = abs(
+                        flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]
+                    ) / 1_000_000.0
+                    points.append(
+                        Point("link_latency")
+                        .tag("flow_id", flow_id)
+                        .tag("src_ip", flow_info.src_ip)
+                        .tag("dst_ip", flow_info.dst_ip)
+                        .tag("queue_id", expected_queue_id)
+                        .tag("egress_switch_id", flow_info.switch_ids[i + 1])
+                        .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
+                        .tag("ingress_switch_id", flow_info.switch_ids[i])
+                        .tag("ingress_port_id", flow_info.l1_ingress_ports[i])
+                        .field("value", link_latency)
+                        .time(report_time)
+                    )
+
+            # Flow latency, unified time (only if we have both ends)
+            if len(flow_info.ingress_tstamps) >= 1 and len(flow_info.egress_tstamps) >= safe_hops:
+                flow_latency = (
+                    flow_info.ingress_tstamps[0]
+                    - flow_info.egress_tstamps[safe_hops - 1]
                 ) / 1_000_000.0
                 points.append(
-                    Point("link_latency")
+                    Point("flow_latency")
                     .tag("flow_id", flow_id)
                     .tag("src_ip", flow_info.src_ip)
                     .tag("dst_ip", flow_info.dst_ip)
                     .tag("queue_id", expected_queue_id)
-                    .tag("egress_switch_id", flow_info.switch_ids[i + 1])
-                    .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
-                    .tag("ingress_switch_id", flow_info.switch_ids[i])
-                    .tag("ingress_port_id", flow_info.l1_ingress_ports[i])
-                    .field("value", link_latency)
+                    .field("value", flow_latency)
                     .time(report_time)
                 )
-
-            # Flow latency, unified time
-            flow_latency = (
-                flow_info.ingress_tstamps[0]
-                - flow_info.egress_tstamps[flow_info.hop_cnt - 1]
-            ) / 1_000_000.0
-            points.append(
-                Point("flow_latency")
-                .tag("flow_id", flow_id)
-                .tag("src_ip", flow_info.src_ip)
-                .tag("dst_ip", flow_info.dst_ip)
-                .tag("queue_id", expected_queue_id)
-                .field("value", flow_latency)
-                .time(report_time)
-            )
 
             # Single, atomic write for this report
             self.write_api.write(

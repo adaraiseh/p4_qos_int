@@ -252,17 +252,37 @@ def config_network(p4):
         dst_host="h8",
         flow_id=18,
         queue_id="all",
-        per_queue_bw={0: 1.5, 1: 1.0, 7: 1.0},   # Mbps
+        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
         per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
     )
 
     generate_traffic(
         net=net,
-        src_host="h3",
-        dst_host="h1",
-        flow_id=31,
+        src_host="h1",
+        dst_host="h7",
+        flow_id=17,
         queue_id="all",
-        per_queue_bw={0: 1.0, 1: 0.5, 7: 0.5},   # Mbps
+        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
+        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
+    )
+
+    generate_traffic(
+        net=net,
+        src_host="h2",
+        dst_host="h7",
+        flow_id=27,
+        queue_id="all",
+        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
+        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
+    )
+
+    generate_traffic(
+        net=net,
+        src_host="h2",
+        dst_host="h8",
+        flow_id=28,
+        queue_id="all",
+        per_queue_bw={0: 1.1, 1: 0.2, 7: 1.0},   # Mbps
         per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
     )
 

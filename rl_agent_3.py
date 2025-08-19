@@ -354,19 +354,13 @@ class RoutingRLSystem:
         #  - 7 continuous features (penalty, flowr, linkr, swr, txn, drn, near)
         self.state_dim = 3 + WORST_ID_BUCKETS + 7
 
-        # Build role → ids and compute MAX_ALTS once (exclude ToR)
-        self.role_to_ids = {}
-        for sid, role in self.switch_id_role.items():
-            self.role_to_ids.setdefault(role, []).append(int(sid))
+        # ======== ACTION SPACE (CHANGED) ========
+        # 0: no-op
+        # 1: change route for one demand within the queue (highest flow_latency)
+        # 2: revert the last route change
+        self.action_dim = 3
+        # ========================================
 
-        def _compute_max_alts():
-            candidates = [len(ids) - 1 for role, ids in self.role_to_ids.items() if role != "tor"]
-            # Fallback if mapping missing
-            return max(candidates) if candidates else 3
-
-        self.MAX_ALTS = _compute_max_alts()
-        self.action_dim = 1 + self.MAX_ALTS
-        log.info(f"Action space sized: MAX_ALTS={self.MAX_ALTS} ⇒ action_dim={self.action_dim}")
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.agents = {
             qid: DuelingDQNAgent(self.state_dim, self.action_dim, self.device, n_step=3)
@@ -465,26 +459,6 @@ class RoutingRLSystem:
                 log.warning("Failed to parse %s: %s", path, e)
 
         return mapping
-
-    # No controller dependency; purely uses your parsed rules/test/*-commands.txt mapping.
-    def _get_ordered_alternates(self, qid: int, worst_id: int):
-        """
-        Deterministic list of alternates for the worst node:
-        - Same tier as worst_id (agg ↔ agg, core ↔ core), ToR excluded
-        - Excludes worst_id itself
-        - Sorted by switch_id for stability
-        Returns: [{'target_node_id': <int>}, ...] capped to MAX_ALTS
-        """
-        if worst_id <= 0:
-            return []
-        role = self.switch_id_role.get(int(worst_id))
-        if not role or role == "tor":
-            return []
-
-        ids = [sid for sid in self.role_to_ids.get(role, []) if sid != int(worst_id)]
-        ids.sort()
-        alts = [{"target_node_id": sid} for sid in ids]
-        return alts[: self.MAX_ALTS]
 
     # ---------------- Batched per-qid metrics (single Flux for aggs + one for worst) ----------------
 
@@ -678,47 +652,106 @@ class RoutingRLSystem:
 
         return float(max(min(r, REWARD_ALL_MEET), -REWARD_ALL_MEET))
 
+    # ----- Demand picker (highest flow_latency in window) -----
+
+    def _pick_hottest_demand(self, qid: int, seconds=1):
+        """
+        Returns (src_ip, dst_ip) of the demand with highest mean flow_latency in the last window.
+        """
+        start, stop = self._time_window(seconds)
+        flux = f'''
+        from(bucket:"{self.bucket}")
+          |> range(start:{start}, stop:{stop})
+          |> filter(fn: (r) => r._measurement == "flow_latency" and r.queue_id == "{qid}")
+          |> toFloat()
+          |> group(columns:["src_ip","dst_ip"])
+          |> mean(column:"_value")
+          |> group()
+          |> sort(columns:["_value"], desc:true)
+          |> limit(n:1)
+        '''
+        tables = self.query_api.query(org=self.org, query=flux)
+        for tbl in tables or []:
+            for rec in tbl.records:
+                src = rec.values.get("src_ip")
+                dst = rec.values.get("dst_ip")
+                if src and dst:
+                    return src, dst
+        return None
+
     # ----- Actions -----
 
     def apply_path_change(self, qid, worst_node_id, action):
+        # 0: NO-OP
         if action == 0:
             log.debug("NO change (action 0)")
             return
 
-        alts = self._get_ordered_alternates(qid, int(worst_node_id))
-        idx = action - 1
-        if idx < 0 or idx >= len(alts):
-            log.warning(f"Chosen action {action} has no mapped alternate for worst_id={worst_node_id}; skipping.")
+        # 2: REVERT-LAST
+        if action == 2:
+            ok = self.controller.revert_last_change()
+            if ok:
+                log.info("[REVERT] Last route change was successfully reverted.")
+            else:
+                log.info("[REVERT] No change to revert.")
             return
 
-        alt = alts[idx]
-        alt_sid = alt["target_node_id"]
-        # TODO: wire this to controller.update_path(...) for your fabric.
-        # Keep this log rich so you can verify decisions during training.
-        log.debug(
-            f"Path change q={qid} worst_node_id={worst_node_id} → alt_idx={idx} (alt_sid={alt_sid})"
-        )
+        # 1: CHANGE_ONE_DEMAND
+        # - Find hottest demand (src_ip, dst_ip) by flow_latency in this queue
+        # - Find alternate for worst node (same tier; agg same pod)
+        # - Apply symmetric reroute for that demand+queue (DSCP)
+        if action == 1:
+            if int(worst_node_id) <= 0:
+                log.debug("No worst node available; skipping change.")
+                return
+            demand = self._pick_hottest_demand(qid, seconds=1)
+            if not demand:
+                log.debug("No demand candidates found for reroute; skipping.")
+                return
+            src_ip, dst_ip = demand
+            alt = self.controller.find_alternate_for_worst(int(worst_node_id))
+            if not alt:
+                log.debug(f"No alternate found for worst node {worst_node_id}; skipping.")
+                return
 
+            ok, details = self.controller.reroute_one_demand_symmetric(
+                src_ip=src_ip,
+                dst_ip=dst_ip,
+                qid=qid,
+                worst_switch_id=int(worst_node_id),
+                alt_switch_name=alt
+            )
+            if ok:
+                log.debug(
+                    f"Path change q={qid} worst_node_id={worst_node_id} "
+                    f"→ alt={alt} for demand ({src_ip} → {dst_ip})"
+                )
+            else:
+                log.debug(
+                    f"Path change FAILED q={qid} worst_node_id={worst_node_id} "
+                    f"alt={alt} demand=({src_ip} → {dst_ip}) reason={details}"
+                )
+            return
 
     # ----- Action masking -----
     def valid_action_mask(self, qid, data):
         """
         Boolean mask of shape [action_dim].
         a0 = no-op (always valid)
-        a1.. = alternates for (qid, worst_id) capped by MAX_ALTS.
+        a1 = change-one-demand (valid if worst_id>0 and an alternate exists)
+        a2 = revert-last (valid if controller has revert state)
         """
         mask = np.zeros(self.action_dim, dtype=bool)
         mask[0] = True  # no-op
 
         worst_id = int(data.get('worst_node_id', 0) or 0)
-        if worst_id == 0:
-            return mask
+        if worst_id > 0 and self.controller.has_alternate_for_worst(worst_id):
+            mask[1] = True
 
-        alts = self._get_ordered_alternates(qid, worst_id)
-        for i in range(len(alts)):
-            mask[1 + i] = True
+        if self.controller.has_pending_change():
+            mask[2] = True
+
         return mask
-
 
     # ----- Diagnostics -----
 
