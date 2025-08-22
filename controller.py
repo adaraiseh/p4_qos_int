@@ -556,6 +556,28 @@ class Controller:
         _revert_one(change.get("rev"))
         return True
 
+    # ---------- Public helpers for RL agent logging ----------
+
+    def host_from_ip(self, ip: str):
+        """Public wrapper (non-underscored) to map an IP to a topology host name like 'h3'."""
+        return self.ip_to_host.get(ip)
+
+    def get_path_by_hosts(self, src_host: str, dst_host: str):
+        """Return stored path [nodes...] for (src_host, dst_host), or None."""
+        return self.path_map.get((src_host, dst_host))
+
+    def get_path_by_ips(self, src_ip: str, dst_ip: str):
+        """
+        Resolve IPs to host names and return stored path [nodes...],
+        e.g. ['h1','t1','a1','c1','a4','t4','h4'], or None if unknown.
+        """
+        sh = self.host_from_ip(src_ip)
+        dh = self.host_from_ip(dst_ip)
+        if not sh or not dh:
+            return None
+        return self.get_path_by_hosts(sh, dh)
+
+
     # -----------------------
     # Debug
     # -----------------------

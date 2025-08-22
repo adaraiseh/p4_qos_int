@@ -764,16 +764,30 @@ class RoutingRLSystem:
                 alt_switch_name=alt
             )
             if ok:
-                log.debug(
-                    f"Path change q={qid} worst_node_id={worst_node_id} "
-                    f"→ alt={alt} for demand ({src_ip} → {dst_ip})"
+                # Grab the last recorded change details (Controller pushed it)
+                last_change = self.controller.change_history[-1] if self.controller.change_history else {}
+                fwd = last_change.get("fwd")
+                rev = last_change.get("rev")
+
+                log.info(
+                    f"[PATH CHANGE SUCCESS] q={qid} demand=({src_ip} → {dst_ip}) "
+                    f"worst={worst_node_id} alt={alt}"
                 )
+
+                # Print before/after paths if available
+                if fwd and fwd.get("old_path") and fwd.get("new_path"):
+                    log.info("  Forward: \n%s\n%s",
+                            " -> ".join(fwd["old_path"]),
+                            " -> ".join(fwd["new_path"]))
+                if rev and rev.get("old_path") and rev.get("new_path"):
+                    log.info("  Reverse: \n%s\n%s",
+                            " -> ".join(rev["old_path"]),
+                            " -> ".join(rev["new_path"]))
             else:
                 log.debug(
-                    f"Path change FAILED q={qid} worst_node_id={worst_node_id} "
+                    f"[PATH CHANGE FAILED] q={qid} worst_node_id={worst_node_id} "
                     f"alt={alt} demand=({src_ip} → {dst_ip}) reason={details}"
                 )
-            return
 
     # ----- Action masking -----
     def valid_action_mask(self, qid, data):
@@ -796,6 +810,41 @@ class RoutingRLSystem:
         return mask
 
     # ----- Diagnostics -----
+
+    def list_active_demands(self, seconds=1):
+        """
+        Return a list of tuples (qid:int, src_ip:str, dst_ip:str) for demands
+        that had any 'flow_latency' points in the last window (safety-lagged).
+        """
+        start, stop = self._time_window(seconds)
+        flux = f'''
+        from(bucket:"{self.bucket}")
+          |> range(start:{start}, stop:{stop})
+          |> filter(fn: (r) => r._measurement == "flow_latency")
+          |> group(columns:["src_ip","dst_ip","queue_id"])
+          |> count(column:"_value")
+          |> filter(fn: (r) => r._value > 0)
+          |> keep(columns:["src_ip","dst_ip","queue_id","_value"])
+        '''
+        try:
+            tables = self.query_api.query(org=self.org, query=flux)
+        except Exception as e:
+            log.warning("Failed to list active demands: %s", e)
+            return []
+
+        out = []
+        for tbl in tables or []:
+            for rec in tbl.records:
+                src = rec.values.get("src_ip")
+                dst = rec.values.get("dst_ip")
+                qid = rec.values.get("queue_id")
+                if src and dst and qid is not None:
+                    try:
+                        out.append((int(qid), str(src), str(dst)))
+                    except Exception:
+                        pass
+        return out
+
 
     def agent_stats(self):
         now_mono = time.monotonic()
@@ -951,6 +1000,22 @@ if __name__ == "__main__":
                     f"[Step {step}] rewards:"
                     f" voice={rewards[0]:.2f}, video={rewards[1]:.2f}, best={rewards[7]:.2f}"
                 )
+                
+                # === Log all active demand paths (last safety-lagged window) ===
+                demands = env.list_active_demands(seconds=1)  # window can be widened if you like
+                if not demands:
+                    log.info("[Active Demands] none observed in the last window")
+                else:
+                    log.info("[Active Demands] %d demand(s) with resolved paths:", len(demands))
+                    for qid, src_ip, dst_ip in sorted(demands):
+                        path = env.controller.get_path_by_ips(src_ip, dst_ip)
+                        sh = env.controller.host_from_ip(src_ip) or src_ip
+                        dh = env.controller.host_from_ip(dst_ip) or dst_ip
+                        if path:
+                            # path already includes hX at both ends; format compactly
+                            log.info("  [q=%s] %s→%s: %s", qid, sh, dh, " -> ".join(path))
+                        else:
+                            log.info("  [q=%s] %s→%s: <no stored path>", qid, sh, dh)
 
             if step % LOG_EVERY == 0:
                 stats = env.agent_stats()
