@@ -7,7 +7,7 @@ import time
 from scapy.all import Packet
 from scapy.all import BitField, ShortField
 from scapy.layers.inet import Ether, IP, TCP, UDP, bind_layers
-from influxdb_client import Point
+from influxdb_client import Point, WriteOptions
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.write.point import WritePrecision
 
@@ -154,20 +154,38 @@ class FlowInfo():
 
 class Collector:
     """
-    Per-report atomic writes using the sink-hop egress timestamp as a unified time.
-    Emits a drop-rate point on every report (except the first per tag).
+    Per-report writes with batched async option.
+    - write_async=True: ~0.5s flush cadence, much lower CPU/latency.
+    - use_device_time=False: use server now() to avoid device clock skew.
     """
-    def __init__(self, influx_client, org, bucket):
+    def __init__(self, influx_client, org, bucket,
+                 write_async=True, flush_interval_ms=500, batch_size=1000,
+                 use_device_time=True):
         self.influx_client = influx_client
-        self.write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+        if write_async:
+            self.write_api = influx_client.write_api(write_options=WriteOptions(
+                batch_size=batch_size,
+                flush_interval=flush_interval_ms,
+                jitter_interval=0,
+                retry_interval=1000,
+                max_retries=3,
+                max_retry_delay=5000,
+                exponential_base=2
+            ))
+        else:
+            self.write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+
+        self.use_device_time = bool(use_device_time)
         self.org = org
         self.bucket = bucket
         # (flow_id, switch_id, queue_id, egress_port) -> (last_count, last_ts_ns)
         self.last_drop_data = {}
 
-    # Kept for compatibility with influx_export.py
     def flush_buffer(self):
-        return
+        try:
+            self.write_api.flush()
+        except Exception:
+            pass
 
     def record_drop_rate_instant(self, flow_id, src_ip, dst_ip, switch_id, egress_port, queue_id,
                                  drop_count, report_time_ns):
@@ -240,9 +258,10 @@ class Collector:
                 return
 
             # Use sink-hop egress timestamp as unified time if available; else fallback
-            if len(flow_info.egress_tstamps) >= safe_hops:
+            # Use sink-hop egress timestamp if device time is enabled and present
+            if self.use_device_time and len(flow_info.egress_tstamps) >= safe_hops:
                 report_time = int(flow_info.egress_tstamps[safe_hops - 1])
-            elif len(flow_info.ingress_tstamps) >= safe_hops:
+            elif self.use_device_time and len(flow_info.ingress_tstamps) >= safe_hops:
                 report_time = int(flow_info.ingress_tstamps[safe_hops - 1])
             else:
                 report_time = int(time.time_ns())

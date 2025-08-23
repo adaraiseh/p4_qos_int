@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-
 import sys
 import signal
-from scapy.all import sniff
+from scapy.all import AsyncSniffer, conf
 from influxdb_client import InfluxDBClient
 from collector import *
 
@@ -11,37 +10,54 @@ INFLUX_TOKEN = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9T
 INFLUX_ORG = "research"
 INFLUX_BUCKET = "INT"
 
-def handle_pkt(pkt, c):
+BPF = "udp and dst port 1234"   # <<<< narrowed; huge CPU win
+
+def handle_pkt(pkt, c: Collector):
     if INTREP in pkt:
-        flow_info = c.parser_int_pkt(pkt)
-        if flow_info:
-            c.export_influxdb(flow_info)
-            flow_info.clear_metadata()  # Custom cleanup for FlowInfo
+        fi = c.parser_int_pkt(pkt)
+        if fi:
+            c.export_influxdb(fi)
 
 def main():
     iface = ['t1-eth10', 't2-eth10', 't3-eth10', 't4-eth10']
-    print(f"Sniffing on {iface}")
+    print(f"Sniffing on {iface} with BPF: {BPF}")
     sys.stdout.flush()
 
-    # Initialize the InfluxDB client and the Collector
-    influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-    c = Collector(influx_client, INFLUX_ORG, INFLUX_BUCKET)
+    # Scapy performance knobs (optional, but helpful)
+    conf.use_pcap = True          # prefer libpcap
+    conf.sniff_promisc = 0        # no promiscuous unless needed
 
-    # Graceful shutdown handler
+    influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+
+    # Async writer (flush ~0.5s). If your device clocks are skewed, set use_device_time=False.
+    c = Collector(influx_client, INFLUX_ORG, INFLUX_BUCKET,
+                  write_async=True, flush_interval_ms=500, batch_size=1000,
+                  use_device_time=True)
+
+    stop = False
     def signal_handler(sig, frame):
-        print("\nStopping sniffing and shutting down...")
+        nonlocal stop
+        stop = True
+        print("\nStopping...")
         c.flush_buffer()
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start sniffing
-    sniff(
-        iface=iface,
-        filter='inbound and tcp or udp',
-        prn=lambda x: handle_pkt(x, c),
-        store=False  # Avoid storing packets in memory
-    )
+    sniffer = AsyncSniffer(iface=iface, filter=BPF, store=False,
+                           prn=lambda x: handle_pkt(x, c))
+    sniffer.start()
+    try:
+        while not stop:
+            signal.pause()
+    except Exception:
+        pass
+    finally:
+        try:
+            sniffer.stop()
+        except Exception:
+            pass
+        c.flush_buffer()
 
 if __name__ == '__main__':
     main()

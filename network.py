@@ -119,23 +119,29 @@ def generate_traffic(
         #net.addTask(dst_host, f"python3 receive.py --proto all --ports {probe_port}", 1, 0, True)
         net.addTask(
             dst_host,
-            f"""nohup sh -c 'while true; do \
-            python3 receive.py --proto all --ports {probe_port} >>/tmp/recv_{probe_port}.log 2>&1 || true; \
-            echo "[watchdog] receive.py {probe_port} exited — restarting in 2s" >>/tmp/recv_{probe_port}.log; \
-            sleep 2; \
-            done' >/dev/null 2>&1 &""",
+            f"""python3 receive.py --proto all --ports {probe_port} >>/tmp/{dst_host}_recv_{probe_port}.log""",
             1, 0, True
         )
         # iperf3 server: keep it running forever, restart if it dies
+        # net.addTask(
+        #     dst_host,
+        #     f"""iperf3 -s -p {traffic_port} -i 1 --logfile /tmp/{dst_host}_iperf3_s_{traffic_port}.log""",
+        #     1, 0, True
+        # )
         net.addTask(
-            dst_host,
-            f"""nohup sh -c 'while true; do \
-            iperf3 -s -p {traffic_port} -i 1 --logfile /tmp/iperf3_s_{traffic_port}.log; \
-            echo "[watchdog] server {traffic_port} exited (rc=$?) — restarting in 2s" >>/tmp/iperf3_s_{traffic_port}.log; \
-            sleep 2; \
-            done' >/dev/null 2>&1 &""",
-            1, 0, True
-        )
+        dst_host,
+        (
+            f"bash -lc '"
+            f"while true; do "
+            f"  iperf3 -s -p {traffic_port} -i 1 "
+            f"    --logfile /tmp/{dst_host}_iperf3_s_{traffic_port}.log ; "
+            f"  echo \"[RESTART][$(date +%F_%T)] iperf3 server {traffic_port} exited ($?)\" "
+            f"    >> /tmp/{dst_host}_iperf3_s_{traffic_port}.log ; "
+            f"  sleep 1 ; "
+            f"done'"
+        ),
+        1, 0, True
+    )
 
 
     # Send traffic from src -> dst for each selected queue
@@ -150,36 +156,33 @@ def generate_traffic(
         length = len_map[qid]
 
         # Your lightweight sender (control/marker packets), matches ToS and port
+        net.addTask(
+            src_host,
+            f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
+            1.5, 0, True
+        )
+        
+        # iperf3 client: run forever, auto-restart on any exit, keep logs
         # net.addTask(
         #     src_host,
-        #     f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
-        #     1.5, 0, True
+        #     f"""iperf3 -c {dst_ip} -p {traffic_port} -u -b {bw_mbps}M -l {length} --tos {tos} \
+        #         -i 1 -t 3600 --connect-timeout 5000 --logfile /tmp/{src_host}_iperf3_c_{traffic_port}.log""",
+        #     2.0, 0, True
         # )
         net.addTask(
             src_host,
-            f"""nohup bash -lc 'while true; do \
-            python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} \
-                            --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0 \
-                >>/tmp/send_{probe_port}.log 2>&1 || true; \
-            echo "[watchdog] send.py {probe_port} exited (rc=$?) — restarting in 2s" >>/tmp/send_{probe_port}.log; \
-            sleep 2; \
-            done' >/dev/null 2>&1 &""",
-            1.5, 0, True
-        )
-
-        # iperf3 UDP stream
-        # -t 0 means run until stopped
-        # -b {bw_mbps}M
-        # -l {packet length}
-        # iperf3 client: run forever, auto-restart on any exit, keep logs
-        net.addTask(
-            src_host,
-            f"""nohup sh -c 'while true; do \
-            iperf3 -c {dst_ip} -p {traffic_port} -u -b {bw_mbps}M -l {length} --tos {tos} \
-                    -i 1 -t 3600 --connect-timeout 5000 >>/tmp/iperf3_c_{traffic_port}.log 2>&1; \
-            echo "[watchdog] client {traffic_port} exited (rc=$?) — restarting in 2s" >>/tmp/iperf3_c_{traffic_port}.log; \
-            sleep 2; \
-            done' >/dev/null 2>&1 &""",
+            (
+                f"bash -lc '"
+                f"while true; do "
+                f"  iperf3 -c {dst_ip} -p {traffic_port} -u "
+                f"         -b {bw_mbps}M -l {length} --tos {tos} "
+                f"         -i 1 -t 0 --connect-timeout 5000 "
+                f"         >> /tmp/{src_host}_iperf3_c_{traffic_port}.log 2>&1 ; "
+                f"  echo \"[RESTART][$(date +%F_%T)] iperf3 client {traffic_port} exited ($?)\" "
+                f"    >> /tmp/{src_host}_iperf3_c_{traffic_port}.log ; "
+                f"  sleep 1 ; "
+                f"done'"
+            ),
             2.0, 0, True
         )
 
@@ -281,47 +284,45 @@ def config_network(p4):
     net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
 
     # -----------------
-    # Generate traffic
+    # Generate traffic (balanced ~85% load)
     # -----------------
-    generate_traffic(
-        net=net,
-        src_host="h1",
-        dst_host="h8",
-        flow_id=18,
-        queue_id="all",
-        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
-        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
-    )
 
-    generate_traffic(
-        net=net,
-        src_host="h1",
-        dst_host="h7",
-        flow_id=17,
-        queue_id="all",
-        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
-        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
-    )
+    # Per-flow, per-queue Mbps so each src→dst pair sums to ~1.4167 Mbps
+    # (0.4 + 0.2 + 0.4) * 1.4167 ≈ 1.4167. Total per host ≈ 3 * 1.4167 = 4.25 Mbps.
+    # Two hosts per ToR ≈ 8.5 Mbps ⇒ ~85% of 10 Mbps (2×5).
+    LOAD_FACTOR = 0.39  # was 1.00
 
-    generate_traffic(
-        net=net,
-        src_host="h2",
-        dst_host="h7",
-        flow_id=27,
-        queue_id="all",
-        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
-        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
-    )
+    PER_QUEUE_BW = {
+        0: 0.4 * LOAD_FACTOR,   # ≈ 0.568 Mbps
+        1: 0.2 * LOAD_FACTOR,   # ≈ 0.284 Mbps
+        7: 0.4 * LOAD_FACTOR,   # ≈ 0.568 Mbps
+    }
 
-    generate_traffic(
-        net=net,
-        src_host="h2",
-        dst_host="h8",
-        flow_id=28,
-        queue_id="all",
-        per_queue_bw={0: 0.5, 1: 0.2, 7: 0.5},   # Mbps
-        per_queue_len={0: 1250, 1: 1250, 7: 1250},     # byes
-    )
+    PER_QUEUE_LEN = {0: 1250, 1: 1250, 7: 1250}  # iperf3 -l payload bytes
+
+    # Each host sends 3 flows to other pods (keeps things “natural” & ECMP‑friendly).
+    # Flow IDs must stay 0..99 (used in your port scheme).
+    balanced_pairs = [
+        ("h1","h6",10), ("h1","h7",11), ("h1","h8",12),
+        ("h2","h5",13), ("h2","h7",14), ("h2","h8",15),
+        ("h3","h5",16), ("h3","h7",17), ("h3","h8",18),
+        ("h4","h5",19), ("h4","h6",20), ("h4","h8",21),
+        ("h5","h2",22), ("h5","h3",23), ("h5","h4",24),
+        ("h6","h1",25), ("h6","h3",26), ("h6","h4",27),
+        ("h7","h1",28), ("h7","h2",29), ("h7","h3",30),
+        ("h8","h1",31), ("h8","h2",32), ("h8","h4",33),
+    ]
+
+    for src, dst, fid in balanced_pairs:
+        generate_traffic(
+            net=net,
+            src_host=src,
+            dst_host=dst,
+            flow_id=fid,
+            queue_id="all",
+            per_queue_bw=PER_QUEUE_BW,   # Mbps per queue
+            per_queue_len=PER_QUEUE_LEN  # payload bytes
+        )
 
     # Nodes general options
     #net.enableCpuPortAll()
