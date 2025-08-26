@@ -68,7 +68,7 @@ class Controller:
 
     def compute_forwarding_entries(self):
         hosts = list(self.topo.get_hosts().keys())
-        dscp_list = ["0x2E", "0x18", "0x12", "0x00"]
+        dscp_list = ["0x2E", "0x18", "0x00"]
 
         # Per-switch, per-table structures
         # lpm: {(dst_prefix, dscp): (next_hop_ip, egress_port)}
@@ -110,7 +110,6 @@ class Controller:
                         next_hop_ip  = dst_ip
                     else:
                         next_hop_mac = self.topo.node_to_node_mac(next_hop, sw_name)
-                        # >>> FIX: use network address for /24
                         net = ip_network(f"{dst_ip}/24", strict=False).network_address
                         dst_prefix   = f"{net}/24"
                         next_hop_ip  = self.topo.node_to_node_interface_ip(next_hop, sw_name).split('/')[0]
@@ -134,10 +133,6 @@ class Controller:
     def program_switches(self):
         for sw_name, tables in self.forwarding_entries.items():
             controller = self.controllers[sw_name]
-
-            # If your P4 has a real drop action, set it here; otherwise, remove this line.
-            # controller.table_set_default("l3_forward.ipv4_lpm", "drop_pkt")
-
             # 1) Switching table: unique next_hop_ip
             for next_hop_ip, next_hop_mac in tables['switching'].items():
                 controller.table_add(
@@ -170,41 +165,39 @@ class Controller:
     # Table/aux helpers
     # -----------------------
 
-    def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
+    def _upsert_lpm(self, sw_name: str, dst_prefix: str, dscp: str, next_hop_ip: str, egress_port: int) -> bool:
+        """
+        Robust modify-or-add for 'l3_forward.ipv4_lpm'. We do a delete-match (ignore if not present),
+        then add. Returns True on success; False on failure. Keeps the shadow map in sync only on success.
+        """
         controller = self.controllers[sw_name]
-        # MODIFY-OR-ADD policy:
-        exists = (sw_name in self.forwarding_entries
-                  and (dst_prefix, dscp) in self.forwarding_entries[sw_name].get('lpm', {}))
         try:
-            if exists:
-                controller.table_modify_match(
-                    "l3_forward.ipv4_lpm",
-                    "ipv4_forward",
-                    [dst_prefix, dscp],
-                    [next_hop_ip, str(egress_port)]
-                )
-            else:
-                controller.table_add(
-                    "l3_forward.ipv4_lpm",
-                    "ipv4_forward",
-                    [dst_prefix, dscp],
-                    [next_hop_ip, str(egress_port)]
-                )
-        finally:
-            # Keep shadow copy up to date for reversions
-            if sw_name in self.forwarding_entries:
-                self.forwarding_entries[sw_name].setdefault('lpm', {})
-                self.forwarding_entries[sw_name]['lpm'][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
+            # Delete any existing match for (dst_prefix, dscp) to avoid duplicate ambiguous entries
+            try:
+                controller.table_delete_match("l3_forward.ipv4_lpm", [dst_prefix, dscp])
+            except Exception:
+                pass  # not present is fine
 
-        # (Optionally) ensure aux tables have the needed keys only once:
-        # controller.table_add(...) guarded by a read/exists check if your API supports it,
-        # or keep a small in-memory set per switch to avoid re-adding.
-        
-        ### helper functions:
-        #def table_modify(self, table_name, action_name, entry_handle, action_params=[]):
-        #def table_modify_match(self, table_name, action_name, match_keys, action_params=[]):
-        #def table_delete_match(self, table_name, match_keys):
-        #def table_add(self, table_name, action_name, match_keys, action_params=[], prio=0):
+            # Add the new entry
+            controller.table_add(
+                "l3_forward.ipv4_lpm",
+                "ipv4_forward",
+                [dst_prefix, dscp],
+                [next_hop_ip, str(egress_port)]
+            )
+
+            # Shadow copy (only if we succeeded)
+            self.forwarding_entries.setdefault(sw_name, {}).setdefault('lpm', {})
+            self.forwarding_entries[sw_name]['lpm'][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
+            return True
+
+        except Exception as e:
+            print(f"[LPM upsert FAILED] {sw_name} {dst_prefix} dscp={dscp} -> {next_hop_ip}/{egress_port}: {e}")
+            return False
+
+
+    def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
+        return self._upsert_lpm(sw_name, dst_prefix, dscp, next_hop_ip, egress_port)
 
     def ensure_switching_and_mac(self, sw_name: str, next_hop: str):
         """
@@ -310,45 +303,59 @@ class Controller:
         cand_tors = set(self._tors_connected_to_agg(candidate_agg))
         return len(cur_tors & cand_tors) > 0
 
-    def find_alternate_for_worst(self, worst_switch_id: int):
+    def find_alternate_for_worst(self, worst_switch_id: int, path: list[str]):
         """
-        Pick an alternate switch name for the given worst switch id:
-          - ToR: return None
-          - Agg: another 'a*' in same pod (shares at least one ToR)
-          - Core: any other 'c*'
+        Given a worst switch ID and a concrete path [nodes...], propose an alternate switch:
+          - Identify the worst switch name from its ID.
+          - In the given path, find the nodes immediately before and after it (n-1, n+1).
+          - Return a switch (not a host) that has links to BOTH (n-1) and (n+1).
+          - If the worst is a ToR, or it's not found / is at the path edge, or no candidate exists, return None.
         """
+        # Resolve name and role
         worst_name = self.switch_id_to_name.get(int(worst_switch_id))
         if not worst_name:
             return None
 
+        # ToR alternates are not feasible in our topology (hosts are single-homed)
         role = self._role_of_sid(worst_switch_id)
         if role == "tor":
             return None
 
-        # all switch nodes present in topology graph
-        sw_nodes = [n for n in self.topo.get_p4switches().keys()]
+        if not path or worst_name not in path:
+            return None
 
-        if role == "agg":
-            candidates = [n for n in sw_nodes if n.startswith("a") and n != worst_name]
-            same_pod = [n for n in candidates if self._is_same_pod_agg(n, worst_name)]
-            same_pod.sort()
-            return same_pod[0] if same_pod else None
+        idx = path.index(worst_name)
+        # Can't substitute if worst is at either end (host or path boundary)
+        if idx == 0 or idx == len(path) - 1:
+            return None
 
-        if role == "core":
-            candidates = [n for n in sw_nodes if n.startswith("c") and n != worst_name]
-            candidates.sort()
-            return candidates[0] if candidates else None
+        prev_node = path[idx - 1]
+        next_node = path[idx + 1]
 
-        # other roles
+        # Only consider P4 switches (exclude hosts), and exclude prev/next/worst itself
+        sw_nodes = set(self.topo.get_p4switches().keys())
+        sw_nodes.discard(worst_name)
+        sw_nodes.discard(prev_node)
+        sw_nodes.discard(next_node)
+
+        # Deterministic order for reproducibility
+        candidates = sorted(sw_nodes)
+
+        # A valid alternate must connect to BOTH neighbors in the topology graph
+        for cand in candidates:
+            if self.net_graph.has_edge(prev_node, cand) and self.net_graph.has_edge(cand, next_node):
+                return cand
+
+        # No alternate found that bridges both neighbors
         return None
 
-    def has_alternate_for_worst(self, worst_switch_id: int) -> bool:
+    def has_alternate_for_worst(self, worst_switch_id: int, path: list[str]) -> bool:
         """
         Compatibility wrapper used by rl_agent.py.
         Returns True if we can propose an alternate switch for the given worst switch id,
         subject to role constraints (no ToR, same pod for aggs, any core).
         """
-        return self.find_alternate_for_worst(int(worst_switch_id)) is not None
+        return self.find_alternate_for_worst(int(worst_switch_id), path) is not None
 
     def has_pending_change(self) -> bool:
         """
@@ -409,53 +416,68 @@ class Controller:
         if not src_host or not dst_host:
             return False, f"host name not found for src={src_ip} dst={dst_ip}"
 
-        # helper to rewire one direction given hosts
         def _rewire_direction(src_h, dst_h, dst_ip_):
             path = self.path_map.get((src_h, dst_h))
             if not path or worst_name not in path:
-                return None  # couldn't prove worst is on this stored path
+                return None
 
             idx = path.index(worst_name)
             if idx == 0 or idx == len(path)-1:
-                return None  # worst at endpoint, ignore
+                return None
 
             prev_node = path[idx-1]
             next_node = path[idx+1]
             if prev_node not in self.topo.get_p4switches().keys():
-                return None  # previous hop isn't a switch (shouldn't happen)
+                return None
 
-            # Determine the exact dst_prefix style we should use for this hop:
-            # - If next is host -> /32
-            # - Else -> /24 network normalized
+            # Match key normalization (must match initial programming)
             if next_node == dst_h:
                 dst_prefix_used = f"{dst_ip_}/32"
             else:
                 net = ip_network(f"{dst_ip_}/24", strict=False).network_address
                 dst_prefix_used = f"{net}/24"
 
-            # Prepare prev -> ALT
-            self.ensure_switching_and_mac(prev_node, alt_switch_name)
+            # Ensure aux tables BEFORE touching L3
+            self.ensure_switching_and_mac(prev_node,        alt_switch_name)
+            self.ensure_switching_and_mac(alt_switch_name,  next_node)
+
+            # Compute next-hop IPs and egress ports for both legs
             nh_ip_prev_to_alt = self._neighbor_iface_ip(alt_switch_name, prev_node)
             eport_prev_to_alt = self.topo.node_to_node_port_num(prev_node, alt_switch_name)
 
-            # Prepare ALT -> next
-            self.ensure_switching_and_mac(alt_switch_name, next_node)
             if next_node in self.topo.get_p4switches().keys():
                 nh_ip_alt_to_next = self._neighbor_iface_ip(next_node, alt_switch_name)
             else:
                 nh_ip_alt_to_next = dst_ip_
             eport_alt_to_next = self.topo.node_to_node_port_num(alt_switch_name, next_node)
 
-            # Save originals for revert
+            # Originals for potential rollback
+            dscp = self._dscp_for_qid(qid)
             orig_prev  = self.forwarding_entries.get(prev_node,        {}).get('lpm', {}).get((dst_prefix_used, dscp))
             orig_alt   = self.forwarding_entries.get(alt_switch_name,  {}).get('lpm', {}).get((dst_prefix_used, dscp))
             orig_worst = self.forwarding_entries.get(worst_name,       {}).get('lpm', {}).get((dst_prefix_used, dscp))
 
-            # Apply changes
-            self.update_path(prev_node, dst_prefix_used, dscp, nh_ip_prev_to_alt, eport_prev_to_alt)
-            self.update_path(alt_switch_name, dst_prefix_used, dscp, nh_ip_alt_to_next, eport_alt_to_next)
+            # ---- TRANSACTION ----
+            # 1) Program prev -> ALT
+            ok1 = self._upsert_lpm(prev_node, dst_prefix_used, dscp, nh_ip_prev_to_alt, eport_prev_to_alt)
+            if not ok1:
+                return None  # abort; nothing else applied
 
-            # Delete worst's entry if present
+            # 2) Program ALT -> next
+            ok2 = self._upsert_lpm(alt_switch_name, dst_prefix_used, dscp, nh_ip_alt_to_next, eport_alt_to_next)
+            if not ok2:
+                # rollback leg 1 if possible
+                if orig_prev is not None:
+                    self._upsert_lpm(prev_node, dst_prefix_used, dscp, orig_prev[0], orig_prev[1])
+                else:
+                    try:
+                        self.controllers[prev_node].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix_used, dscp])
+                        del self.forwarding_entries[prev_node]['lpm'][(dst_prefix_used, dscp)]
+                    except Exception:
+                        pass
+                return None
+
+            # 3) Now safe to delete worst’s entry (specific demand/queue)
             if orig_worst is not None:
                 try:
                     self.controllers[worst_name].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix_used, dscp])
@@ -466,7 +488,7 @@ class Controller:
                 except Exception:
                     pass
 
-            # Update the stored path: replace worst_name with alt_switch_name
+            # Update the stored path (replace worst with alt)
             new_path = list(path)
             new_path[idx] = alt_switch_name
             self.path_map[(src_h, dst_h)] = new_path
