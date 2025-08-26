@@ -247,11 +247,14 @@ class Controller:
     def _parse_switch_ids_and_roles(self, rules_dir: Path):
         """
         Parse rules_dir/*-commands.txt to derive:
-         - switch_id -> switch_name (by filename stem e.g., a1-commands.txt => 'a1')
-         - switch_name -> switch_id
-         - switch_id -> role ('tor'|'agg'|'core'|'other') by name prefix
+        - switch_id -> switch_name (by filename stem e.g., a1-commands.txt => 'a1')
+        - switch_name -> switch_id
+        - switch_id -> role ('tor'|'agg'|'core'|'other') by name prefix
+
         Assumes each file contains:
-          table_set_default process_int_transit.tb_int_insert init_metadata <ID>
+        table_set_default process_int_transit.tb_int_insert init_metadata <ID>
+
+        If duplicate switch_id is seen across files, keep the FIRST mapping and warn.
         """
         sid_to_name = {}
         name_to_sid = {}
@@ -263,7 +266,11 @@ class Controller:
             r"table_set_default\s+process_int_transit\.tb_int_insert\s+init_metadata\s+(\d+)",
             re.IGNORECASE
         )
-        for path in glob.glob(str(rules_dir / "*-commands.txt")):
+
+        # Deterministic order
+        files = sorted(glob.glob(str(rules_dir / "*-commands.txt")))
+
+        for path in files:
             fname = Path(path).name
             sw_name = fname.split("-")[0]  # t1, a2, c3...
             role = "other"
@@ -273,19 +280,34 @@ class Controller:
                 role = "agg"
             elif sw_name.startswith("c"):
                 role = "core"
+
             try:
                 with open(path, "r") as f:
                     text = f.read()
                 m = pat.search(text)
-                if m:
-                    sid = int(m.group(1))
-                    sid_to_name[sid] = sw_name
+                if not m:
+                    print(f"[WARN] No init_metadata ID found in {fname}; skipping mapping for {sw_name}")
+                    continue
+
+                sid = int(m.group(1))
+
+                # Duplicate protection: keep first mapping for a given sid
+                if sid in sid_to_name and sid_to_name[sid] != sw_name:
+                    print(f"[WARN] Duplicate switch_id {sid}: already mapped to {sid_to_name[sid]}, "
+                        f"ignoring later mapping from {sw_name} ({fname})")
+                    # Still record sw_name -> sid for convenience, but don't overwrite sid_to_name
                     name_to_sid[sw_name] = sid
-                    sid_role[sid] = role
+                    continue
+
+                sid_to_name.setdefault(sid, sw_name)
+                name_to_sid[sw_name] = sid
+                sid_role[sid] = role
+
             except Exception as e:
                 print(f"Failed to parse {path}: {e}")
 
         return sid_to_name, name_to_sid, sid_role
+
 
     def _role_of_sid(self, sid: int) -> str:
         return self.switch_id_role.get(int(sid), "other")
@@ -375,14 +397,13 @@ class Controller:
 
     def _dscp_for_qid(self, qid: int) -> str:
         """
-        Adjust these mappings to your reality.
-        You said: voice queue is 0, video is 1, best-effort is 7.
+        voice queue is 0, video is 1, best-effort is 7.
         Below DSCP hex values align with the pre-installed set used by compute_forwarding_entries().
         """
         mapping = {
-            0: "0x00",  # voice -> default (adjust if needed)
+            0: "0x2E",  # voice -> EF
             1: "0x18",  # video -> CS3
-            7: "0x2E",  # best-effort -> EF
+            7: "0x00",  # best-effort -> 00
         }
         return mapping.get(int(qid), "0x00")
 
@@ -394,13 +415,13 @@ class Controller:
     # Reroute using stored paths (path-tracking approach)
     # -----------------------
 
+    
     def reroute_one_demand_symmetric(self, src_ip: str, dst_ip: str, qid: int,
                                      worst_switch_id: int, alt_switch_name: str):
         """
-        Change route for one demand (src_ip,dst_ip) within the specific queue (DSCP),
-        by splicing 'alt_switch_name' between the original upstream (prev) and downstream (next)
-        around 'worst_switch_id', using the STORED PATHS for the demand.
-        Do it symmetrically (src->dst and dst->src).
+        Install per-demand (/32) overlays for (src_ip,dst_ip) within DSCP of 'qid'
+        along the entire new path where 'worst' is replaced by 'alt'. No deletions.
+        Transactional: on failure, roll back all newly-added entries.
         Returns (ok: bool, details: str)
         """
         dscp = self._dscp_for_qid(qid)
@@ -416,118 +437,169 @@ class Controller:
         if not src_host or not dst_host:
             return False, f"host name not found for src={src_ip} dst={dst_ip}"
 
-        def _rewire_direction(src_h, dst_h, dst_ip_):
-            path = self.path_map.get((src_h, dst_h))
+        def _with_alt(path: list[str]):
             if not path or worst_name not in path:
                 return None
+            newp = list(path)
+            idx = newp.index(worst_name)
+            if idx == 0 or idx == len(newp) - 1:
+                return None
+            newp[idx] = alt_switch_name
+            return newp
 
-            idx = path.index(worst_name)
-            if idx == 0 or idx == len(path)-1:
+        def _install_overlay_along_path(path: list[str], dst_h: str, dst_ip_: str):
+            """
+            For a concrete node path [hS, sw1, sw2, ..., swN, hD], install /32 LPM overlays
+            on every switch sw_i sending toward the next hop in the path (sw_{i+1} or hD).
+            We also ensure switching/mac tables for each leg (sw_i -> next).
+            Returns list of change entries (for revert) or None on failure (with rollback).
+            """
+            if not path or len(path) < 3:
                 return None
 
-            prev_node = path[idx-1]
-            next_node = path[idx+1]
-            if prev_node not in self.topo.get_p4switches().keys():
-                return None
+            dst_prefix = f"{dst_ip_}/32"
+            changes = []
 
-            # Match key normalization (must match initial programming)
-            if next_node == dst_h:
-                dst_prefix_used = f"{dst_ip_}/32"
-            else:
-                net = ip_network(f"{dst_ip_}/24", strict=False).network_address
-                dst_prefix_used = f"{net}/24"
+            # Iterate over switch -> next pairs
+            for i in range(1, len(path) - 1):
+                sw = path[i]
+                nxt = path[i + 1]
+                if sw not in self.topo.get_p4switches().keys():
+                    continue  # skip if somehow a host appears in the middle
 
-            # Ensure aux tables BEFORE touching L3
-            self.ensure_switching_and_mac(prev_node,        alt_switch_name)
-            self.ensure_switching_and_mac(alt_switch_name,  next_node)
+                # Make sure aux tables exist before L3 programming
+                self.ensure_switching_and_mac(sw, nxt)
 
-            # Compute next-hop IPs and egress ports for both legs
-            nh_ip_prev_to_alt = self._neighbor_iface_ip(alt_switch_name, prev_node)
-            eport_prev_to_alt = self.topo.node_to_node_port_num(prev_node, alt_switch_name)
-
-            if next_node in self.topo.get_p4switches().keys():
-                nh_ip_alt_to_next = self._neighbor_iface_ip(next_node, alt_switch_name)
-            else:
-                nh_ip_alt_to_next = dst_ip_
-            eport_alt_to_next = self.topo.node_to_node_port_num(alt_switch_name, next_node)
-
-            # Originals for potential rollback
-            dscp = self._dscp_for_qid(qid)
-            orig_prev  = self.forwarding_entries.get(prev_node,        {}).get('lpm', {}).get((dst_prefix_used, dscp))
-            orig_alt   = self.forwarding_entries.get(alt_switch_name,  {}).get('lpm', {}).get((dst_prefix_used, dscp))
-            orig_worst = self.forwarding_entries.get(worst_name,       {}).get('lpm', {}).get((dst_prefix_used, dscp))
-
-            # ---- TRANSACTION ----
-            # 1) Program prev -> ALT
-            ok1 = self._upsert_lpm(prev_node, dst_prefix_used, dscp, nh_ip_prev_to_alt, eport_prev_to_alt)
-            if not ok1:
-                return None  # abort; nothing else applied
-
-            # 2) Program ALT -> next
-            ok2 = self._upsert_lpm(alt_switch_name, dst_prefix_used, dscp, nh_ip_alt_to_next, eport_alt_to_next)
-            if not ok2:
-                # rollback leg 1 if possible
-                if orig_prev is not None:
-                    self._upsert_lpm(prev_node, dst_prefix_used, dscp, orig_prev[0], orig_prev[1])
+                # Next-hop IP as used by this sw toward nxt
+                if nxt in self.topo.get_p4switches().keys():
+                    nh_ip = self._neighbor_iface_ip(nxt, sw)
                 else:
-                    try:
-                        self.controllers[prev_node].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix_used, dscp])
-                        del self.forwarding_entries[prev_node]['lpm'][(dst_prefix_used, dscp)]
-                    except Exception:
-                        pass
-                return None
+                    # nxt is the destination host
+                    nh_ip = dst_ip_
 
-            # 3) Now safe to delete worst’s entry (specific demand/queue)
-            if orig_worst is not None:
-                try:
-                    self.controllers[worst_name].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix_used, dscp])
-                except Exception:
-                    pass
-                try:
-                    del self.forwarding_entries[worst_name]['lpm'][(dst_prefix_used, dscp)]
-                except Exception:
-                    pass
+                eport = self.topo.node_to_node_port_num(sw, nxt)
 
-            # Update the stored path (replace worst with alt)
-            new_path = list(path)
-            new_path[idx] = alt_switch_name
-            self.path_map[(src_h, dst_h)] = new_path
+                # Save original /32 (if any) so we can revert; don't touch /24 entries
+                before = self.forwarding_entries.get(sw, {}).get('lpm', {}).get((dst_prefix, dscp))
 
-            return {
-                "prev_node": prev_node,
-                "dst_prefix": dst_prefix_used,
-                "dscp": dscp,
-                "prev_before": orig_prev,
-                "prev_after": (nh_ip_prev_to_alt, eport_prev_to_alt),
-                "alt_node": alt_switch_name,
-                "alt_before": orig_alt,
-                "alt_after": (nh_ip_alt_to_next, eport_alt_to_next),
-                "worst_node": worst_name,
-                "worst_deleted": (dst_prefix_used, dscp, orig_worst),
-                "old_path": path,
-                "new_path": new_path,
-            }
+                ok = self._upsert_lpm(sw, dst_prefix, dscp, nh_ip, eport)
+                if not ok:
+                    # Roll back what we’ve done on this direction
+                    for ent in reversed(changes):
+                        b = ent["before"]
+                        if b is not None:
+                            self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
+                        else:
+                            try:
+                                self.controllers[ent["sw"]].table_delete_match(
+                                    "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
+                                )
+                                del self.forwarding_entries[ent["sw"]]['lpm'][(ent["dst_prefix"], ent["dscp"])]
+                            except Exception:
+                                pass
+                    return None
 
-        # Forward (src -> dst) and reverse (dst -> src)
-        fwd_change = _rewire_direction(src_host, dst_host, dst_ip)
-        rev_change = _rewire_direction(dst_host, src_host, src_ip)
+                changes.append({
+                    "sw": sw,
+                    "dst_prefix": dst_prefix,
+                    "dscp": dscp,
+                    "before": before,                  # None if no prior /32 existed
+                    "after":  (nh_ip, eport),          # what we installed
+                })
 
-        if fwd_change is None and rev_change is None:
+            return changes
+
+        # ---------- Forward direction (src -> dst) ----------
+        path_fwd = self.path_map.get((src_host, dst_host))
+        if not path_fwd:
+            return False, "no stored forward path"
+        if worst_name not in path_fwd:
+            fwd_new_path = None
+        else:
+            fwd_new_path = _with_alt(path_fwd)
+        fwd_changes = None
+        if fwd_new_path:
+            fwd_changes = _install_overlay_along_path(fwd_new_path, dst_host, dst_ip)
+
+        # ---------- Reverse direction (dst -> src) ----------
+        path_rev = self.path_map.get((dst_host, src_host))
+        if not path_rev:
+            return False, "no stored reverse path"
+        if worst_name not in path_rev:
+            rev_new_path = None
+        else:
+            rev_new_path = _with_alt(path_rev)
+        rev_changes = None
+        if rev_new_path:
+            rev_changes = _install_overlay_along_path(rev_new_path, src_host, src_ip)
+
+        if fwd_changes is None and rev_changes is None:
             return False, "worst not present on stored path for either direction"
 
-        # Record for revert()
+        # Commit path snapshot updates (after successful programming)
+        if fwd_new_path:
+            self.path_map[(src_host, dst_host)] = fwd_new_path
+        if rev_new_path:
+            self.path_map[(dst_host, src_host)] = rev_new_path
+
+        # Record a single change object compatible with existing logs
         self.change_history.append({
-            "fwd": fwd_change,
-            "rev": rev_change
+            "fwd": {
+                "old_path": path_fwd,
+                "new_path": fwd_new_path if fwd_new_path else path_fwd,
+                "overlays": fwd_changes or [],
+            },
+            "rev": {
+                "old_path": path_rev,
+                "new_path": rev_new_path if rev_new_path else path_rev,
+                "overlays": rev_changes or [],
+            }
         })
         return True, "ok"
 
     def revert_last_change(self):
+        """
+        Revert the most recent change. Supports both:
+          (A) overlay-format records: {'fwd': {'overlays': [...] , 'old_path': [...], 'new_path': [...]}, 'rev': {...}}
+          (B) legacy per-leg records:  {'fwd': {'prev_node': ..., 'alt_node': ..., 'worst_node': ..., ...}, 'rev': {...}}
+        """
         if not self.change_history:
             return False
         change = self.change_history.pop()
 
-        def _revert_one(side):
+        # ---- Overlay-format side revert ----
+        def _revert_overlay(side):
+            if not side:
+                return
+            # Undo overlays in reverse order (closest to dst back toward src)
+            for ent in reversed(side.get("overlays", [])):
+                sw = ent["sw"]
+                dst_prefix = ent["dst_prefix"]
+                dscp = ent["dscp"]
+                before = ent["before"]
+                if before is not None:
+                    # Restore the previous /32 that existed before we overlaid
+                    self._upsert_lpm(sw, dst_prefix, dscp, before[0], before[1])
+                else:
+                    # Remove our added /32 entry entirely
+                    try:
+                        self.controllers[sw].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix, dscp])
+                        del self.forwarding_entries[sw]['lpm'][(dst_prefix, dscp)]
+                    except Exception:
+                        pass
+
+            # Restore stored path snapshot if it still matches what we set
+            old_path = side.get("old_path")
+            new_path = side.get("new_path")
+            if old_path and new_path:
+                src_h = old_path[0]
+                dst_h = old_path[-1]
+                cur = self.path_map.get((src_h, dst_h))
+                if cur and cur == new_path:
+                    self.path_map[(src_h, dst_h)] = old_path
+
+        # ---- Legacy-format side revert (for older records) ----
+        def _revert_legacy(side):
             if not side:
                 return
             prev_node = side["prev_node"]
@@ -546,7 +618,7 @@ class Controller:
                 nh_ip, eport = side["alt_before"]
                 self.update_path(alt_node, dst_prefix, dscp, nh_ip, eport)
             else:
-                # If there was no prior entry, attempt to remove the specific match
+                # If there was no prior entry, remove the specific match
                 try:
                     self.controllers[alt_node].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix, dscp])
                 except Exception:
@@ -562,20 +634,25 @@ class Controller:
                 nh_ip, eport = worst_before
                 self.update_path(worst_node, dst_prefix, dscp, nh_ip, eport)
 
-            # Restore path snapshot, if present
+            # Restore path snapshot
             old_path = side.get("old_path")
             new_path = side.get("new_path")
             if old_path and new_path:
-                # Determine src/dst hosts from either path ends
                 src_h = old_path[0]
                 dst_h = old_path[-1]
-                # Only restore if our current record matches the new_path we had written
                 cur = self.path_map.get((src_h, dst_h))
                 if cur and cur == new_path:
                     self.path_map[(src_h, dst_h)] = old_path
 
-        _revert_one(change.get("fwd"))
-        _revert_one(change.get("rev"))
+        def _revert_side(side):
+            # Detect format by presence of 'overlays'
+            if side and "overlays" in side:
+                _revert_overlay(side)
+            else:
+                _revert_legacy(side)
+
+        _revert_side(change.get("fwd"))
+        _revert_side(change.get("rev"))
         return True
 
     # ---------- Public helpers for RL agent logging ----------

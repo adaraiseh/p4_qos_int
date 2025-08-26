@@ -5,8 +5,8 @@ from scapy.all import AsyncSniffer, conf
 from influxdb_client import InfluxDBClient
 from collector import *
 
-INFLUX_URL = "http://localhost:8086"
-INFLUX_TOKEN = "pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA=="
+INFLUX_URL = "http://192.168.201.1:8086"
+INFLUX_TOKEN = "0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w=="
 INFLUX_ORG = "research"
 INFLUX_BUCKET = "INT"
 

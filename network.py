@@ -117,11 +117,11 @@ def generate_traffic(
         probe_port = _probe_dst_port(flow_id, qid)
         traffic_port = _traffic_dst_port(flow_id, qid)
         #net.addTask(dst_host, f"python3 receive.py --proto all --ports {probe_port}", 1, 0, True)
-        net.addTask(
-            dst_host,
-            f"""python3 receive.py --proto all --ports {probe_port} >>/tmp/{dst_host}_recv_{probe_port}.log""",
-            1, 0, True
-        )
+        # net.addTask(
+        #     dst_host,
+        #     f"""python3 receive.py --proto all --ports {probe_port} >>/tmp/{dst_host}_recv_{probe_port}.log""",
+        #     1, 0, True
+        # )
         # iperf3 server: keep it running forever, restart if it dies
         # net.addTask(
         #     dst_host,
@@ -156,11 +156,11 @@ def generate_traffic(
         length = len_map[qid]
 
         # Your lightweight sender (control/marker packets), matches ToS and port
-        net.addTask(
-            src_host,
-            f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
-            1.5, 0, True
-        )
+        # net.addTask(
+        #     src_host,
+        #     f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
+        #     1.5, 0, True
+        # )
         
         # iperf3 client: run forever, auto-restart on any exit, keep logs
         # net.addTask(
@@ -284,35 +284,41 @@ def config_network(p4):
     net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
 
     # -----------------
-    # Generate traffic (balanced ~85% load)
+    # Generate traffic (half-host senders, hosts 1..8 only)
     # -----------------
 
-    # Per-flow, per-queue Mbps so each src→dst pair sums to ~1.4167 Mbps
-    # (0.4 + 0.2 + 0.4) * 1.4167 ≈ 1.4167. Total per host ≈ 3 * 1.4167 = 4.25 Mbps.
-    # Two hosts per ToR ≈ 8.5 Mbps ⇒ ~85% of 10 Mbps (2×5).
-    LOAD_FACTOR = 0.39  # was 1.00
-
+    # Per-flow, per-queue Mbps (kept same shape, scaled by LOAD_FACTOR)
+    LOAD_FACTOR = 1.3
     PER_QUEUE_BW = {
-        0: 0.4 * LOAD_FACTOR,   # ≈ 0.568 Mbps
-        1: 0.2 * LOAD_FACTOR,   # ≈ 0.284 Mbps
-        7: 0.4 * LOAD_FACTOR,   # ≈ 0.568 Mbps
+        0: 0.3 * LOAD_FACTOR,
+        1: 0.4 * LOAD_FACTOR,
+        7: 0.5 * LOAD_FACTOR,
     }
+    PER_QUEUE_LEN = {0: 1250, 1: 1250, 7: 1250}
 
-    PER_QUEUE_LEN = {0: 1250, 1: 1250, 7: 1250}  # iperf3 -l payload bytes
-
-    # Each host sends 3 flows to other pods (keeps things “natural” & ECMP‑friendly).
-    # Flow IDs must stay 0..99 (used in your port scheme).
-    balanced_pairs = [
-        ("h1","h6",10), ("h1","h7",11), ("h1","h8",12),
-        ("h2","h5",13), ("h2","h7",14), ("h2","h8",15),
-        ("h3","h5",16), ("h3","h7",17), ("h3","h8",18),
-        ("h4","h5",19), ("h4","h6",20), ("h4","h8",21),
-        ("h5","h2",22), ("h5","h3",23), ("h5","h4",24),
-        ("h6","h1",25), ("h6","h3",26), ("h6","h4",27),
-        ("h7","h1",28), ("h7","h2",29), ("h7","h3",30),
-        ("h8","h1",31), ("h8","h2",32), ("h8","h4",33),
+    # Define pods as pairs and pick only half (first) as senders
+    pods = [
+        ["h1", "h2"],
+        ["h3", "h4"],
+        ["h5", "h6"],
+        ["h7", "h8"],
     ]
+    senders   = [pod[0] for pod in pods]  # h1, h3, h5, h7
+    receivers = [pod[1] for pod in pods]  # h2, h4, h6, h8  (used as pure receivers)
 
+    # Build src->dst pairs:
+    # For each sender in pod i, send to the *second* host of every other pod.
+    balanced_pairs = []
+    next_flow_id = 10
+    for i, s in enumerate(senders):
+        for j, pod in enumerate(pods):
+            if j == i:
+                continue  # skip same pod
+            dst = pod[1]  # the non-sender half from other pod
+            balanced_pairs.append((s, dst, next_flow_id))
+            next_flow_id += 1
+
+    # Schedule traffic for the selected pairs
     for src, dst, fid in balanced_pairs:
         generate_traffic(
             net=net,

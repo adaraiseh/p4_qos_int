@@ -381,20 +381,8 @@ class RoutingRLSystem:
 
         self.controller = Controller()
 
-        # Topology info
-        self.switch_names = list(self.controller.topo.get_p4switches().keys())
-        self.switch_count = len(self.switch_names)
-        print("switch names ", self.switch_names)
-        print("switch count ", self.switch_count)
-
-        # Map: INT switch_id -> role; plus name<->id maps
-        self.rules_dir = Path("rules/test")
-        self.switch_id_role = self._load_switch_id_roles(self.rules_dir)
-        self.tor_ids = {sid for sid, role in self.switch_id_role.items() if role == "tor"}
-        if not self.switch_id_role:
-            log.warning("Could not map any switch_id to roles; ToR avoidance disabled.")
-        else:
-            log.info("Role map loaded. ToR IDs: %s", sorted(list(self.tor_ids)))
+        self.switch_id_name   = dict(self.controller.switch_id_to_name)
+        self.name_to_switch_id = dict(self.controller.switch_name_to_id)
 
         self.switch_metrics = SWITCH_METRIC_WEIGHTS
 
@@ -475,40 +463,6 @@ class RoutingRLSystem:
 
     def _norm_penalty(self, v: float) -> float:
         return float(min(max(v, 0.0), PENALTY_CAP))
-
-    # ----- Name/ID map & role parsing -----
-    def _load_switch_id_roles(self, rules_dir: Path):
-        mapping = {}
-        self.switch_id_name = {}
-        self.name_to_switch_id = {}
-        if not rules_dir.exists():
-            return mapping
-        pattern = re.compile(
-            r"table_set_default\s+process_int_transit\.tb_int_insert\s+init_metadata\s+(\d+)",
-            re.IGNORECASE
-        )
-        for path in glob.glob(str(rules_dir / "*-commands.txt")):
-            fname = Path(path).name
-            name = fname.split("-")[0]
-            role = "other"
-            if name.startswith("t"):
-                role = "tor"
-            elif name.startswith("a"):
-                role = "agg"
-            elif name.startswith("c"):
-                role = "core"
-            try:
-                with open(path, "r") as f:
-                    text = f.read()
-                m = pattern.search(text)
-                if m:
-                    sid = int(m.group(1))
-                    mapping[sid] = role
-                    self.switch_id_name[sid] = name
-                    self.name_to_switch_id[name] = sid
-            except Exception as e:
-                log.warning("Failed to parse %s: %s", path, e)
-        return mapping
 
     # ----- Lighter snapshot collection -----
     def collect_snapshot(self, seconds=WINDOW_SECONDS):
@@ -592,6 +546,8 @@ class RoutingRLSystem:
             # hottest demand fields
             "hot_src_ip": None, "hot_dst_ip": None,
             # path-derived fields
+            "path_nodes": [],            #  stored path at snapshot time
+            "bneck_name": None,          #  bottleneck switch name at snapshot time
             "hop_count": 0,
             "hop_oh_0to8": self._one_hot(0, 9),
             "bneck_sid": 0,
@@ -692,40 +648,50 @@ class RoutingRLSystem:
         src_ip, dst_ip = d.get("hot_src_ip"), d.get("hot_dst_ip")
         if not (src_ip and dst_ip):
             return
+
+        # Resolve the current stored path and the switches on it
         path = self.controller.get_path_by_ips(src_ip, dst_ip)
         if not path:
             return
-        sw_names = [n for n in path if isinstance(n, str) and n[:1] in ("t","a","c")]
-        sw_ids = [self.name_to_switch_id.get(n) for n in sw_names]
+        d["path_nodes"] = list(path)
+
+        sw_names = [n for n in path if isinstance(n, str) and n[:1] in ("t", "a", "c")]
+        sw_ids = [self.controller.switch_name_to_id.get(n) for n in sw_names]
         sw_ids = [int(s) for s in sw_ids if s is not None]
+        if not sw_ids:
+            log.error(
+                "No switch IDs resolved for path %s (names=%s); check rules/test mappings.",
+                path, sw_names
+            )
+            return
+
         hop_count = len(sw_ids)
         d["hop_count"] = hop_count
         d["hop_oh_0to8"] = self._hop_one_hot_0to8(hop_count)
-
         if hop_count == 0:
             return
 
-        # Build an "or" filter for switch_id in sw_ids
+        # Query per-switch metrics along this path (single compact flux)
         sid_filter = " or ".join([f'r.switch_id == "{sid}"' for sid in sw_ids]) or 'true'
         start, stop = self._time_window(seconds)
         flux = f'''
         from(bucket:"{self.bucket}")
-          |> range(start:{start}, stop:{stop})
-          |> filter(fn: (r) => r.queue_id == "{qid}" and ({sid_filter})
+        |> range(start:{start}, stop:{stop})
+        |> filter(fn: (r) => r.queue_id == "{qid}" and ({sid_filter})
             and r._measurement =~ /q_drop_rate_100ms|switch_latency|tx_utilization|queue_occupancy/)
-          |> toFloat()
-          |> group(columns:["queue_id","switch_id","_measurement"])
-          |> max(column:"_value")
-          |> group(columns:["switch_id"])
-          |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
+        |> toFloat()
+        |> group(columns:["queue_id","switch_id","_measurement"])
+        |> max(column:"_value")
+        |> group(columns:["switch_id"])
+        |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
         '''
         try:
             wtables = self.query_api.query(org=self.org, query=flux)
         except Exception as e:
-            log.debug("path metrics query failed: %s", e)
+            log.error("path metrics query failed: %s", e)
             return
 
-        # Collect per-switch metrics
+        # Collect per-switch metric rows
         rows = {}
         for tbl in wtables or []:
             for rec in tbl.records:
@@ -741,19 +707,19 @@ class RoutingRLSystem:
         if not rows:
             return
 
-        # Normalized weights
+        # Normalized weights for scoring
         smw = getattr(self, "switch_metrics", SWITCH_METRIC_WEIGHTS)
         total_w = max(1e-9, sum(w for _, w in smw.values()))
-        wts = {m: w/total_w for m, (_, w) in smw.items()}
+        wts = {m: w / total_w for m, (_, w) in smw.items()}
 
-        # Find bottleneck using normalized metrics (all in [0..1])
+        # Pick bottleneck switch using normalized metrics
         best_sid, best_score = None, -1.0
         for sid in sw_ids:
-            r = rows.get(sid, {"drop":0.0,"swlat":0.0,"txu":0.0,"qocc":0.0})
+            r = rows.get(sid, {"drop": 0.0, "swlat": 0.0, "txu": 0.0, "qocc": 0.0})
             drop_n = self._norm_drop_rate(r["drop"])
             slat_n = self._latency_ratio(r["swlat"], qid)
             txu_n  = self._norm_tx_util(r["txu"])
-            qocc_n = self._norm_drop_rate(r["qocc"])  # reuse 0..1 cap normalization
+            qocc_n = self._norm_tx_util(r["qocc"])  # queue occupancy is 0..100%
             score = (
                 drop_n * wts["q_drop_rate_100ms"] +
                 slat_n * wts["switch_latency"] +
@@ -763,42 +729,38 @@ class RoutingRLSystem:
             if score > best_score:
                 best_sid, best_score = sid, score
 
-        # Position of bottleneck along path
+        # Position of bottleneck on the path and feasibility of an alternate
         try:
             b_idx = sw_ids.index(best_sid) if best_sid in sw_ids else -1
         except Exception:
             b_idx = -1
         bpos = 0.0 if b_idx < 0 else (b_idx / max(1, hop_count - 1))
+        alt_exists = 1.0 if (b_idx >= 0 and self.controller.has_alternate_for_worst(best_sid, path)) else 0.0
 
-        # Alt existence (avoid ToR if policy)
-        alt_exists = 0.0
-        if b_idx >= 0:
-            if self.switch_id_role and best_sid in self.tor_ids:
-                alt_exists = 0.0
-            else:
-                alt_exists = 1.0 if self.controller.has_alternate_for_worst(best_sid, path) else 0.0
-
-        # Aggregates on path
+        # Aggregates over path (raw, then normalized for the state vector)
         def nzmean(xs, default=0.0): return (sum(xs) / len(xs)) if xs else default
         swlat_vals = [rows[sid]["swlat"] for sid in sw_ids if sid in rows]
         txu_vals   = [rows[sid]["txu"]   for sid in sw_ids if sid in rows]
         drop_vals  = [rows[sid]["drop"]  for sid in sw_ids if sid in rows]
         qocc_vals  = [rows[sid]["qocc"]  for sid in sw_ids if sid in rows]
 
-        # Store normalized forms
-        d["bneck_sid"] = int(best_sid or 0)
-        d["bneck_pos_norm"] = float(bpos)
-        d["bneck_score_norm"] = float(max(0.0, min(1.0, best_score)))  # already weighted sum of [0..1] components
-        d["alt_exists"] = float(alt_exists)
+        # Store snapshot fields
+        d["bneck_sid"]        = int(best_sid or 0)
+        d["bneck_name"]       = self.switch_id_name.get(int(best_sid)) if best_sid else None
+        d["bneck_pos_norm"]   = float(bpos)
+        d["bneck_score_norm"] = float(max(0.0, min(1.0, best_score)))
+        d["alt_exists"]       = float(alt_exists)
 
+        # Store normalized aggregates for the state
         d["sw_lat_mean"] = self._latency_ratio(nzmean(swlat_vals), qid)
         d["sw_lat_max"]  = self._latency_ratio(max(swlat_vals) if swlat_vals else 0.0, qid)
         d["txu_mean"]    = self._norm_tx_util(nzmean(txu_vals))
         d["txu_max"]     = self._norm_tx_util(max(txu_vals) if txu_vals else 0.0)
         d["drop_mean"]   = self._norm_drop_rate(nzmean(drop_vals))
         d["drop_max"]    = self._norm_drop_rate(max(drop_vals) if drop_vals else 0.0)
-        d["qocc_mean"]   = self._norm_drop_rate(nzmean(qocc_vals))
-        d["qocc_max"]    = self._norm_drop_rate(max(qocc_vals) if qocc_vals else 0.0)
+        d["qocc_mean"]   = self._norm_tx_util(nzmean(qocc_vals))
+        d["qocc_max"]    = self._norm_tx_util(max(qocc_vals) if qocc_vals else 0.0)
+
 
     # ----- Logging -----
     def _log_state(self, label: str, qid: int, d: dict):
@@ -897,25 +859,34 @@ class RoutingRLSystem:
         # action == 1: operate on the hottest demand path (use snapshot data)
         src_ip, dst_ip = data.get('hot_src_ip'), data.get('hot_dst_ip')
         bneck_sid = int(data.get('bneck_sid', 0) or 0)
-        alt_exists = bool(int(data.get('alt_exists', 0)))
 
         if not (src_ip and dst_ip):
-            log.debug("No hottest demand available; skipping path change.")
+            log.error(f"qid {qid} no hottest demand available; skipping path change.")
             return
         if bneck_sid <= 0:
-            log.debug("No bottleneck detected along hottest path; skipping.")
+            log.error(f"qid {qid} no bottleneck detected along hottest path; skipping.")
             return
-        if not alt_exists:
-            # Try to compute an alt lazily once (in case topology changed)
-            path = self.controller.get_path_by_ips(src_ip, dst_ip)
-            if not path or not self.controller.has_alternate_for_worst(bneck_sid, path):
-                log.debug("No alternate available for bottleneck; skipping.")
-                return
 
+        # Always re-check against the CURRENT path (another queue may have changed it already)
         path = self.controller.get_path_by_ips(src_ip, dst_ip)
+        if not path:
+            log.error(f"qid {qid} no stored path for {src_ip}->{dst_ip}; skipping.")
+            return
+
+        worst_name_snapshot = data.get('bneck_name') or self.switch_id_name.get(bneck_sid, None)
+        if worst_name_snapshot not in path:
+            # Snapshot is stale (e.g., another queue replaced this node). Skip to avoid bad/invalid logs.
+            log.debug(f"qid {qid} snapshot worst {bneck_sid}({worst_name_snapshot}) is not on current path {path}; skipping change.")
+            return
+
+        # Re-check feasibility on the CURRENT path (controller-only logic; no Influx calls)
+        if not self.controller.has_alternate_for_worst(bneck_sid, path):
+            log.debug(f"qid {qid} no alternate available for worst {bneck_sid}({worst_name_snapshot}) on current path {path}; skipping.")
+            return
+
         alt = self.controller.find_alternate_for_worst(bneck_sid, path)
         if not alt:
-            log.debug(f"No alternate found for bottleneck {bneck_sid}; skipping.")
+            log.debug(f"qid {qid} no alternate found for worst {bneck_sid}({worst_name_snapshot}) on current path {path}; skipping.")
             return
 
         ok, details = self.controller.reroute_one_demand_symmetric(
@@ -927,26 +898,20 @@ class RoutingRLSystem:
         )
         if ok:
             last_change = self.controller.change_history[-1] if self.controller.change_history else {}
-            fwd = last_change.get("fwd")
-            rev = last_change.get("rev")
+            fwd = last_change.get("fwd"); rev = last_change.get("rev")
             log.info(
                 f"[PATH CHANGE SUCCESS] q={qid} demand=({src_ip} → {dst_ip}) "
                 f"bneck={bneck_sid} alt={alt}"
             )
             if fwd and fwd.get("old_path") and fwd.get("new_path"):
-                log.info("  Forward: \n%s\n%s",
-                         " -> ".join(fwd["old_path"]),
-                         " -> ".join(fwd["new_path"]))
+                log.info("  Forward: \n%s\n%s", " -> ".join(fwd["old_path"]), " -> ".join(fwd["new_path"]))
             if rev and rev.get("old_path") and rev.get("new_path"):
-                log.info("  Reverse: \n%s\n%s",
-                         " -> ".join(rev["old_path"]),
-                         " -> ".join(rev["new_path"]))
+                log.info("  Reverse: \n%s\n%s", " -> ".join(rev["old_path"]), " -> ".join(rev["new_path"]))
         else:
-            log.debug(
+            log.error(
                 f"[PATH CHANGE FAILED] q={qid} bneck_sid={bneck_sid} "
                 f"alt={alt} demand=({src_ip} → {dst_ip}) reason={details}"
             )
-
     # ----- Action masking -----
     def valid_action_mask(self, qid, data):
         """
@@ -1128,9 +1093,8 @@ class RoutingRLSystem:
                 a = 0
                 log.debug(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s -> action=0")
             else:
-                if not self._should_consider_change(qid, snap_now[qid]) and len(mask) >= 2:
-                    # Allow CHANGE for exploration sometimes
-                    mask[1] = True
+                # Keep feasibility constraints from valid_action_mask(); 
+                # exploration happens only among valid actions.
                 s = self.build_state_vector(qid, snap_now[qid], self.last_action_taken[qid], cooldown_remaining)
                 states[qid] = s
                 a = self.agents[qid].select_action_masked(
@@ -1252,10 +1216,10 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=10000,
                         help="Total steps in train OR eval loop")
     parser.add_argument("--log-every", type=int, default=20)
-    parser.add_argument("--influx-url", default="http://localhost:8086")
+    parser.add_argument("--influx-url", default="http://192.168.201.1:8086")
     parser.add_argument("--influx-org", default="research")
     parser.add_argument("--influx-bucket", default="INT")
-    parser.add_argument("--influx-token", default="pkyJUX9Itrw-y8YuTx3kLDAQ_VYyR_MxnyvtFmHwnRQOjDb7n2QBUFt7piMNgl9TU6IujEJpi8cMEKnwGs77dA==")
+    parser.add_argument("--influx-token", default="0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w==")
     args = parser.parse_args()
 
     # Seeds & determinism
