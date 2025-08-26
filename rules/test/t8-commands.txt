@@ -5,16 +5,16 @@ table_set_default process_int_transit.tb_int_insert init_metadata 8
 table_add process_int_source_sink.tb_set_source int_set_source 1 =>
 table_add process_int_source_sink.tb_set_source int_set_source 2 =>
 
-// 4864–5119
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 4864&&&0xFF00 => 12 16 0xF 0xF 1
-// 5120–5375
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5120&&&0xFF00 => 12 16 0xF 0xF 1
-// 5376–5631
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5376&&&0xFF00 => 12 16 0xF 0xF 1
-// 5632–5887
-table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5632&&&0xFF00 => 12 16 0xF 0xF 1
-// 5888–6143  (covers up to 5999)
+// 0x1700–0x17FF  (5888–6143)
 table_add process_int_source.tb_int_source int_source 10.0.0.0/8 5888&&&0xFF00 => 12 16 0xF 0xF 1
+// 0x1800–0x18FF  (6144–6399)
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 6144&&&0xFF00 => 12 16 0xF 0xF 1
+// 0x1900–0x19FF  (6400–6655)
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 6400&&&0xFF00 => 12 16 0xF 0xF 1
+// 0x1A00–0x1AFF  (6656–6911)
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 6656&&&0xFF00 => 12 16 0xF 0xF 1
+// 0x1B00–0x1BFF  (6912–7167)
+table_add process_int_source.tb_int_source int_source 10.0.0.0/8 6912&&&0xFF00 => 12 16 0xF 0xF 1
 
 
 // set up INT sink (the monitored packets output port)
