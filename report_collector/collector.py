@@ -3,6 +3,7 @@
 import sys
 import io
 import time
+import threading
 
 from scapy.all import Packet
 from scapy.all import BitField, ShortField
@@ -10,6 +11,7 @@ from scapy.layers.inet import Ether, IP, TCP, UDP, bind_layers
 from influxdb_client import Point, WriteOptions
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.write.point import WritePrecision
+
 
 class INTREP(Packet):
     name = "INT Report Header v2.0"
@@ -19,6 +21,7 @@ class INTREP(Packet):
         BitField("seq_number", 0, 22),
         BitField("node_id", 0, 32)
     ]
+
 
 class INTIndiviREP(Packet):
     name = "INT Report Individual Header v2.0"
@@ -35,6 +38,7 @@ class INTIndiviREP(Packet):
         ShortField("DSMdstatus", 0)
     ]
 
+
 class INTShim(Packet):
     name = "INT Shim header v2.1"
     fields_desc = [
@@ -44,6 +48,7 @@ class INTShim(Packet):
         BitField("int_length", 0, 8),
         ShortField("NPT_Dependent_Field", 0)
     ]
+
 
 class INTMD(Packet):
     name = "INT-MD Header v2.1"
@@ -61,6 +66,7 @@ class INTMD(Packet):
         ShortField("DomainInstructions", 0),
         ShortField("DomainFlags", 0)
     ]
+
 
 bind_layers(UDP, INTREP, dport=1234)
 bind_layers(INTREP, INTIndiviREP)
@@ -149,7 +155,7 @@ class FlowInfo():
         self.egress_tx_utils.clear()
 
     def __str__(self) -> str:
-        pass
+        return f"Flow {self.src_ip}:{self.src_port}->{self.dst_ip}:{self.dst_port} hops={self.hop_cnt}"
 
 
 class Collector:
@@ -157,11 +163,25 @@ class Collector:
     Per-report writes with batched async option.
     - write_async=True: ~0.5s flush cadence, much lower CPU/latency.
     - use_device_time=False: use server now() to avoid device clock skew.
+    - aggregate_enabled=True caps each series at <= 10 pts/sec via 100ms averaging.
     """
     def __init__(self, influx_client, org, bucket,
                  write_async=True, flush_interval_ms=500, batch_size=1000,
-                 use_device_time=True):
+                 use_device_time=False,
+                 aggregate_enabled=True,        # NEW: knob to enable/disable averaging
+                 aggregate_window_ms=500):      # NEW: 500ms -> <=20 pts/sec
         self.influx_client = influx_client
+        self.counter = 0            # packets parsed
+        self.records_exported = 0   # points written to Influx
+        self._lock = threading.Lock()
+        self._last_log = time.time()
+
+        # Aggregation controls/state
+        self.aggregate_enabled = bool(aggregate_enabled)
+        self.bucket_ns = int(max(1, int(aggregate_window_ms)) * 1_000_000)  # ms -> ns
+        # key=(measurement, sorted(tags)) -> state dict
+        self._agg = {}
+
         if write_async:
             self.write_api = influx_client.write_api(write_options=WriteOptions(
                 batch_size=batch_size,
@@ -187,12 +207,24 @@ class Collector:
         except Exception:
             pass
 
+    # ---------- Logging ----------
+    def log_export_rate(self):
+        now = time.time()
+        with self._lock:
+            if now - self._last_log >= 1.0:   # once per second
+                print(f"[INFO] Exported {self.records_exported} records in the last second")
+                sys.stdout.flush()
+                self.records_exported = 0
+                self._last_log = now
+
+    # ---------- Drop-rate (structured return for aggregation) ----------
     def record_drop_rate_instant(self, flow_id, src_ip, dst_ip, switch_id, egress_port, queue_id,
                                  drop_count, report_time_ns):
         """
-        Emit a per-100ms instantaneous drop rate for every report.
-        - Uses elapsed time between consecutive samples for this tag.
-        - If the counter resets (wrap/restart), treats negative diffs as 0.
+        Compute an instantaneous drop rate (per 100ms) using elapsed time
+        between samples of the same series. Returns a dict suitable for aggregation:
+          {"measurement": ..., "tags": {...}, "value": float, "ts_ns": int}
+        or None if not enough info yet.
         """
         tag_key = (flow_id, switch_id, queue_id, egress_port)
         current_time = int(report_time_ns)
@@ -213,21 +245,88 @@ class Collector:
             # counter reset/wrap
             diff = 0
 
-        # Scale to "per 100 ms"
         per100ms = float(diff) * (100.0 / elapsed_ms)
 
-        return (
-            Point("q_drop_rate_100ms")
-            .tag("flow_id", flow_id)
-            .tag("src_ip", src_ip)
-            .tag("dst_ip", dst_ip)
-            .tag("switch_id", switch_id)
-            .tag("egress_port", egress_port)
-            .tag("queue_id", queue_id)
-            .field("value", per100ms)
-            .time(current_time)
-        )
+        return {
+            "measurement": "q_drop_rate_100ms",
+            "tags": {
+                "flow_id": flow_id,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "switch_id": switch_id,
+                "egress_port": egress_port,
+                "queue_id": queue_id,
+            },
+            "value": per100ms,
+            "ts_ns": current_time
+        }
 
+    # ---------- Aggregation helpers ----------
+    def _agg_key(self, measurement: str, tags: dict):
+        return (measurement, tuple(sorted(tags.items())))
+
+    def _emit_point(self, measurement: str, tags: dict, avg_value: float, ts_ns: int):
+        p = Point(measurement)
+        for k, v in tags.items():
+            p = p.tag(k, v)
+        return p.field("value", float(avg_value)).time(int(ts_ns))
+
+    def _emit_or_aggregate(self, measurement: str, tags: dict, value: float, timestamp_ns: int, out_points: list):
+        """
+        Either append the raw point, or aggregate into 100ms bucket to emit 1 averaged point per bucket.
+        """
+        if not self.aggregate_enabled:
+            out_points.append(self._emit_point(measurement, tags, value, timestamp_ns))
+            return
+
+        key = self._agg_key(measurement, tags)
+        bucket = int(timestamp_ns // self.bucket_ns)
+        state = self._agg.get(key)
+
+        if state is None:
+            self._agg[key] = {
+                "bucket": bucket,
+                "sum": float(value),
+                "count": 1,
+                "tags": tags,
+                "measurement": measurement,
+            }
+            return
+
+        if state["bucket"] == bucket:
+            state["sum"] += float(value)
+            state["count"] += 1
+            return
+
+        # bucket changed: flush previous bucket
+        prev_bucket = state["bucket"]
+        avg = state["sum"] / max(1, state["count"])
+        ts_emit = (prev_bucket + 1) * self.bucket_ns  # end-of-bucket timestamp
+        out_points.append(self._emit_point(state["measurement"], state["tags"], avg, ts_emit))
+
+        # start new bucket
+        state["bucket"] = bucket
+        state["sum"] = float(value)
+        state["count"] = 1
+
+    def _flush_agg_due(self, now_ns: int, out_points: list):
+        """
+        Flush buckets older than the current bucket to prevent points from getting stuck.
+        """
+        if not self.aggregate_enabled or not self._agg:
+            return
+        current_bucket = now_ns // self.bucket_ns
+        to_delete = []
+        for key, st in self._agg.items():
+            if st["bucket"] < current_bucket:
+                avg = st["sum"] / max(1, st["count"])
+                ts_emit = (st["bucket"] + 1) * self.bucket_ns
+                out_points.append(self._emit_point(st["measurement"], st["tags"], avg, ts_emit))
+                to_delete.append(key)
+        for key in to_delete:
+            del self._agg[key]
+
+    # ---------- Export ----------
     def export_influxdb(self, flow_info):
         if not flow_info:
             return
@@ -237,7 +336,6 @@ class Collector:
             expected_queue_id = flow_info.dst_port % 10  # digit 4
 
             # ---- Robust guard for partial/empty hop metadata ----
-            # Determine a safe number of hops present across all arrays.
             arrays = [
                 flow_info.switch_ids,
                 flow_info.l1_ingress_ports,
@@ -254,11 +352,9 @@ class Collector:
             safe_hops = min([flow_info.hop_cnt] + present_lengths) if flow_info.hop_cnt else min(present_lengths + [0])
 
             if safe_hops <= 0:
-                # Nothing consistent to write; just drop this report.
                 return
 
-            # Use sink-hop egress timestamp as unified time if available; else fallback
-            # Use sink-hop egress timestamp if device time is enabled and present
+            # Choose a unified timestamp in ns
             if self.use_device_time and len(flow_info.egress_tstamps) >= safe_hops:
                 report_time = int(flow_info.egress_tstamps[safe_hops - 1])
             elif self.use_device_time and len(flow_info.ingress_tstamps) >= safe_hops:
@@ -268,40 +364,54 @@ class Collector:
 
             # Per-hop metrics
             for i in range(safe_hops):
-                points.append(
-                    Point("switch_latency")
-                    .tag("flow_id", flow_id)
-                    .tag("src_ip", flow_info.src_ip)
-                    .tag("dst_ip", flow_info.dst_ip)
-                    .tag("queue_id", flow_info.queue_ids[i])
-                    .tag("switch_id", flow_info.switch_ids[i])
-                    .field("value", flow_info.hop_latencies[i] / 1000.0)
-                    .time(report_time)
-                )
-                points.append(
-                    Point("tx_utilization")
-                    .tag("flow_id", flow_id)
-                    .tag("src_ip", flow_info.src_ip)
-                    .tag("dst_ip", flow_info.dst_ip)
-                    .tag("switch_id", flow_info.switch_ids[i])
-                    .tag("egress_port", flow_info.l1_egress_ports[i])
-                    .tag("queue_id", flow_info.queue_ids[i])
-                    .field("value", flow_info.egress_tx_utils[i])
-                    .time(report_time)
-                )
-                points.append(
-                    Point("queue_occupancy")
-                    .tag("flow_id", flow_id)
-                    .tag("src_ip", flow_info.src_ip)
-                    .tag("dst_ip", flow_info.dst_ip)
-                    .tag("switch_id", flow_info.switch_ids[i])
-                    .tag("queue_id", flow_info.queue_ids[i])
-                    .field("value", flow_info.queue_occups[i])
-                    .time(report_time)
+                # switch_latency (us -> ms)
+                self._emit_or_aggregate(
+                    "switch_latency",
+                    {
+                        "flow_id": flow_id,
+                        "src_ip": flow_info.src_ip,
+                        "dst_ip": flow_info.dst_ip,
+                        "queue_id": flow_info.queue_ids[i],
+                        "switch_id": flow_info.switch_ids[i],
+                    },
+                    float(flow_info.hop_latencies[i] / 1000.0),
+                    report_time,
+                    points,
                 )
 
-                # NEW: emit a drop-rate point on every report (except first sample)
-                drp = self.record_drop_rate_instant(
+                # tx_utilization
+                self._emit_or_aggregate(
+                    "tx_utilization",
+                    {
+                        "flow_id": flow_id,
+                        "src_ip": flow_info.src_ip,
+                        "dst_ip": flow_info.dst_ip,
+                        "switch_id": flow_info.switch_ids[i],
+                        "egress_port": flow_info.l1_egress_ports[i],
+                        "queue_id": flow_info.queue_ids[i],
+                    },
+                    float(flow_info.egress_tx_utils[i]),
+                    report_time,
+                    points,
+                )
+
+                # queue_occupancy
+                self._emit_or_aggregate(
+                    "queue_occupancy",
+                    {
+                        "flow_id": flow_id,
+                        "src_ip": flow_info.src_ip,
+                        "dst_ip": flow_info.dst_ip,
+                        "switch_id": flow_info.switch_ids[i],
+                        "queue_id": flow_info.queue_ids[i],
+                    },
+                    float(flow_info.queue_occups[i]),
+                    report_time,
+                    points,
+                )
+
+                # drop-rate (structured)
+                dr = self.record_drop_rate_instant(
                     flow_id,
                     flow_info.src_ip,
                     flow_info.dst_ip,
@@ -311,58 +421,74 @@ class Collector:
                     flow_info.queue_drops[i],
                     report_time,
                 )
-                if drp is not None:
-                    points.append(drp)
+                if dr is not None:
+                    self._emit_or_aggregate(
+                        dr["measurement"], dr["tags"], float(dr["value"]), dr["ts_ns"], points
+                    )
 
-            # Link latency (device stamps), same unified time
+            # Link latency (device stamps), same time domain
             link_pairs = max(safe_hops - 1, 0)
             for i in range(link_pairs):
-                # Guard against mismatched stamp lengths
                 if i + 1 < len(flow_info.egress_tstamps) and i < len(flow_info.ingress_tstamps):
                     link_latency = abs(
                         flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]
                     ) / 1_000_000.0
-                    points.append(
-                        Point("link_latency")
-                        .tag("flow_id", flow_id)
-                        .tag("src_ip", flow_info.src_ip)
-                        .tag("dst_ip", flow_info.dst_ip)
-                        .tag("queue_id", expected_queue_id)
-                        .tag("egress_switch_id", flow_info.switch_ids[i + 1])
-                        .tag("egress_port_id", flow_info.l1_egress_ports[i + 1])
-                        .tag("ingress_switch_id", flow_info.switch_ids[i])
-                        .tag("ingress_port_id", flow_info.l1_ingress_ports[i])
-                        .field("value", link_latency)
-                        .time(report_time)
+
+                    self._emit_or_aggregate(
+                        "link_latency",
+                        {
+                            "flow_id": flow_id,
+                            "src_ip": flow_info.src_ip,
+                            "dst_ip": flow_info.dst_ip,
+                            "queue_id": expected_queue_id,
+                            "egress_switch_id": flow_info.switch_ids[i + 1],
+                            "egress_port_id": flow_info.l1_egress_ports[i + 1],
+                            "ingress_switch_id": flow_info.switch_ids[i],
+                            "ingress_port_id": flow_info.l1_ingress_ports[i],
+                        },
+                        float(link_latency),
+                        report_time,
+                        points,
                     )
 
-            # Flow latency, unified time (only if we have both ends)
+            # Flow latency
             if len(flow_info.ingress_tstamps) >= 1 and len(flow_info.egress_tstamps) >= safe_hops:
                 flow_latency = (
-                    flow_info.ingress_tstamps[0]
-                    - flow_info.egress_tstamps[safe_hops - 1]
+                    flow_info.ingress_tstamps[0] - flow_info.egress_tstamps[safe_hops - 1]
                 ) / 1_000_000.0
-                points.append(
-                    Point("flow_latency")
-                    .tag("flow_id", flow_id)
-                    .tag("src_ip", flow_info.src_ip)
-                    .tag("dst_ip", flow_info.dst_ip)
-                    .tag("queue_id", expected_queue_id)
-                    .field("value", flow_latency)
-                    .time(report_time)
+
+                self._emit_or_aggregate(
+                    "flow_latency",
+                    {
+                        "flow_id": flow_id,
+                        "src_ip": flow_info.src_ip,
+                        "dst_ip": flow_info.dst_ip,
+                        "queue_id": expected_queue_id,
+                    },
+                    float(flow_latency),
+                    report_time,
+                    points,
                 )
 
-            # Single, atomic write for this report
-            self.write_api.write(
-                bucket=self.bucket,
-                org=self.org,
-                record=points,
-                write_precision=WritePrecision.NS,
-            )
+            # Flush any buckets that are due (older than current bucket)
+            self._flush_agg_due(report_time, points)
+
+            # Write what we have (may be empty if everything stayed in current bucket)
+            if points:
+                self.write_api.write(
+                    bucket=self.bucket,
+                    org=self.org,
+                    record=points,
+                    write_precision=WritePrecision.NS,
+                )
+                with self._lock:
+                    self.records_exported += len(points)
 
         finally:
             flow_info.clear_metadata()
+            self.log_export_rate()
 
+    # ---------- Parsing ----------
     def parse_flow_info(self, flow_info, ip_pkt):
         flow_info.src_ip = ip_pkt.src
         flow_info.dst_ip = ip_pkt.dst
@@ -434,7 +560,8 @@ class Collector:
         int_shim_pkt = INTShim(int_rep_pkt.load)
         self.parse_int_metadata(flow_info, int_shim_pkt)
 
-        #flow_info.show()
-
+        # Count parsed packets (FYI)
+        self.counter += 1
+        self.log_export_rate()
         sys.stdout.flush()
         return flow_info
