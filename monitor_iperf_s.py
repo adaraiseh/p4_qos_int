@@ -24,7 +24,6 @@ def flow_from_port(port: int) -> int:  return (port // 10) % 100
 
 def get_host_port_from_path(path: str):
     base = os.path.basename(path)
-    # h7_iperf3_s_6140.log
     m = re.match(r"(h\d+)_iperf3_s_(\d+)\.log$", base)
     if not m: return None, None
     return m.group(1), int(m.group(2))
@@ -33,7 +32,7 @@ class Rolling:
     """Rolling window of samples per server: (mbps, jitter_ms, lost, total)."""
     def __init__(self, window: int):
         self.window = window
-        self.samples = deque(maxlen=window)  # tuples
+        self.samples = deque(maxlen=window)
 
     def add(self, mbps, jitter_ms, lost, total):
         self.samples.append((mbps, jitter_ms, lost, total))
@@ -58,7 +57,6 @@ class FileTail:
         lines = []
         try:
             st = os.stat(self.path)
-            # Handle rotation/truncation/inode changes
             if self.inode is None or self.inode != st.st_ino or st.st_size < self.pos:
                 self.pos = 0
                 self.inode = st.st_ino
@@ -70,9 +68,7 @@ class FileTail:
             return lines
         if not chunk:
             return lines
-        # Ensure we split on lines; drop partial trailing line if any
-        parts = chunk.splitlines()
-        return parts
+        return chunk.splitlines()
 
 def print_table(rows):
     if not rows: return
@@ -84,11 +80,14 @@ def print_table(rows):
             print("-" * len(line))
 
 def run(dirpath, pattern, window, refresh):
-    # Discover files once, but also re‑scan occasionally (cheap)
     last_rescan = 0
-    tails = {}         # path -> FileTail
-    rolls = {}         # (host,port) -> Rolling
-    latest_jitter = {} # (host,port) -> last jitter_ms seen
+    tails = {}          # path -> FileTail
+    rolls = {}          # (host,port) -> Rolling
+    latest_jitter = {}  # (host,port) -> last jitter_ms seen
+
+    # NEW: monotonic cumulative "total" and previous snapshot for stall detection
+    cum_total = defaultdict(int)   # (host,port) -> cumulative total packets seen so far
+    prev_cum_total = {}            # (host,port) -> value at last refresh
 
     def rescan():
         files = glob.glob(os.path.join(dirpath, pattern))
@@ -99,25 +98,31 @@ def run(dirpath, pattern, window, refresh):
 
     while True:
         now = time.time()
-        if now - last_rescan > 5:  # light periodic rescan
+        if now - last_rescan > 5:
             rescan()
             last_rescan = now
 
         # Parse only new lines for each file
         for path, tail in list(tails.items()):
             host, port = get_host_port_from_path(path)
-            if host is None: 
+            if host is None:
                 continue
+            key = (host, port)
             for line in tail.read_new_lines():
                 m = LINE_RE.search(line)
-                if not m: 
+                if not m:
                     continue
                 mbps = rate_to_mbps(float(m.group("rate")), m.group("rate_unit"))
-                jitter_ms = float(m.group("jitter_ms"))  # <-- this is jitter, not latency
+                jitter_ms = float(m.group("jitter_ms"))
                 lost = int(m.group("lost"))
                 total = int(m.group("total"))
-                rolls[(host, port)].add(mbps, jitter_ms, lost, total)
-                latest_jitter[(host, port)] = jitter_ms
+
+                # Update rolling stats
+                rolls[key].add(mbps, jitter_ms, lost, total)
+                latest_jitter[key] = jitter_ms
+
+                # Update monotonic cumulative total (used for stall detection)
+                cum_total[key] += total
 
         # Build summary
         server_rows = [["Host", "Port", "Flow", "Q", "Samples", "Avg Mbps", "Avg Jitter ms", "Loss %", "Lost/Total", "Latest ms"]]
@@ -126,40 +131,38 @@ def run(dirpath, pattern, window, refresh):
 
         for (host, port), roll in sorted(rolls.items()):
             n, mbps, jitter, lost, total = roll.stats()
-            if n == 0: 
+            if n == 0:
                 continue
+
+            key = (host, port)
+            # Stall if the cumulative total didn't increase since last refresh
+            prev = prev_cum_total.get(key, None)
+            stalled = (prev is not None and cum_total[key] <= prev)
+
             loss_pct = (lost / total * 100.0) if total > 0 else 0.0
+            host_disp = f"{host}{'*' if stalled else ''}"
             server_rows.append([
-                host, str(port), str(flow_from_port(port)), str(queue_from_port(port)),
+                host_disp, str(port), str(flow_from_port(port)), str(queue_from_port(port)),
                 str(n), f"{mbps:.3f}", f"{jitter:.3f}", f"{loss_pct:.2f}", f"{lost}/{total}",
                 f"{latest_jitter.get((host, port), 0.0):.3f}"
             ])
+
             per_host[host]["mbps"] += mbps
             per_host[host]["lost"] += lost
             per_host[host]["total"] += total
-            key = (host, queue_from_port(port))
-            per_host_q[key]["mbps"] += mbps
-            per_host_q[key]["lost"] += lost
-            per_host_q[key]["total"] += total
+            key_hq = (host, queue_from_port(port))
+            per_host_q[key_hq]["mbps"] += mbps
+            per_host_q[key_hq]["lost"] += lost
+            per_host_q[key_hq]["total"] += total
 
         os.system("clear")
         print(f"iperf3 UDP server summaries (window={window} samples, refresh={refresh}s)")
+        print("(* = no new packets since last refresh)")
         print("\nPer-server\n")
         print_table(server_rows)
 
-        # host_rows = [["Host", "Sum Mbps", "Loss %", "Lost/Total"]]
-        # for h, d in sorted(per_host.items()):
-        #     loss_pct = (d["lost"]/d["total"]*100.0) if d["total"]>0 else 0.0
-        #     host_rows.append([h, f"{d['mbps']:.3f}", f"{loss_pct:.2f}", f"{d['lost']}/{d['total']}"])
-        # print("\nPer-host aggregate\n")
-        # print_table(host_rows)
-
-        # hq_rows = [["Host", "Q", "Sum Mbps", "Loss %", "Lost/Total"]]
-        # for (h,q), d in sorted(per_host_q.items()):
-        #     loss_pct = (d["lost"]/d["total"]*100.0) if d["total"]>0 else 0.0
-        #     hq_rows.append([h, str(q), f"{d['mbps']:.3f}", f"{loss_pct:.2f}", f"{d['lost']}/{d['total']}"])
-        # print("\nPer-host per-queue aggregate\n")
-        # print_table(hq_rows)
+        # After printing, snapshot current cumulative totals for the next refresh
+        prev_cum_total = dict(cum_total)
 
         time.sleep(refresh)
 
