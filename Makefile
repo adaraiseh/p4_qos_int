@@ -26,7 +26,7 @@ collect:
 	sudo python3 report_collector/influxdb_export.py
 
 monitor:
-	python3 monitor_iperf_s.py --dir /tmp --window 60 --refresh 2
+	python3 monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
 
 # run RL agent in training mode (saves weights to training_files)
 train:

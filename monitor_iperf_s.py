@@ -171,7 +171,7 @@ def main():
     ap.add_argument("--dir", default="/tmp", help="directory with *_iperf3_s_*.log")
     ap.add_argument("--pattern", default="*_iperf3_s_*.log", help="glob pattern")
     ap.add_argument("--window", type=int, default=60, help="rolling window (samples)")
-    ap.add_argument("--refresh", type=float, default=2.0, help="refresh interval seconds")
+    ap.add_argument("--refresh", type=float, default=1.0, help="refresh interval seconds")
     args = ap.parse_args()
     run(args.dir, args.pattern, args.window, args.refresh)
 

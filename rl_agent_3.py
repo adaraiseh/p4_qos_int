@@ -8,9 +8,6 @@ from collections import deque
 from math import cos, pi
 from datetime import datetime, timedelta
 import math
-import glob
-import re
-from pathlib import Path
 import numpy as np
 import argparse
 import torch
@@ -18,6 +15,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
 from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
 from controller import Controller
 
 # =========================================
@@ -43,16 +41,17 @@ INFLUX_QUERY_TIMEOUT = 5000
 # Action timing
 DELAY_NO_ACTION = 0.7
 DELAY_AFTER_ACTION = 1.0
-ACTION_COOLDOWN_SECS = 5.0
+GLOBAL_COOLDOWN_SECS = 2.0
+AGENT_ACTION_COOLDOWN_SECS = 5.0
 
 # =========================================
 #              HYPERPARAMETERS
 # =========================================
 LR = 1e-3
 GAMMA = 0.99
-BATCH_SIZE = 32
+BATCH_SIZE = 64            # <- was 32
 MIN_REPLAY_SIZE = 500
-REPLAY_MEMORY_SIZE = 10000
+REPLAY_MEMORY_SIZE = 100_000  # <- was 10_000
 
 # Epsilon schedule (cosine with adaptive nudges)
 EPS_START = 1.0
@@ -62,11 +61,9 @@ EPS_DECAY_STEPS = 10_000
 # Target updates (Polyak)
 TAU = 0.005
 
-# QoS thresholds (ms / drops / util)
+# QoS thresholds (ms)
 VOICE_LAT_THRESH = 100.0
-VOICE_DROP_THRESH = 2
 VIDEO_LAT_THRESH = 150.0
-VIDEO_DROP_THRESH = 5
 BEST_EFFORT_LAT_THRESH = 200.0
 SLA_NEAR_FACTOR = 0.9
 
@@ -74,8 +71,7 @@ SLA_NEAR_FACTOR = 0.9
 QIDS = (0, 1, 7)  # voice, video, best-effort
 
 # Normalization caps
-DROP_RATE_CAP_PER_100MS = 20.0
-PENALTY_CAP = 1.0  # kept for helper, not directly used now
+DROP_RATE_CAP_PER_100MS = 5.0
 LATENCY_RATIO_CLIP = 2.0
 
 # Fallbacks when no INT data in the window
@@ -97,24 +93,39 @@ SWITCH_METRIC_WEIGHTS = {
 # =========================================
 #              REWARD SHAPING
 # =========================================
+# Keep max reward at 10 (as requested)
 MAX_REWARD = 10.0
 
 # Exponential decay scales (ms)
 LAT_K_MS    = {0: 5.0, 1: 10.0, 7: 20.0}     # voice, video, best
 JITTER_K_MS = {0: 2.0, 1: 5.0, 7: 10.0}
 
-DROP_REF_PER_100MS = 1.0     # p95 drops/100ms above this start to hurt
 UTIL_SOFTCAP = 80.0          # p95 tx_util above this starts to hurt
 
-# Reward weights
-W_LAT95   = 6.0
-W_IMPROVE = 3.0
-W_JITTER  = 1.5
-W_DROP    = 2.0
-W_UTIL    = 1.0
+# =============================
+# REWARD WEIGHTING PER QUEUE
+# =============================
+# Drops are a pure penalty in the base term (r_drops ≤ 0).
+# Thus we keep a *small* base weight (so it doesn't dominate twice),
+# and increase the improvement weight so the agent gets credit when drops fall.
 
-CHANGE_PENALTY     = 0.8
-IMPROVE_EPSILON_MS = 0.5
+GOODNESS_WEIGHTS = {
+    0: {"latency": 6.0, "jitter": 3.0, "drops": 0.5, "utilization": 1.0, "bottleneck": 2.0},
+    1: {"latency": 4.0, "jitter": 1.5, "drops": 0.5, "utilization": 1.5, "bottleneck": 2.0},
+    7: {"latency": 2.0, "jitter": 0.5, "drops": 0.5, "utilization": 2.5, "bottleneck": 2.0},
+}
+
+IMPROVEMENT_WEIGHTS = {
+    0: {"latency": 1.5, "drops": 2.0, "utilization": 0.5, "bottleneck": 0.5},
+    1: {"latency": 1.0, "drops": 1.8, "utilization": 0.5, "bottleneck": 0.5},
+    7: {"latency": 0.5, "drops": 1.2, "utilization": 1.0, "bottleneck": 1.0},
+}
+
+# Penalties
+CHANGE_PENALTY        = 0.8   # futile change
+PENALTY_NONZERO_ACT   = 0.10  # any action
+PENALTY_ACTION_SWITCH = 0.15  # switching between act types
+IMPROVE_EPSILON_MS    = 0.5
 
 # =========================================
 #                   MODELS
@@ -172,17 +183,14 @@ class ReplayBuffer:
 #                    AGENT
 # =========================================
 class DuelingDQNAgent:
-    def __init__(self, state_dim, action_dim, device, n_step=3, warmup_steps=1000):
+    def __init__(self, state_dim, action_dim, device, n_step=3, warmup_steps=0):
         self.device = device
         self.online = DuelingDQN(state_dim, action_dim).to(device)
         self.target = DuelingDQN(state_dim, action_dim).to(device)
         self.target.load_state_dict(self.online.state_dict())
 
+        # Fixed LR (no scheduler)
         self.opt = optim.Adam(self.online.parameters(), lr=LR, eps=1e-5)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=20_000, eta_min=1e-5
-        )
-        self.warmup_steps = warmup_steps
 
         self.rb = ReplayBuffer(REPLAY_MEMORY_SIZE)
         self.action_dim = action_dim
@@ -208,7 +216,6 @@ class DuelingDQNAgent:
                 'online': self.online.state_dict(),
                 'target': self.target.state_dict(),
                 'opt': self.opt.state_dict(),
-                'scheduler': self.scheduler.state_dict(),
             }, path
         )
 
@@ -220,8 +227,6 @@ class DuelingDQNAgent:
         self.online.load_state_dict(st['online'])
         self.target.load_state_dict(st['target'])
         self.opt.load_state_dict(st['opt'])
-        if 'scheduler' in st:
-            self.scheduler.load_state_dict(st['scheduler'])
 
     # ---------- Eval helpers ----------
     def set_eval(self):
@@ -230,15 +235,9 @@ class DuelingDQNAgent:
         self.eps = 0.0
 
     # ---------- Epsilon-greedy (unmasked) ----------
-    def select_action(self, state_vec, decay_allowed: bool = True):
+    def select_action(self, state_vec):
         self.step_count += 1
-        if self.step_count <= self.warmup_steps:
-            warm_lr = LR * (self.step_count / float(self.warmup_steps))
-            for g in self.opt.param_groups:
-                g['lr'] = warm_lr
-        self.last_lr = self.opt.param_groups[0]['lr']
-
-        self.maybe_decay_epsilon(decay_allowed)
+        # No manual warmup, no auto-decay here
         if random.random() < self.eps:
             return random.randrange(self.action_dim)
         with torch.no_grad():
@@ -249,8 +248,7 @@ class DuelingDQNAgent:
     # ---------- Masked epsilon-greedy ----------
     def select_action_masked(self, state_vec, valid_mask, eps_override=None, no_op_priority=True, margin=0.05):
         eps_now = self.eps if eps_override is None else eps_override
-        if eps_override is None:
-            self.maybe_decay_epsilon(decay_allowed=True)
+        # No auto-decay here
 
         vm = np.asarray(valid_mask, dtype=bool)
         valid_idxs = np.flatnonzero(vm)
@@ -272,6 +270,7 @@ class DuelingDQNAgent:
             if a != 0 and (q_masked[a] - q_masked[0]) < margin:
                 a = 0
         return a
+
 
     # ---------- Epsilon schedule ----------
     def _cosine_eps(self):
@@ -359,9 +358,11 @@ class DuelingDQNAgent:
         loss = self.loss_fn(q, tgt)
         self.opt.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)  # <- was 1.0
         self.opt.step()
-        self.scheduler.step()
+
+        # Record effective LR *after* step
+        self.last_lr = float(self.opt.param_groups[0]['lr'])
         self.last_loss = float(loss.item())
 
         with torch.no_grad():
@@ -376,33 +377,31 @@ class RoutingRLSystem:
         self.bucket = bucket
         self.org = org
         self.client = InfluxDBClient(url=url, token=token, org=org, timeout=INFLUX_QUERY_TIMEOUT)
+        # Synchronous writes to avoid silent buffering
+        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
-        self.write_api = self.client.write_api()
 
         self.controller = Controller()
 
-        self.switch_id_name   = dict(self.controller.switch_id_to_name)
+        self.switch_id_name    = dict(self.controller.switch_id_to_name)
         self.name_to_switch_id = dict(self.controller.switch_name_to_id)
 
         self.switch_metrics = SWITCH_METRIC_WEIGHTS
 
-        # ===== State space v2 =====
-        # qid one-hot: 3
-        # global features: 12 (first = bneck_score_norm)
-        # path features:
-        #   hop_count one-hot (0..8; 8=≥8): 9
-        #   bneck_pos_norm: 1
-        #   alt_exists: 1
-        #   path agg mean/max (sw_lat, txu, drop, qocc): 8
-        # action context:
-        #   last_action_kind one-hot (noop/change/revert): 3
-        #   cooldown_remaining_norm: 1
-        self.state_dim = 3 + 12 + (9 + 1 + 1 + 8) + 3 + 1  # = 38
+        # Episode config
+        self.EP_SLA_STREAK_N = 10
+        self.EP_MAX_HORIZON  = 300
 
-        # Actions:
-        # 0: no-op
-        # 1: change route for the hottest demand (this qid)
-        # 2: revert last change
+        # Per-queue episode bookkeeping
+        self.ep_steps   = {qid: 0 for qid in QIDS}
+        self.sla_streak = {qid: 0 for qid in QIDS}
+
+        # ===== State space v2 =====
+        # 3 (qid) + 12 (globals) + 1 (has_pending_change) +
+        # (9 onehot hops +1 bpos +1 alt +8 path aggs) + 3 (last action) +1 cooldown = 39
+        self.state_dim = 39
+
+        # Actions: 0=no-op, 1=change hottest path for qid, 2=revert last change
         self.action_dim = 3
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -411,15 +410,34 @@ class RoutingRLSystem:
         # Timing/delays
         self.action_response_delay_no_change = DELAY_NO_ACTION
         self.action_response_delay_change = DELAY_AFTER_ACTION
-        self.cooldown_secs = ACTION_COOLDOWN_SECS
+        self.cooldown_secs = AGENT_ACTION_COOLDOWN_SECS
         self.last_action_time = {qid: -float('inf') for qid in QIDS}
         self.last_action_taken = {qid: 0 for qid in QIDS}  # 0=noop,1=change,2=revert
 
+        # For arbitration/fairness/safety
+        self.global_last_change_time = -1e9
+        self.last_changed_qid = -1
+
         self.last_snapshot = self.collect_snapshot()
 
-        # Churn regularizers
+        # Churn regularizers (back-compat with earlier global names)
         self.W_ACTION_NONZERO = 0.10
         self.W_ACTION_SWITCH  = 0.15
+
+    def _meets_sla(self, qid:int, snap_q:dict) -> bool:
+        """SLA: p95 latency <= queue-specific threshold."""
+        lat95 = float(snap_q.get('flow_p95', snap_q.get('flow_latency', 0.0)))
+        thresh = {0: VOICE_LAT_THRESH, 1: VIDEO_LAT_THRESH, 7: BEST_EFFORT_LAT_THRESH}[qid]
+        return lat95 <= float(thresh)
+
+    def _should_end_episode(self, qid:int) -> bool:
+        """End episode if SLA streak reached or horizon hit."""
+        return (self.sla_streak[qid] >= self.EP_SLA_STREAK_N) or (self.ep_steps[qid] >= self.EP_MAX_HORIZON)
+
+    def _on_episode_end(self, qid:int):
+        """Reset per-queue episode counters when an episode ends."""
+        self.ep_steps[qid] = 0
+        self.sla_streak[qid] = 0
 
     # ----- Time window helper -----
     def _time_window(self, seconds=WINDOW_SECONDS, lag_ms=SAFETY_LAG_MS):
@@ -441,12 +459,10 @@ class RoutingRLSystem:
         return self._one_hot(order.get(qid, 2), 3)
 
     def _last_action_one_hot(self, a: int) -> np.ndarray:
-        # clamp to {0,1,2}
         a = int(a) if a in (0,1,2) else 0
         return self._one_hot(a, 3)
 
     def _hop_one_hot_0to8(self, hop_count: int) -> np.ndarray:
-        # bin: 0..8 (8 means >=8)
         b = 8 if hop_count >= 8 else max(0, int(hop_count))
         return self._one_hot(b, 9)
 
@@ -461,9 +477,6 @@ class RoutingRLSystem:
     def _norm_drop_rate(self, v: float) -> float:
         return float(min(max(v, 0.0), DROP_RATE_CAP_PER_100MS)) / DROP_RATE_CAP_PER_100MS
 
-    def _norm_penalty(self, v: float) -> float:
-        return float(min(max(v, 0.0), PENALTY_CAP))
-
     # ----- Lighter snapshot collection -----
     def collect_snapshot(self, seconds=WINDOW_SECONDS):
         """
@@ -474,7 +487,7 @@ class RoutingRLSystem:
         start, stop = self._time_window(seconds)
         qset = 'r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7"'
 
-        # Global aggregates (single union query for all queues)
+        # Global aggregates (single union query for all queues), grouped by queue_id
         flux_global = f'''
         base = from(bucket:"{self.bucket}")
         |> range(start:{start}, stop:{stop})
@@ -483,60 +496,76 @@ class RoutingRLSystem:
 
         flow_mean = base
         |> filter(fn: (r) => r._measurement == "flow_latency")
+        |> group(columns:["queue_id"])
         |> mean(column:"_value")
+        |> group()
         |> set(key:"_measurement", value:"flow_latency_agg")
 
         link_mean = base
         |> filter(fn: (r) => r._measurement == "link_latency")
+        |> group(columns:["queue_id"])
         |> mean(column:"_value")
+        |> group()
         |> set(key:"_measurement", value:"link_latency_agg")
 
         sw_mean = base
         |> filter(fn: (r) => r._measurement == "switch_latency")
+        |> group(columns:["queue_id"])
         |> mean(column:"_value")
+        |> group()
         |> set(key:"_measurement", value:"switch_latency_agg")
 
         drop_mean = base
         |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms")
+        |> group(columns:["queue_id"])
         |> mean(column:"_value")
+        |> group()
         |> set(key:"_measurement", value:"drop_rate_agg")
 
         txu_mean = base
         |> filter(fn: (r) => r._measurement == "tx_utilization")
+        |> group(columns:["queue_id"])
         |> mean(column:"_value")
+        |> group()
         |> set(key:"_measurement", value:"tx_util_agg")
 
         pre = base
         |> filter(fn: (r) => r._measurement == "flow_latency")
+        |> group(columns:["queue_id"])
         |> aggregateWindow(every: 100ms, fn: mean, createEmpty: false)
 
         flow_p50 = pre
         |> quantile(q:0.50, method:"estimate_tdigest")
+        |> group()
         |> set(key:"_measurement", value:"flow_p50")
 
         flow_p95 = pre
         |> quantile(q:0.95, method:"estimate_tdigest")
+        |> group()
         |> set(key:"_measurement", value:"flow_p95")
 
         flow_std = base
         |> filter(fn: (r) => r._measurement == "flow_latency")
+        |> group(columns:["queue_id"])
         |> stddev()
+        |> group()
         |> set(key:"_measurement", value:"flow_stddev")
 
         drop_p95 = base
         |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms")
+        |> group(columns:["queue_id"])
         |> quantile(q:0.95, method:"estimate_tdigest")
+        |> group()
         |> set(key:"_measurement", value:"drop_p95")
 
         txu_p95 = base
         |> filter(fn: (r) => r._measurement == "tx_utilization")
+        |> group(columns:["queue_id"])
         |> quantile(q:0.95, method:"estimate_tdigest")
+        |> group()
         |> set(key:"_measurement", value:"tx_util_p95")
 
-        union(tables:[
-          flow_mean, link_mean, sw_mean, drop_mean, txu_mean,
-          flow_p50, flow_p95, flow_std, drop_p95, txu_p95
-        ])
+        union(tables:[flow_mean, link_mean, sw_mean, drop_mean, txu_mean, flow_p50, flow_p95, flow_std, drop_p95, txu_p95])
         '''
 
         snap = {qid: {
@@ -546,13 +575,13 @@ class RoutingRLSystem:
             # hottest demand fields
             "hot_src_ip": None, "hot_dst_ip": None,
             # path-derived fields
-            "path_nodes": [],            #  stored path at snapshot time
-            "bneck_name": None,          #  bottleneck switch name at snapshot time
+            "path_nodes": [],
+            "bneck_name": None,
             "hop_count": 0,
             "hop_oh_0to8": self._one_hot(0, 9),
             "bneck_sid": 0,
             "bneck_pos_norm": 0.0,
-            "bneck_score_norm": 0.0,     # replaces penalty_worst_node
+            "bneck_score_norm": 0.0,
             "alt_exists": 0.0,
             "sw_lat_mean": 0.0, "sw_lat_max": 0.0,
             "txu_mean": 0.0, "txu_max": 0.0,
@@ -580,16 +609,14 @@ class RoutingRLSystem:
         except Exception as e:
             log.debug("Global aggregate query failed: %s", e)
 
-        # Attach hottest demand + path features (per qid -> compact queries)
+        # Attach hottest demand + path features (per qid)
         for qid in QIDS:
-            # Hottest demand
             hot = self._pick_hottest_demand(qid, seconds=seconds)
             if hot:
                 src_ip, dst_ip = hot
                 snap[qid]["hot_src_ip"], snap[qid]["hot_dst_ip"] = src_ip, dst_ip
-                # Path features + bottleneck scoring
                 self._fill_path_features_for_hottest(qid, snap[qid], seconds=seconds)
-            # Derive globals fallback if missing
+            # Fallbacks if missing
             if snap[qid]["flow_latency_agg"] is None:
                 snap[qid].update({
                     "flow_latency_agg":  MISSING_FLOW_LAT_MS,
@@ -642,14 +669,10 @@ class RoutingRLSystem:
         return None
 
     def _fill_path_features_for_hottest(self, qid: int, d: dict, seconds=WINDOW_SECONDS):
-        """
-        Mutates snapshot 'd' in-place with path features & bottleneck details for the hottest demand.
-        """
         src_ip, dst_ip = d.get("hot_src_ip"), d.get("hot_dst_ip")
         if not (src_ip and dst_ip):
             return
 
-        # Resolve the current stored path and the switches on it
         path = self.controller.get_path_by_ips(src_ip, dst_ip)
         if not path:
             return
@@ -659,10 +682,7 @@ class RoutingRLSystem:
         sw_ids = [self.controller.switch_name_to_id.get(n) for n in sw_names]
         sw_ids = [int(s) for s in sw_ids if s is not None]
         if not sw_ids:
-            log.error(
-                "No switch IDs resolved for path %s (names=%s); check rules/test mappings.",
-                path, sw_names
-            )
+            log.error("No switch IDs resolved for path %s (names=%s); check rules/test mappings.", path, sw_names)
             return
 
         hop_count = len(sw_ids)
@@ -671,7 +691,6 @@ class RoutingRLSystem:
         if hop_count == 0:
             return
 
-        # Query per-switch metrics along this path (single compact flux)
         sid_filter = " or ".join([f'r.switch_id == "{sid}"' for sid in sw_ids]) or 'true'
         start, stop = self._time_window(seconds)
         flux = f'''
@@ -691,7 +710,6 @@ class RoutingRLSystem:
             log.error("path metrics query failed: %s", e)
             return
 
-        # Collect per-switch metric rows
         rows = {}
         for tbl in wtables or []:
             for rec in tbl.records:
@@ -707,19 +725,17 @@ class RoutingRLSystem:
         if not rows:
             return
 
-        # Normalized weights for scoring
         smw = getattr(self, "switch_metrics", SWITCH_METRIC_WEIGHTS)
         total_w = max(1e-9, sum(w for _, w in smw.values()))
         wts = {m: w / total_w for m, (_, w) in smw.items()}
 
-        # Pick bottleneck switch using normalized metrics
         best_sid, best_score = None, -1.0
         for sid in sw_ids:
             r = rows.get(sid, {"drop": 0.0, "swlat": 0.0, "txu": 0.0, "qocc": 0.0})
             drop_n = self._norm_drop_rate(r["drop"])
             slat_n = self._latency_ratio(r["swlat"], qid)
             txu_n  = self._norm_tx_util(r["txu"])
-            qocc_n = self._norm_tx_util(r["qocc"])  # queue occupancy is 0..100%
+            qocc_n = self._norm_tx_util(r["qocc"])
             score = (
                 drop_n * wts["q_drop_rate_100ms"] +
                 slat_n * wts["switch_latency"] +
@@ -729,7 +745,6 @@ class RoutingRLSystem:
             if score > best_score:
                 best_sid, best_score = sid, score
 
-        # Position of bottleneck on the path and feasibility of an alternate
         try:
             b_idx = sw_ids.index(best_sid) if best_sid in sw_ids else -1
         except Exception:
@@ -737,21 +752,18 @@ class RoutingRLSystem:
         bpos = 0.0 if b_idx < 0 else (b_idx / max(1, hop_count - 1))
         alt_exists = 1.0 if (b_idx >= 0 and self.controller.has_alternate_for_worst(best_sid, path)) else 0.0
 
-        # Aggregates over path (raw, then normalized for the state vector)
         def nzmean(xs, default=0.0): return (sum(xs) / len(xs)) if xs else default
         swlat_vals = [rows[sid]["swlat"] for sid in sw_ids if sid in rows]
         txu_vals   = [rows[sid]["txu"]   for sid in sw_ids if sid in rows]
         drop_vals  = [rows[sid]["drop"]  for sid in sw_ids if sid in rows]
         qocc_vals  = [rows[sid]["qocc"]  for sid in sw_ids if sid in rows]
 
-        # Store snapshot fields
         d["bneck_sid"]        = int(best_sid or 0)
         d["bneck_name"]       = self.switch_id_name.get(int(best_sid)) if best_sid else None
         d["bneck_pos_norm"]   = float(bpos)
         d["bneck_score_norm"] = float(max(0.0, min(1.0, best_score)))
         d["alt_exists"]       = float(alt_exists)
 
-        # Store normalized aggregates for the state
         d["sw_lat_mean"] = self._latency_ratio(nzmean(swlat_vals), qid)
         d["sw_lat_max"]  = self._latency_ratio(max(swlat_vals) if swlat_vals else 0.0, qid)
         d["txu_mean"]    = self._norm_tx_util(nzmean(txu_vals))
@@ -760,7 +772,6 @@ class RoutingRLSystem:
         d["drop_max"]    = self._norm_drop_rate(max(drop_vals) if drop_vals else 0.0)
         d["qocc_mean"]   = self._norm_tx_util(nzmean(qocc_vals))
         d["qocc_max"]    = self._norm_tx_util(max(qocc_vals) if qocc_vals else 0.0)
-
 
     # ----- Logging -----
     def _log_state(self, label: str, qid: int, d: dict):
@@ -780,10 +791,8 @@ class RoutingRLSystem:
 
     # ----- State vector (v2) -----
     def build_state_vector(self, qid, data, last_action_kind: int, cooldown_remaining_s: float):
-        # (A) Queue one-hot
         qid_oh = self._qid_one_hot(qid)  # 3
 
-        # (B) Global flow features (12) — first is bneck_score_norm (replaces penalty_worst_node)
         bneck_score = float(data.get('bneck_score_norm', 0.0))
         flowr = self._latency_ratio(data['flow_latency'], qid)
         linkr = self._latency_ratio(data['mean_link_latency'], qid)
@@ -803,12 +812,15 @@ class RoutingRLSystem:
         drop95_n = self._norm_drop_rate(data.get('drop_p95', data['drop_rate']))
         txu95_n  = self._norm_tx_util(data.get('tx_util_p95', data['mean_tx_util']))
 
-        global_cont = np.array(
-            [bneck_score, flowr, linkr, swr, txn, drn, near, p50r, p95r, jitter_r, drop95_n, txu95_n],
-            dtype=np.float32
-        )  # 12
+        # NEW: expose pending-change as a binary feature
+        has_pending_change = 1.0 if self.controller.has_pending_change_for_qid(qid) else 0.0
 
-        # (C) Hottest-path features:
+        global_cont = np.array(
+            [bneck_score, flowr, linkr, swr, txn, drn, near, p50r, p95r, jitter_r, drop95_n, txu95_n,
+             has_pending_change],
+            dtype=np.float32
+        )  # 12 + 1 = 13
+
         hop_oh = np.asarray(data.get("hop_oh_0to8", self._one_hot(0, 9)), dtype=np.float32)  # 9
         bpos   = float(data.get("bneck_pos_norm", 0.0))  # 1
         aexists= float(data.get("alt_exists", 0.0))      # 1
@@ -823,13 +835,12 @@ class RoutingRLSystem:
             float(data.get("qocc_max",    0.0)),
         ], dtype=np.float32)  # 8
 
-        # (D) Action context
         last_act_oh = self._last_action_one_hot(last_action_kind)  # 3
         cool_norm = max(0.0, min(1.0, cooldown_remaining_s / max(1e-6, self.cooldown_secs)))  # 1
 
-        # Final vector: 3 + 12 + (9+1+1+8) + 3 + 1 = 38
         return np.concatenate([qid_oh, global_cont, hop_oh, np.array([bpos, aexists], np.float32),
                                path_aggs, last_act_oh, np.array([cool_norm], np.float32)], axis=0)
+
 
     # ----- Health gate -----
     def _should_consider_change(self, qid:int, d:dict) -> bool:
@@ -849,14 +860,13 @@ class RoutingRLSystem:
             return
 
         if action == 2:
-            ok = self.controller.revert_last_change()
+            ok = self.controller.revert_last_change_for_qid(qid)  # <- per-queue
             if ok:
-                log.info("[REVERT] Last route change was successfully reverted.")
+                log.info("[REVERT q=%s] Reverted last change for this queue.", qid)
             else:
-                log.info("[REVERT] No change to revert.")
+                log.info("[REVERT q=%s] No change to revert for this queue.", qid)
             return
 
-        # action == 1: operate on the hottest demand path (use snapshot data)
         src_ip, dst_ip = data.get('hot_src_ip'), data.get('hot_dst_ip')
         bneck_sid = int(data.get('bneck_sid', 0) or 0)
 
@@ -867,7 +877,6 @@ class RoutingRLSystem:
             log.error(f"qid {qid} no bottleneck detected along hottest path; skipping.")
             return
 
-        # Always re-check against the CURRENT path (another queue may have changed it already)
         path = self.controller.get_path_by_ips(src_ip, dst_ip)
         if not path:
             log.error(f"qid {qid} no stored path for {src_ip}->{dst_ip}; skipping.")
@@ -875,48 +884,33 @@ class RoutingRLSystem:
 
         worst_name_snapshot = data.get('bneck_name') or self.switch_id_name.get(bneck_sid, None)
         if worst_name_snapshot not in path:
-            # Snapshot is stale (e.g., another queue replaced this node). Skip to avoid bad/invalid logs.
-            log.debug(f"qid {qid} snapshot worst {bneck_sid}({worst_name_snapshot}) is not on current path {path}; skipping change.")
+            log.debug(f"qid {qid} snapshot worst {bneck_sid}({worst_name_snapshot}) not on current path {path}; skipping change.")
             return
 
-        # Re-check feasibility on the CURRENT path (controller-only logic; no Influx calls)
         if not self.controller.has_alternate_for_worst(bneck_sid, path):
-            log.debug(f"qid {qid} no alternate available for worst {bneck_sid}({worst_name_snapshot}) on current path {path}; skipping.")
+            log.debug(f"qid {qid} no alternate available for worst {bneck_sid} on current path; skipping.")
             return
 
         alt = self.controller.find_alternate_for_worst(bneck_sid, path)
         if not alt:
-            log.debug(f"qid {qid} no alternate found for worst {bneck_sid}({worst_name_snapshot}) on current path {path}; skipping.")
+            log.debug(f"qid {qid} no alternate found for worst {bneck_sid} on current path; skipping.")
             return
 
         ok, details = self.controller.reroute_one_demand_symmetric(
-            src_ip=src_ip,
-            dst_ip=dst_ip,
-            qid=qid,
-            worst_switch_id=bneck_sid,
-            alt_switch_name=alt
+            src_ip=src_ip, dst_ip=dst_ip, qid=qid,
+            worst_switch_id=bneck_sid, alt_switch_name=alt
         )
         if ok:
-            last_change = self.controller.change_history[-1] if self.controller.change_history else {}
-            fwd = last_change.get("fwd"); rev = last_change.get("rev")
-            log.info(
-                f"[PATH CHANGE SUCCESS] q={qid} demand=({src_ip} → {dst_ip}) "
-                f"bneck={bneck_sid} alt={alt}"
-            )
-            if fwd and fwd.get("old_path") and fwd.get("new_path"):
-                log.info("  Forward: \n%s\n%s", " -> ".join(fwd["old_path"]), " -> ".join(fwd["new_path"]))
-            if rev and rev.get("old_path") and rev.get("new_path"):
-                log.info("  Reverse: \n%s\n%s", " -> ".join(rev["old_path"]), " -> ".join(rev["new_path"]))
+            log.info(f"[PATH CHANGE SUCCESS] q={qid} demand=({src_ip} → {dst_ip}) bneck={bneck_sid} alt={alt}")
         else:
-            log.error(
-                f"[PATH CHANGE FAILED] q={qid} bneck_sid={bneck_sid} "
-                f"alt={alt} demand=({src_ip} → {dst_ip}) reason={details}"
-            )
+            log.error(f"[PATH CHANGE FAILED] q={qid} bneck_sid={bneck_sid} alt={alt} demand=({src_ip} → {dst_ip})")
+
     # ----- Action masking -----
     def valid_action_mask(self, qid, data):
         """
         [NOOP, CHANGE, REVERT]
-        'CHANGE' allowed iff we have hottest demand, a detected bottleneck, and an alternate exists for it.
+        'CHANGE' allowed iff hottest demand + bottleneck + alternate exists.
+        'REVERT' allowed iff this qid has a pending change (i.e., something to revert).
         """
         mask = np.zeros(self.action_dim, dtype=bool)
         mask[0] = True  # no-op always allowed
@@ -926,10 +920,10 @@ class RoutingRLSystem:
         alt_exists = bool(int(data.get('alt_exists', 0)))
 
         if src_ip and dst_ip and bneck_sid > 0 and alt_exists:
-            mask[1] = True
+            mask[1] = True  # CHANGE possible
 
-        if self.controller.has_pending_change():
-            mask[2] = True
+        if self.controller.has_pending_change_for_qid(qid):
+            mask[2] = True  # REVERT possible
 
         return mask
 
@@ -1005,72 +999,262 @@ class RoutingRLSystem:
         except Exception as e:
             log.warning("Failed to write training metrics: %s", e)
 
-    # ----- Reward (unchanged semantics) -----
+    # ----- Reward helpers -----
     def _exp_score(self, x_ms: float, k_ms: float) -> float:
         x = max(0.0, float(x_ms))
         return math.exp(-x / max(1e-6, k_ms))
 
     def compute_reward_v2(self, qid:int, cur:dict, prev_snap:dict, action:int, prev_action:int=None):
-        lat50 = float(cur.get('flow_p50', cur['flow_latency']))
-        lat95 = float(cur.get('flow_p95', cur['flow_latency']))
-        jitter = max(0.0, lat95 - lat50)
-        drop95 = float(cur.get('drop_p95', cur['drop_rate']))
-        util95 = float(cur.get('tx_util_p95', cur['mean_tx_util']))
+        """
+        Reward with per-qid weights from GOODNESS_WEIGHTS and IMPROVEMENT_WEIGHTS.
+        Drops are purely a penalty (never positive).
+        """
+        def gw(metric, default):
+            try:
+                return float(GOODNESS_WEIGHTS.get(qid, {}).get(metric, default))
+            except Exception:
+                return float(default)
 
-        prev95 = float(prev_snap.get(qid, {}).get('flow_p95', prev_snap.get(qid, {}).get('flow_latency', lat95)))
-        d_improve = max(-10000.0, min(10000.0, prev95 - lat95))
+        def iw(metric, default):
+            try:
+                return float(IMPROVEMENT_WEIGHTS.get(qid, {}).get(metric, default))
+            except Exception:
+                return float(default)
 
-        r_lat = W_LAT95 * self._exp_score(lat95, LAT_K_MS[qid])
-        r_imp = W_IMPROVE * (d_improve / (LAT_K_MS[qid] * 3.0))
-        r_imp = max(-W_IMPROVE, min(W_IMPROVE, r_imp))
+        pen_nonzero = float(globals().get("PENALTY_NONZERO_ACT", getattr(self, "W_ACTION_NONZERO", 0.10)))
+        pen_switch  = float(globals().get("PENALTY_ACTION_SWITCH", getattr(self, "W_ACTION_SWITCH", 0.15)))
 
-        r_jit  = -W_JITTER * self._exp_score(jitter, JITTER_K_MS[qid]) * (jitter / (JITTER_K_MS[qid] + 1e-6))
-        r_drop = -W_DROP   * max(0.0, (drop95 - DROP_REF_PER_100MS) / max(DROP_REF_PER_100MS, 1e-6))
-        r_util = -W_UTIL   * max(0.0, (util95 - UTIL_SOFTCAP) / 20.0)
+        # -------- current metrics --------
+        lat50   = float(cur.get('flow_p50',   cur.get('flow_latency', 0.0)))
+        lat95   = float(cur.get('flow_p95',   cur.get('flow_latency', 0.0)))
+        jitter  = max(0.0, lat95 - lat50)
+        drop95  = float(cur.get('drop_p95',   cur.get('drop_rate', 0.0)))
+        util95  = float(cur.get('tx_util_p95',cur.get('mean_tx_util', 0.0)))
+        bneck_n = float(cur.get('bneck_score_norm', 0.0))  # 0..1 (badness)
 
-        r_change = 0.0
-        if action != 0 and d_improve < IMPROVE_EPSILON_MS:
-            r_change = -CHANGE_PENALTY
+        # -------- previous snapshot (for deltas) --------
+        prev_q = prev_snap.get(qid, {}) if isinstance(prev_snap, dict) else {}
+        prev95      = float(prev_q.get('flow_p95',   prev_q.get('flow_latency', lat95)))
+        prev_drop95 = float(prev_q.get('drop_p95',   prev_q.get('drop_rate', drop95)))
+        prev_util95 = float(prev_q.get('tx_util_p95',prev_q.get('mean_tx_util', util95)))
+        prev_bneck  = float(prev_q.get('bneck_score_norm', bneck_n))
 
-        r_total = r_lat + r_imp + r_jit + r_drop + r_util + r_change
+        # -------- base "goodness" terms --------
+        lat_score  = self._exp_score(lat95, LAT_K_MS[qid])                 # ∈(0,1], higher is better
+        jit_score  = self._exp_score(jitter, JITTER_K_MS[qid])             # ∈(0,1], higher is better
 
-        # Churn regularizers
+        # UTIL: soft penalty above softcap, gentle below
+        if util95 <= UTIL_SOFTCAP:
+            util_score = 1.0 - 0.0015 * util95
+        else:
+            over = min(100.0, util95) - UTIL_SOFTCAP
+            util_score = max(0.0, 1.0 - over / 20.0)
+
+        # BOTTLENECK: invert normalized badness
+        bneck_score = 1.0 - max(0.0, min(1.0, bneck_n))
+
+        # DROPS: **pure penalty** (never positive)
+        drop_penalty = min(max(drop95, 0.0), DROP_RATE_CAP_PER_100MS) / DROP_RATE_CAP_PER_100MS  # ∈[0,1]
+        r_drops = - gw("drops", 2.5) * drop_penalty
+
+        r_latency     = gw("latency",     4.0) * lat_score
+        r_jitter      = gw("jitter",      1.5) * jit_score
+        r_utilization = gw("utilization", 1.5) * util_score
+        r_bottleneck  = gw("bottleneck",  1.5) * bneck_score
+
+        # -------- improvement bonuses (signed; clipped) --------
+        d_lat        = prev95 - lat95
+        d_drop       = prev_drop95 - drop95
+        def util_pressure(u): return 0.0 if u <= UTIL_SOFTCAP else (u - UTIL_SOFTCAP) / 20.0
+        d_util_press = util_pressure(prev_util95) - util_pressure(util95)
+        d_bn         = prev_bneck - bneck_n
+
+        imp_lat  = max(-2.0, min( 2.0, (d_lat / (LAT_K_MS[qid] * 3.0)) * 2.0))
+        imp_drop = max(-1.5, min( 1.5, (d_drop / max(1.0, DROP_RATE_CAP_PER_100MS)) * 1.5))
+        imp_util = max(-1.0, min( 1.0, d_util_press))
+        imp_bn   = max(-1.0, min( 1.0, d_bn))
+
+        r_improve_latency      = iw("latency",     1.0) * imp_lat
+        r_improve_drops        = iw("drops",       1.0) * imp_drop
+        r_improve_utilization  = iw("utilization", 1.0) * imp_util
+        r_improve_bottleneck   = iw("bottleneck",  1.0) * imp_bn
+        r_improvements = (r_improve_latency + r_improve_drops +
+                          r_improve_utilization + r_improve_bottleneck)
+
+        # -------- penalties --------
+        r_futile_change = 0.0
+        IMPROVE_EPS = max(IMPROVE_EPSILON_MS, 0.5)
+        any_meaningful_improve = (
+            d_lat > IMPROVE_EPS or
+            d_drop > 0.25 or
+            d_util_press > 0.05 or
+            d_bn > 0.03
+        )
+        if action != 0 and not any_meaningful_improve:
+            r_futile_change = -CHANGE_PENALTY
+
+        r_churn = 0.0
         if prev_action is not None:
             if action != 0:
-                r_total -= self.W_ACTION_NONZERO
+                r_churn -= pen_nonzero
             if action != prev_action:
-                r_total -= self.W_ACTION_SWITCH
+                r_churn -= pen_switch
 
+        # -------- total --------
+        r_total = (
+        r_latency + r_drops + r_jitter + r_utilization + r_bottleneck +
+        r_improvements + r_futile_change + r_churn
+        )
+        # cap total reward 
         r_total = max(-MAX_REWARD, min(MAX_REWARD, r_total))
+
         parts = {
-            "r_total": r_total, "r_lat": r_lat, "r_imp": r_imp,
-            "r_jit": r_jit, "r_drop": r_drop, "r_util": r_util, "r_change": r_change,
-            "lat95": lat95, "lat50": lat50, "jitter": jitter, "drop95": drop95, "util95": util95,
-            "prev95": prev95, "d_improve": d_improve
+            "r_total": r_total,
+            "r_latency": r_latency,
+            "r_drops": r_drops,  # ≤ 0
+            "r_jitter": r_jitter,
+            "r_utilization": r_utilization,
+            "r_bottleneck": r_bottleneck,
+            "r_improvements_sum": r_improvements,
+            "r_improve_latency": r_improve_latency,
+            "r_improve_drops": r_improve_drops,  # ≥ 0 when drops fall
+            "r_improve_utilization": r_improve_utilization,
+            "r_improve_bottleneck": r_improve_bottleneck,
+            "r_penalty_futile_change": r_futile_change,
+            "r_penalty_churn": r_churn,
+            # raw observables:
+            "latency_p95": lat95,
+            "latency_p50": lat50,
+            "jitter_ms": jitter,
+            "drops_p95": drop95,
+            "utilization_p95": util95,
+            "bottleneck_now": bneck_n,
+            "bottleneck_prev": prev_bneck,
+            "prev_latency_p95": prev95,
+            "delta_latency": d_lat,
         }
         return r_total, parts
 
-    def write_reward_metrics(self, qid:int, parts:dict):
+
+    def write_reward_metrics(self, qid:int, parts:dict, action:int=None, prev_action:int=None):
+        """
+        Writes the reward breakdown returned by compute_reward_v2.
+        Uses synchronous write to avoid buffering/flush surprises.
+        """
         try:
-            p = (Point("rl_reward")
-                 .tag("queue_id", str(qid))
-                 .field("r_total", float(parts["r_total"]))
-                 .field("r_lat",   float(parts["r_lat"]))
-                 .field("r_imp",   float(parts["r_imp"]))
-                 .field("r_jit",   float(parts["r_jit"]))
-                 .field("r_drop",  float(parts["r_drop"]))
-                 .field("r_util",  float(parts["r_util"]))
-                 .field("r_change",float(parts["r_change"]))
-                 .field("lat95",   float(parts["lat95"]))
-                 .field("lat50",   float(parts["lat50"]))
-                 .field("jitter",  float(parts["jitter"]))
-                 .field("drop95",  float(parts["drop95"]))
-                 .field("util95",  float(parts["util95"]))
-                 .field("prev95",  float(parts["prev95"]))
-                 .field("d_improve", float(parts["d_improve"])) )
+            p = Point("rl_reward").tag("queue_id", str(qid)).time(datetime.utcnow())
+            for k, v in parts.items():
+                try:
+                    p = p.field(k, float(v))
+                except Exception:
+                    pass
+            if action is not None:
+                p = p.field("action", int(action))
+            if prev_action is not None:
+                p = p.field("prev_action", int(prev_action))
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
-            log.debug("Failed to write rl_reward metrics: %s", e)
+            log.warning("Failed to write rl_reward metrics: %s", e)
+
+    # ----- Arbitration (one actor at a time + global cooldown) -----
+    def _arbitrate_and_apply(self, snap_now, actions, now_mono):
+        """
+        Applies at most one action this step using:
+         - Global cooldown
+         - Revert-first preemption (per-queue, only if pending change exists)
+         - Pressure-based choice (latency/drops/bottleneck)
+         - Deterministic tie-break + recency penalty + pressure threshold
+        Returns (actions_after_arb, any_changed, chosen_qid_or_None)
+        """
+
+        # Respect settle window: force all to NOOP
+        if (now_mono - self.global_last_change_time) < GLOBAL_COOLDOWN_SECS:
+            for qid in QIDS:
+                if actions[qid] != 0:
+                    log.debug(f"[Arb] Global cooldown → forcing NOOP for q={qid}")
+                actions[qid] = 0
+            return actions, False, None
+
+        # Reverts preempt changes (pick first deterministically), but only if there's a pending change
+        chosen_qid = None
+        for qid in sorted(QIDS):
+            if actions[qid] == 2 and self.controller.has_pending_change_for_qid(qid):
+                chosen_qid = qid
+                break
+
+        if chosen_qid is None:
+            chosen_qid = None
+            chosen_score = -1.0
+
+            # Small fairness anti-starvation
+            last_actor = getattr(self, "last_changed_qid", -1)
+            RECENCY_PENALTY = 0.03
+            PRESSURE_MIN = 0.15
+
+            for qid in sorted(QIDS):  # deterministic
+                if actions[qid] != 1:
+                    continue
+                d = snap_now[qid]
+
+                sla = {0: VOICE_LAT_THRESH, 1: VIDEO_LAT_THRESH, 7: BEST_EFFORT_LAT_THRESH}[qid]
+                lat95 = float(d.get('flow_p95', d.get('flow_latency', 0.0)))
+                lat_ratio = 0.0 if sla <= 0 else min(max(lat95 / sla, 0.0), LATENCY_RATIO_CLIP) / LATENCY_RATIO_CLIP
+
+                drop95 = float(d.get('drop_p95', d.get('drop_rate', 0.0)))
+                drop_n = min(max(drop95, 0.0), DROP_RATE_CAP_PER_100MS) / DROP_RATE_CAP_PER_100MS
+
+                bneck = float(d.get('bneck_score_norm', 0.0))  # 0..1, higher=worse
+
+                score = 0.50 * lat_ratio + 0.30 * drop_n + 0.20 * bneck
+
+                if qid == last_actor:
+                    score -= RECENCY_PENALTY
+
+                if score > chosen_score:
+                    chosen_score = score
+                    chosen_qid = qid
+
+            # If stress is weak, skip the change
+            if chosen_qid is not None and chosen_score < PRESSURE_MIN:
+                log.debug(f"[Arb] No change: max pressure {chosen_score:.3f} < {PRESSURE_MIN}")
+                chosen_qid = None
+
+        # Apply ONLY the chosen action; force others to NOOP
+        any_changed = False
+        for qid in QIDS:
+            a = actions[qid]
+            if qid == chosen_qid:
+                if a in (1, 2):
+                    # Extra safety: ensure alt still exists (mask should enforce) for CHANGE
+                    if a == 1:
+                        alt_exists = bool(int(snap_now[qid].get("alt_exists", 0)))
+                        if not alt_exists:
+                            log.debug(f"[Arb] alt_exists false at apply-time; forcing NOOP for q={qid}")
+                            actions[qid] = 0
+                            continue
+                    # For REVERT, ensure there's still something to revert at apply-time
+                    if a == 2 and not self.controller.has_pending_change_for_qid(qid):
+                        log.debug(f"[Arb] revert not allowed (no pending change) for q={qid}; forcing NOOP")
+                        actions[qid] = 0
+                        continue
+
+                    self.apply_path_change(qid, snap_now[qid], a)
+                    self.last_action_time[qid] = now_mono
+                    self.last_changed_qid = qid
+                    actions[qid] = a
+                    any_changed = True
+                else:
+                    actions[qid] = 0
+            else:
+                if a != 0:
+                    log.debug(f"[Arb] forcing NOOP for q={qid} (chosen={chosen_qid}, a={a})")
+                actions[qid] = 0
+
+        if any_changed:
+            self.global_last_change_time = now_mono
+
+        return actions, any_changed, chosen_qid
+
 
     # ----- Step (train) -----
     def step_all(self):
@@ -1089,31 +1273,25 @@ class RoutingRLSystem:
             mask = self.valid_action_mask(qid, snap_now[qid])
 
             if in_cooldown:
-                _ = self.agents[qid].select_action(np.zeros(self.state_dim, np.float32), decay_allowed=False)  # consume schedule
                 a = 0
                 log.debug(f"[COOLDOWN] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s -> action=0")
             else:
-                # Keep feasibility constraints from valid_action_mask(); 
-                # exploration happens only among valid actions.
                 s = self.build_state_vector(qid, snap_now[qid], self.last_action_taken[qid], cooldown_remaining)
                 states[qid] = s
                 a = self.agents[qid].select_action_masked(
                     s, mask, eps_override=None, no_op_priority=True, margin=0.05
                 )
             if qid not in states:
-                # Build state anyway for experience tuple (no-op context)
                 s = self.build_state_vector(qid, snap_now[qid], self.last_action_taken[qid], cooldown_remaining)
                 states[qid] = s
             actions[qid] = a
 
-        any_changed = False
-        for qid in QIDS:
-            if actions[qid] != 0:
-                self.apply_path_change(qid, snap_now[qid], actions[qid])
-                self.last_action_time[qid] = now_mono
-                any_changed = True
-            else:
-                log.debug(f"NO Path change q={qid}")
+        # ---- Central arbitration: apply at most one change / step
+        actions, any_changed, chosen_qid = self._arbitrate_and_apply(snap_now, actions, now_mono)
+
+        # Decay epsilon ONLY for the chosen queue this step
+        for qid, agent in self.agents.items():
+            agent.maybe_decay_epsilon(decay_allowed=(qid == chosen_qid))
 
         delay = self.action_response_delay_change if any_changed else self.action_response_delay_no_change
         time.sleep(delay)
@@ -1130,16 +1308,31 @@ class RoutingRLSystem:
             prev_a = self.last_action_taken[qid]
             r, parts = self.compute_reward_v2(qid, snap_next[qid], self.last_snapshot, actions[qid], prev_action=prev_a)
             self.last_action_taken[qid] = actions[qid]
-            self.write_reward_metrics(qid, parts)
+            self.write_reward_metrics(qid, parts, action=actions[qid], prev_action=prev_a)
 
-            done = False
+            # --- Per-queue episode accounting ---
+            self.ep_steps[qid] += 1
+            if self._meets_sla(qid, snap_next[qid]):
+                self.sla_streak[qid] += 1
+            else:
+                self.sla_streak[qid] = 0
+
+            done = self._should_end_episode(qid)
+
             self.agents[qid].push_nstep(states[qid], actions[qid], r, ns, done)
             self.agents[qid].train_step()
             self.agents[qid].on_step_end(r)
+
+            if done:
+                reason = "SLA-streak" if self.sla_streak[qid] >= self.EP_SLA_STREAK_N else "horizon"
+                log.debug(f"[EPISODE END] q={qid} reason={reason} (streak={self.sla_streak[qid]}, steps={self.ep_steps[qid]})")
+                self._on_episode_end(qid)
+
             rewards[qid] = r
 
         self.last_snapshot = snap_next
         return rewards
+
 
     # ----- Step (eval-only) -----
     def step_all_eval(self):
@@ -1160,7 +1353,7 @@ class RoutingRLSystem:
                 a = 0
                 log.debug(f"[COOLDOWN][eval] q={qid} {elapsed:.1f}s/{self.cooldown_secs:.0f}s -> action=0")
             else:
-                # More conservative in eval: only allow change if unhealthy (don’t force exploration)
+                # Conservative in eval: only allow change if unhealthy
                 if not self._should_consider_change(qid, snap_now[qid]) and len(mask) >= 2:
                     mask[1] = False
                 s = self.build_state_vector(qid, snap_now[qid], self.last_action_taken[qid], cooldown_remaining)
@@ -1169,14 +1362,8 @@ class RoutingRLSystem:
                 )
             actions[qid] = a
 
-        any_changed = False
-        for qid in QIDS:
-            if actions[qid] != 0:
-                self.apply_path_change(qid, snap_now[qid], actions[qid])
-                self.last_action_time[qid] = now_mono
-                any_changed = True
-            else:
-                log.debug(f"NO Path change q={qid} [eval]")
+        # ---- Central arbitration in eval too
+        actions, any_changed, chosen_qid = self._arbitrate_and_apply(snap_now, actions, now_mono)
 
         delay = self.action_response_delay_change if any_changed else self.action_response_delay_no_change
         time.sleep(delay)
@@ -1186,8 +1373,9 @@ class RoutingRLSystem:
         rewards = {}
         for qid in QIDS:
             self._log_state("next", qid, snap_next[qid])
-            r, parts = self.compute_reward_v2(qid, snap_next[qid], self.last_snapshot, actions[qid], prev_action=self.last_action_taken[qid])
-            self.write_reward_metrics(qid, parts)
+            prev_a = self.last_action_taken[qid]
+            r, parts = self.compute_reward_v2(qid, snap_next[qid], self.last_snapshot, actions[qid], prev_action=prev_a)
+            self.write_reward_metrics(qid, parts, action=actions[qid], prev_action=prev_a)
             self.last_action_taken[qid] = actions[qid]
             rewards[qid] = r
 
@@ -1212,7 +1400,7 @@ if __name__ == "__main__":
     parser.add_argument("--weights_dir", default="training_files",
                         help="Directory containing voice_*.pth, video_*.pth, best_*.pth")
     parser.add_argument("--tag", default="final",
-                        help="Which tag to load (e.g., 50%%, 90%%, final)")
+                        help="Which tag to load (e.g., 50%, 90%, final)")
     parser.add_argument("--steps", type=int, default=10000,
                         help="Total steps in train OR eval loop")
     parser.add_argument("--log-every", type=int, default=20)
@@ -1303,10 +1491,11 @@ if __name__ == "__main__":
                 log.info(f"[Agent Stats @ step {step}]")
                 for qid in (0, 1, 7):
                     s = stats[qid]
+                    loss_str = s['last_loss'] if not np.isnan(s['last_loss']) else 'nan'
                     log.info(
                         f"  q={qid} | eps={s['eps']:.4f} | avgR@100={s['avg_reward_100']:.3f} "
                         f"| decay_used={s['decay_steps_used']} | cooldown_left={s['cooldown_remaining_s']:.2f}s "
-                        f"| loss={s['last_loss'] if not np.isnan(s['last_loss']) else 'nan'} | lr={s['lr']:.6f}"
+                        f"| loss={loss_str} | lr={s['lr']:.6f}"
                     )
                 env.write_training_metrics(step, stats)
 
