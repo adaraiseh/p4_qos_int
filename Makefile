@@ -30,7 +30,7 @@ monitor:
 
 # run RL agent in training mode (saves weights to training_files)
 train:
-	python3 rl_agent_3.py --mode train --steps 10000
+	python3 rl_agent_3.py --mode train --steps 25000
 
 # run RL agent in evaluation mode (loads *_final.pth from training_files)
 test:

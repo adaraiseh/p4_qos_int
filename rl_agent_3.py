@@ -29,18 +29,18 @@ logging.basicConfig(
     force=True,
 )
 log = logging.getLogger()
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 # =========================================
 #              GLOBAL PARAMS
 # =========================================
 # Telemetry window (seconds) & safety lag
-WINDOW_SECONDS = 2
-SAFETY_LAG_MS = 1000
+WINDOW_SECONDS = 1
+SAFETY_LAG_MS = 500
 INFLUX_QUERY_TIMEOUT = 5000
 # Action timing
-DELAY_NO_ACTION = 0.7
-DELAY_AFTER_ACTION = 1.0
+DELAY_NO_ACTION = 0.1
+DELAY_AFTER_ACTION = 0.3
 GLOBAL_COOLDOWN_SECS = 2.0
 AGENT_ACTION_COOLDOWN_SECS = 5.0
 
@@ -50,7 +50,7 @@ AGENT_ACTION_COOLDOWN_SECS = 5.0
 LR = 1e-3
 GAMMA = 0.99
 BATCH_SIZE = 64            # <- was 32
-MIN_REPLAY_SIZE = 500
+MIN_REPLAY_SIZE = 8000
 REPLAY_MEMORY_SIZE = 100_000  # <- was 10_000
 
 # Epsilon schedule (cosine with adaptive nudges)
@@ -607,7 +607,7 @@ class RoutingRLSystem:
                         continue
                     snap[qid][m] = float(v)
         except Exception as e:
-            log.debug("Global aggregate query failed: %s", e)
+            log.error("Global aggregate query failed: %s", e)
 
         # Attach hottest demand + path features (per qid)
         for qid in QIDS:
@@ -658,7 +658,7 @@ class RoutingRLSystem:
         try:
             tables = self.query_api.query(org=self.org, query=flux)
         except Exception as e:
-            log.debug("hottest-demand query failed qid=%s: %s", qid, e)
+            log.error("hottest-demand query failed qid=%s: %s", qid, e)
             return None
         for tbl in tables or []:
             for rec in tbl.records:
@@ -856,10 +856,11 @@ class RoutingRLSystem:
     # ----- Actions -----
     def apply_path_change(self, qid, data, action):
         if action == 0:
-            log.debug("NO change (action 0)")
+            log.debug(f"q={qid} no change (action 0)")
             return
 
         if action == 2:
+            log.debug(f"q={qid} revert change (action 2)")
             ok = self.controller.revert_last_change_for_qid(qid)  # <- per-queue
             if ok:
                 log.info("[REVERT q=%s] Reverted last change for this queue.", qid)
@@ -867,6 +868,7 @@ class RoutingRLSystem:
                 log.info("[REVERT q=%s] No change to revert for this queue.", qid)
             return
 
+        log.debug(f"q={qid} route change (action 1)")
         src_ip, dst_ip = data.get('hot_src_ip'), data.get('hot_dst_ip')
         bneck_sid = int(data.get('bneck_sid', 0) or 0)
 
@@ -884,16 +886,16 @@ class RoutingRLSystem:
 
         worst_name_snapshot = data.get('bneck_name') or self.switch_id_name.get(bneck_sid, None)
         if worst_name_snapshot not in path:
-            log.debug(f"qid {qid} snapshot worst {bneck_sid}({worst_name_snapshot}) not on current path {path}; skipping change.")
+            log.warning(f"qid {qid} snapshot worst {bneck_sid}({worst_name_snapshot}) not on current path {path}; skipping change.")
             return
 
         if not self.controller.has_alternate_for_worst(bneck_sid, path):
-            log.debug(f"qid {qid} no alternate available for worst {bneck_sid} on current path; skipping.")
+            log.warning(f"qid {qid} no alternate available for worst {bneck_sid} on current path; skipping.")
             return
 
         alt = self.controller.find_alternate_for_worst(bneck_sid, path)
         if not alt:
-            log.debug(f"qid {qid} no alternate found for worst {bneck_sid} on current path; skipping.")
+            log.warning(f"qid {qid} no alternate found for worst {bneck_sid} on current path; skipping.")
             return
 
         ok, details = self.controller.reroute_one_demand_symmetric(
@@ -1458,13 +1460,14 @@ if __name__ == "__main__":
         total_steps = int(args.steps)
         save_points = {
             int(total_steps*0.5): '50%',
+            int(total_steps*0.7): '75%',
             int(total_steps*0.9): '90%',
             total_steps: 'final'
         }
         LOG_EVERY = int(args.log_every)
 
         for step in range(1, total_steps + 1):
-            log.debug(f"going to step {step}")
+            log.info(f"[STEP] {step}")
             rewards = env.step_all()
 
             if step % 10 == 0:
