@@ -2,6 +2,8 @@
 
 import re
 import glob
+import os
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from ipaddress import ip_network
 
@@ -40,6 +42,16 @@ class Controller:
         self.build_network_graph()
         self.compute_forwarding_entries()  # also fills self.path_map
         self.program_switches()
+
+    # -----------------------
+    # Quiet helpers to suppress verbose P4Runtime prints
+    # -----------------------
+    def _silent_call(self, fn, *args, **kwargs):
+        """
+        Many p4utils thrift calls print to stdout; silence them so RL logs stay visible.
+        """
+        with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
+            return fn(*args, **kwargs)
 
     def connect_to_switches(self):
         for sw_name in self.topo.get_p4switches().keys():

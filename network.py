@@ -288,7 +288,7 @@ def config_network(p4):
     # -----------------
 
     # Per-flow, per-queue Mbps (kept same shape, scaled by LOAD_FACTOR)
-    LOAD_FACTOR = 1.1
+    LOAD_FACTOR = 3.5
     PER_QUEUE_BW = {
         0: 0.1 * LOAD_FACTOR,
         1: 0.2 * LOAD_FACTOR,
