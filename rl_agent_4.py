@@ -21,6 +21,7 @@ import time
 import random
 import logging
 import argparse
+import csv
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Dict, List, Tuple, Optional
@@ -90,10 +91,10 @@ TARGET_UPDATE_FREQ = 100  # Hard update every N steps
 TAU = 0.005  # Soft update rate (if using soft updates)
 
 # Environment
-WINDOW_SECONDS = 3  # Longer window for stable metrics
+WINDOW_SECONDS = 2  # Longer window for stable metrics
 SAFETY_LAG_MS = 500
-COOLDOWN_SECONDS = 2.0  # Shorter cooldown for faster learning
-DELAY_AFTER_ACTION = 0.5
+COOLDOWN_SECONDS = 1.0  # Shorter cooldown for faster learning
+DELAY_AFTER_ACTION = 2.5
 DELAY_NO_ACTION = 0.1
 
 # Episode
@@ -112,11 +113,15 @@ QIDS = (0, 1, 7)
 DROP_CAP = 5.0  # drops per 100ms
 UTIL_CAP = 100.0  # percentage
 
-# Reward weights
-REWARD_SLA_MET = 1.0
-REWARD_SLA_VIOLATED_SCALE = 1.5
-REWARD_DROP_PENALTY = 0.3
-REWARD_ACTION_COST = 0.1  # Small cost for taking action (encourages stability)
+# Reward weights - TUNED for stability
+REWARD_SLA_MET_SCALE = 1.0          # Max reward per queue when lat=0
+REWARD_SLA_VIOLATED_SCALE = 1.5     # Penalty multiplier for violations
+REWARD_DROP_PENALTY = 1.0           # INCREASED: Drops are actionable signal
+REWARD_ACTION_COST = 0.05           # Reduced: Don't discourage necessary actions
+REWARD_IMPROVEMENT_BONUS = 0.5      # Bonus for improving from previous state
+
+# Soft margin around SLA (reduces reward flip-flopping)
+SLA_SOFT_MARGIN = 0.1  # 10% buffer zone around SLA threshold
 
 # =============================================================================
 #                        PRIORITIZED REPLAY BUFFER
@@ -480,7 +485,7 @@ class QoSRoutingEnv:
         3: 7,     # Best-effort
     }
     
-    def __init__(self, bucket: str, token: str, org: str, url: str):
+    def __init__(self, bucket: str, token: str, org: str, url: str, verbose: bool = False):
         self.bucket = bucket
         self.org = org
         self.url = url
@@ -491,7 +496,7 @@ class QoSRoutingEnv:
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         
         # Controller for routing changes
-        self.controller = Controller()
+        self.controller = Controller(verbose=verbose)
         
         # Episode state
         self.episode_step = 0
@@ -499,8 +504,13 @@ class QoSRoutingEnv:
         self.last_action_time = 0.0
         self.last_action = 0
         
-        # Cache last snapshot
+        # Cache snapshots for comparison
         self.last_snapshot = None
+        self.prev_snapshot = None  # For improvement tracking
+        
+        # Reward baseline (exponential moving average)
+        self.reward_ema = 0.0
+        self.reward_ema_alpha = 0.1  # Smoothing factor
     
     def reset(self) -> np.ndarray:
         """Reset episode and return initial state."""
@@ -510,6 +520,7 @@ class QoSRoutingEnv:
         self.last_action_time = time.monotonic()
         
         self.last_snapshot = self._collect_snapshot()
+        self.prev_snapshot = None  # No previous for first step
         return self._build_state(self.last_snapshot)
     
     def _time_window(self) -> Tuple[str, str]:
@@ -714,21 +725,33 @@ class QoSRoutingEnv:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             
-            # Normalized metrics
-            lat_ratio = min(q['lat_p95'] / sla, 2.0) / 2.0  # [0, 1]
+            # --- FIXED: Log-Space Latency ---
+            # Standardize: ratio = 1.0 means we are AT the SLA.
+            # np.log1p(x) calculates ln(1+x).
+            # If lat = 0, ratio = 0 -> val = 0.0
+            # If lat = SLA, ratio = 1 -> val = 0.69
+            # If lat = 2*SLA, ratio = 2 -> val = 1.09
+            # If lat = 10*SLA, ratio = 10 -> val = 2.39 (Soft compression, no hard cap)
+            raw_ratio = q['lat_p95'] / sla
+            lat_metric = np.log1p(raw_ratio)
+            
+            # Drops are already capped/normalized in snapshot, but good to ensure range
             drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
+            
+            # Utilization remains linear [0, 1]
             util_norm = min(q['util_p95'], UTIL_CAP) / UTIL_CAP
+            
             alt_avail = 1.0 if q['alt_exists'] else 0.0
             
-            state[idx:idx+4] = [lat_ratio, drop_norm, util_norm, alt_avail]
+            state[idx:idx+4] = [lat_metric, drop_norm, util_norm, alt_avail]
             idx += 4
             
-            # Track pressure for global feature
-            pressure = 0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm
+            # Track pressure (Weighted sum for global context)
+            pressure = 0.5 * lat_metric + 0.3 * drop_norm + 0.2 * util_norm
             pressures.append(pressure)
         
         # Global max pressure
-        state[12] = max(pressures)
+        state[12] = max(pressures) if pressures else 0.0
         
         return state
     
@@ -755,41 +778,118 @@ class QoSRoutingEnv:
     
     def _compute_reward(self, snapshot: Dict[int, Dict], action: int) -> Tuple[float, Dict]:
         """
-        Compute reward based on SLA compliance.
+        Compute reward based on SLA compliance with improved stability.
+        
+        Key improvements:
+        1. Soft margin around SLA to reduce flip-flopping
+        2. Higher drop penalty (more actionable signal)
+        3. Improvement bonus (credit for getting better)
+        4. Tanh compression to bound extreme values smoothly
+        5. EMA baseline subtraction for variance reduction
         
         Returns:
             (reward, info_dict)
         """
-        reward = 0.0
-        info = {'sla_met': [], 'sla_violated': []}
+        raw_reward = 0.0
+        info = {'sla_met': [], 'sla_violated': [], 'per_queue': {}}
         
         for qid in QIDS:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             lat = q['lat_p95']
             
-            if lat <= sla:
-                # SLA met - positive reward
-                reward += REWARD_SLA_MET
+            # Calculate ratio with soft margin
+            # SLA_SOFT_MARGIN=0.1 means 90-110% of SLA is "neutral zone"
+            ratio = lat / sla
+            margin_low = 1.0 - SLA_SOFT_MARGIN   # 0.9
+            margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.1
+            
+            if ratio <= margin_low:
+                # Clearly under SLA: positive reward
+                # Use sqrt for diminishing returns (don't over-reward very low latency)
+                headroom = margin_low - ratio  # How much below margin
+                component = REWARD_SLA_MET_SCALE * np.sqrt(headroom / margin_low)
                 info['sla_met'].append(qid)
+            elif ratio <= margin_high:
+                # Within margin: small neutral reward (avoid flip-flopping)
+                # Linear interpolation from +0.1 to -0.1
+                t = (ratio - margin_low) / (margin_high - margin_low)  # 0 to 1
+                component = 0.1 * (1.0 - 2.0 * t)  # +0.1 to -0.1
+                info['sla_met'].append(qid)  # Still counts as met
             else:
-                # SLA violated - negative reward proportional to violation
-                violation_ratio = min((lat - sla) / sla, 1.0)
-                reward -= REWARD_SLA_VIOLATED_SCALE * (1 + violation_ratio)
+                # Above margin: penalty
+                # Use tanh to compress extreme violations smoothly
+                excess = ratio - margin_high  # How much above margin
+                # tanh(x) saturates at ~1 for x>2, so max penalty ~1.5
+                component = -REWARD_SLA_VIOLATED_SCALE * np.tanh(excess)
                 info['sla_violated'].append(qid)
             
-            # Drop penalty (always applies)
+            raw_reward += component
+            
+            # 2. Drop Penalty - SIGNIFICANTLY INCREASED
+            # Drops are a clearer signal of actionable congestion
             drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
-            reward -= REWARD_DROP_PENALTY * drop_norm
+            drop_penalty = REWARD_DROP_PENALTY * drop_norm
+            raw_reward -= drop_penalty
+            
+            # Store per-queue info for debugging
+            info['per_queue'][qid] = {
+                'lat': lat,
+                'ratio': ratio,
+                'component': component,
+                'drop_penalty': drop_penalty
+            }
         
-        # Action cost
+        # 3. Improvement Bonus
+        # Reward getting better compared to previous step
+        improvement_bonus = 0.0
+        if self.prev_snapshot is not None:
+            for qid in QIDS:
+                prev_lat = self.prev_snapshot[qid]['lat_p95']
+                curr_lat = snapshot[qid]['lat_p95']
+                sla = SLA_THRESHOLDS[qid]
+                
+                # Improvement = reduction in latency ratio
+                prev_ratio = prev_lat / sla
+                curr_ratio = curr_lat / sla
+                improvement = prev_ratio - curr_ratio
+                
+                # Only reward improvement, don't penalize degradation (already penalized above)
+                if improvement > 0:
+                    improvement_bonus += REWARD_IMPROVEMENT_BONUS * min(improvement, 0.5)
+                
+                # Drop improvement
+                prev_drop = self.prev_snapshot[qid]['drop_p95']
+                curr_drop = snapshot[qid]['drop_p95']
+                drop_improvement = (prev_drop - curr_drop) / max(DROP_CAP, 1)
+                if drop_improvement > 0:
+                    improvement_bonus += REWARD_IMPROVEMENT_BONUS * 0.5 * min(drop_improvement, 1.0)
+        
+        raw_reward += improvement_bonus
+        info['improvement_bonus'] = improvement_bonus
+        
+        # 4. Action Cost (reduced - don't discourage necessary actions)
         if action != 0:
-            reward -= REWARD_ACTION_COST
+            raw_reward -= REWARD_ACTION_COST
         
-        # Clip reward to reasonable range
-        reward = max(-10.0, min(5.0, reward))
+        # 5. Stability: Soft clipping with tanh instead of hard clip
+        # Maps roughly [-10, +5] to [-3, +2.5] range
+        if raw_reward < 0:
+            reward = -3.0 * np.tanh(-raw_reward / 3.0)
+        else:
+            reward = 2.5 * np.tanh(raw_reward / 2.5)
         
-        info['total_reward'] = reward
+        # 6. Variance Reduction: Subtract EMA baseline
+        # This helps the agent distinguish its actions from environmental noise
+        adjusted_reward = reward - self.reward_ema
+        self.reward_ema = self.reward_ema * (1 - self.reward_ema_alpha) + reward * self.reward_ema_alpha
+        
+        info['raw_reward'] = raw_reward
+        info['clipped_reward'] = reward
+        info['adjusted_reward'] = adjusted_reward
+        info['reward_ema'] = self.reward_ema
+        info['total_reward'] = reward  # Keep using clipped reward for training
+        
         return reward, info
     
     def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> bool:
@@ -883,8 +983,9 @@ class QoSRoutingEnv:
         info['action_applied'] = action_applied
         info['all_sla_met'] = all_sla_met
         
-        # Build next state
+        # Build next state and update snapshot history
         next_state = self._build_state(next_snapshot)
+        self.prev_snapshot = self.last_snapshot  # Track for improvement bonus
         self.last_snapshot = next_snapshot
         
         return next_state, reward, done, info
@@ -915,6 +1016,14 @@ class QoSRoutingEnv:
             
             if agent_stats['last_loss'] is not None:
                 p = p.field("last_loss", float(agent_stats['last_loss']))
+            
+            # New metrics for reward debugging
+            if 'raw_reward' in info:
+                p = p.field("raw_reward", float(info['raw_reward']))
+            if 'improvement_bonus' in info:
+                p = p.field("improvement_bonus", float(info['improvement_bonus']))
+            if 'reward_ema' in info:
+                p = p.field("reward_ema", float(info['reward_ema']))
             
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
@@ -969,12 +1078,23 @@ def train(args):
     
     # Checkpoints
     os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs('data', exist_ok=True)
     checkpoint_steps = {
         int(args.steps * 0.25): '25pct',
         int(args.steps * 0.50): '50pct',
         int(args.steps * 0.75): '75pct',
         args.steps: 'final',
     }
+    
+    # CSV logging for local analysis
+    csv_path = f"data/training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        'step', 'episode', 'action', 'reward', 'raw_reward', 'improvement_bonus',
+        'reward_ema', 'sla_met', 'sla_streak', 'eps', 'loss', 'avg_reward_100', 'timestamp'
+    ])
+    log.info(f"Training log: {csv_path}")
     
     try:
         while total_steps < args.steps:
@@ -1012,19 +1132,33 @@ def train(args):
                 
                 if total_steps % args.log_every == 0:
                     loss_str = f"{stats['last_loss']:.4f}" if stats['last_loss'] is not None else "N/A"
+                    imp_bonus = info.get('improvement_bonus', 0)
+                    ema = info.get('reward_ema', 0)
                     log.info(
                         f"[Step {total_steps}] "
                         f"action={action_name:6s} "
                         f"reward={reward:+.2f} "
+                        f"imp={imp_bonus:+.2f} "
+                        f"ema={ema:+.2f} "
                         f"eps={stats['eps']:.3f} "
                         f"buffer={stats['buffer_size']:5d} "
                         f"loss={loss_str:>8} "
-                        f"sla_met={len(info['sla_met'])}/3 "
+                        f"sla={len(info['sla_met'])}/3 "
                         f"streak={info['sla_streak']}"
                     )
                 
                 # Write metrics to InfluxDB
                 env.write_training_metrics(total_steps, stats, reward, action, info)
+                
+                # Write to local CSV
+                csv_writer.writerow([
+                    total_steps, episode, action, reward,
+                    info.get('raw_reward', 0), info.get('improvement_bonus', 0),
+                    info.get('reward_ema', 0), len(info['sla_met']), info['sla_streak'],
+                    stats['eps'], stats['last_loss'] or 0, stats['avg_reward'],
+                    datetime.now().isoformat()
+                ])
+                csv_file.flush()  # Ensure data is written immediately
                 
                 # Save checkpoints
                 if total_steps in checkpoint_steps:
@@ -1056,9 +1190,11 @@ def train(args):
         path = os.path.join(args.save_dir, "dqn_v4_final.pth")
         agent.save(path)
         env.close()
+        csv_file.close()
         
     log.info("\nTraining complete!")
     log.info(f"Final stats: {agent.get_stats()}")
+    log.info(f"Training log saved to: {csv_path}")
 
 
 def evaluate(args):
@@ -1072,7 +1208,7 @@ def evaluate(args):
     
     # Initialize environment and agent
     env = QoSRoutingEnv(args.influx_bucket, args.influx_token,
-                        args.influx_org, args.influx_url)
+                        args.influx_org, args.influx_url, verbose=args.verbose)
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
     
     # Load weights
@@ -1157,6 +1293,10 @@ def main():
     parser.add_argument('--influx-bucket', default='INT')
     parser.add_argument('--influx-token', 
                         default='0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w==')
+    
+    # Controller output verbosity
+    parser.add_argument('--verbose', action='store_true',
+                        help='Show verbose P4 controller output (route add/delete messages)')
     
     args = parser.parse_args()
     

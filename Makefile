@@ -6,6 +6,14 @@ ifndef P4SRC_FILE
 P4SRC_FILE = p4src/int_md.p4
 endif
 
+# Controller verbose output (default: suppressed)
+# Use VERBOSE=1 to show P4 table add/delete messages
+ifdef VERBOSE
+VERBOSE_FLAG = --verbose
+else
+VERBOSE_FLAG =
+endif
+
 # by default: start training
 all: train
 
@@ -42,12 +50,12 @@ train_simple:
 
 # run RL agent v4 (recommended) in training mode
 train:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 --log-every 10
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 --log-every 10 $(VERBOSE_FLAG)
 
 # run RL agent v4 in evaluation mode
 test:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1000 --weights-tag final
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag final $(VERBOSE_FLAG)
 
 # run RL agent v4 with best model
 test_best:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1000 --weights-tag best
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag best $(VERBOSE_FLAG)
