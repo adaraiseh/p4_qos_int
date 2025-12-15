@@ -14,7 +14,8 @@ from p4utils.utils.sswitch_thrift_API import SimpleSwitchThriftAPI
 
 class Controller:
 
-    def __init__(self):
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
         self.topo = load_topo("topology.json")
         self.controllers = {}
         self.forwarding_entries = {}
@@ -52,6 +53,14 @@ class Controller:
         """
         with open(os.devnull, "w") as devnull, redirect_stdout(devnull), redirect_stderr(devnull):
             return fn(*args, **kwargs)
+
+    def _call(self, fn, *args, **kwargs):
+        """
+        Wrapper that silences output unless self.verbose is True.
+        """
+        if self.verbose:
+            return fn(*args, **kwargs)
+        return self._silent_call(fn, *args, **kwargs)
 
     def connect_to_switches(self):
         for sw_name in self.topo.get_p4switches().keys():
@@ -130,7 +139,8 @@ class Controller:
         for sw_name, tables in self.forwarding_entries.items():
             controller = self.controllers[sw_name]
             for next_hop_ip, next_hop_mac in tables['switching'].items():
-                controller.table_add(
+                self._call(
+                    controller.table_add,
                     "port_forward.switching_table",
                     "set_dmac",
                     [next_hop_ip],
@@ -138,14 +148,16 @@ class Controller:
                 )
             for egress_port, port_smac in tables['mac'].items():
                 egress_port_hex = f"0x{egress_port:x}"
-                controller.table_add(
+                self._call(
+                    controller.table_add,
                     "port_forward.mac_rewriting_table",
                     "set_smac",
                     [egress_port_hex],
                     [port_smac]
                 )
             for (dst_prefix, dscp), (next_hop_ip, egress_port) in tables['lpm'].items():
-                controller.table_add(
+                self._call(
+                    controller.table_add,
                     "l3_forward.ipv4_lpm",
                     "ipv4_forward",
                     [dst_prefix, dscp],
@@ -160,10 +172,11 @@ class Controller:
         controller = self.controllers[sw_name]
         try:
             try:
-                controller.table_delete_match("l3_forward.ipv4_lpm", [dst_prefix, dscp])
+                self._call(controller.table_delete_match, "l3_forward.ipv4_lpm", [dst_prefix, dscp])
             except Exception:
                 pass
-            controller.table_add(
+            self._call(
+                controller.table_add,
                 "l3_forward.ipv4_lpm",
                 "ipv4_forward",
                 [dst_prefix, dscp],
@@ -195,7 +208,8 @@ class Controller:
             next_hop_mac = self.topo.node_to_node_mac(next_hop, sw_name)
 
         if next_hop_ip not in self.forwarding_entries[sw_name]['switching']:
-            controller.table_add(
+            self._call(
+                controller.table_add,
                 "port_forward.switching_table",
                 "set_dmac",
                 [next_hop_ip],
@@ -205,7 +219,8 @@ class Controller:
 
         if egress_port not in self.forwarding_entries[sw_name]['mac']:
             egress_port_hex = f"0x{egress_port:x}"
-            controller.table_add(
+            self._call(
+                controller.table_add,
                 "port_forward.mac_rewriting_table",
                 "set_smac",
                 [egress_port_hex],
@@ -342,7 +357,7 @@ class Controller:
                     self._upsert_lpm(sw, dst_prefix, dscp, before[0], before[1])
                 else:
                     try:
-                        self.controllers[sw].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix, dscp])
+                        self._call(self.controllers[sw].table_delete_match, "l3_forward.ipv4_lpm", [dst_prefix, dscp])
                         try:
                             del self.forwarding_entries[sw]['lpm'][(dst_prefix, dscp)]
                         except Exception:
@@ -376,7 +391,7 @@ class Controller:
                 self.update_path(alt_node, dst_prefix, dscp, nh_ip, eport)
             else:
                 try:
-                    self.controllers[alt_node].table_delete_match("l3_forward.ipv4_lpm", [dst_prefix, dscp])
+                    self._call(self.controllers[alt_node].table_delete_match, "l3_forward.ipv4_lpm", [dst_prefix, dscp])
                 except Exception:
                     pass
                 try:
@@ -508,7 +523,8 @@ class Controller:
                             self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
                         else:
                             try:
-                                self.controllers[ent["sw"]].table_delete_match(
+                                self._call(
+                                    self.controllers[ent["sw"]].table_delete_match,
                                     "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
                                 )
                                 try:
