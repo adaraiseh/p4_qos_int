@@ -11,6 +11,8 @@
 *.pcap
 pcap
 log
-training_files
+training_files/
+data/
+sync_results*
 topology.json
 int_md.json

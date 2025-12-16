@@ -50,12 +50,20 @@ train_simple:
 
 # run RL agent v4 (recommended) in training mode
 train:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 --log-every 10 $(VERBOSE_FLAG)
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 30000 --log-every 1 $(VERBOSE_FLAG)
+
+# resume RL agent v4 training from checkpoint (default: 50pct)
+# Usage: make resume or make resume CHECKPOINT=best
+ifndef CHECKPOINT
+CHECKPOINT = 50pct
+endif
+resume:
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 30000 --resume $(CHECKPOINT) --log-every 1 $(VERBOSE_FLAG)
 
 # run RL agent v4 in evaluation mode
 test:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag final $(VERBOSE_FLAG)
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag final $(VERBOSE_FLAG) --log-every 1
 
 # run RL agent v4 with best model
 test_best:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag best $(VERBOSE_FLAG)
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag best $(VERBOSE_FLAG) --log-every 1

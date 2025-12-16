@@ -23,6 +23,8 @@ class Controller:
         self.paths = []  # Human-readable list to store paths between hosts
         # Fast lookups for paths: (src_host, dst_host) -> [nodes...]
         self.path_map = {}
+        # Round-robin pointer for alternates per worst switch id
+        self.alt_rr_pos = {}  # sid -> last index used
 
         # === Parse switch id/name/role from rules/test/*-commands.txt (used for role-aware alt choices) ===
         self.rules_dir = Path("rules/test")
@@ -319,11 +321,16 @@ class Controller:
         sw_nodes.discard(prev_node)
         sw_nodes.discard(next_node)
 
-        candidates = sorted(sw_nodes)
-        for cand in candidates:
-            if self.net_graph.has_edge(prev_node, cand) and self.net_graph.has_edge(cand, next_node):
-                return cand
-        return None
+        # Stable ordering, but pick in round-robin fashion so repeated actions cycle alternates
+        candidates = [cand for cand in sorted(sw_nodes)
+                      if self.net_graph.has_edge(prev_node, cand) and self.net_graph.has_edge(cand, next_node)]
+        if not candidates:
+            return None
+
+        last_idx = self.alt_rr_pos.get(int(worst_switch_id), -1)
+        next_idx = (last_idx + 1) % len(candidates)
+        self.alt_rr_pos[int(worst_switch_id)] = next_idx
+        return candidates[next_idx]
 
     def has_alternate_for_worst(self, worst_switch_id: int, path: list[str]) -> bool:
         return self.find_alternate_for_worst(int(worst_switch_id), path) is not None

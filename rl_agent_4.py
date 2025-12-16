@@ -4,13 +4,24 @@ rl_agent_4.py - Simplified DQN for per-queue QoS path optimization using P4 INT 
 
 Key Design Principles:
 1. Single centralized DQN agent (not multi-agent) - eliminates coordination overhead
-2. Compact state space (13 features) - only essential normalized metrics
-3. Clear SLA-based reward - bounded, easy to understand credit assignment
-4. Focused action space (4 actions) - no-op + one change per queue
-5. Prioritized Experience Replay - learn from rare important events
-6. Proper episode boundaries - clear termination conditions
-7. Longer observation window (3s) - stable metrics
-8. Shorter cooldown (2s) - faster learning cycles
+2. Frame stacking (92 features) - stacked observations + stacked one-hot actions
+3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
+4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
+5. Focused action space (4 actions) - no-op + one change per queue
+6. Prioritized Experience Replay - learn from rare important events
+7. Proper episode boundaries - clear termination conditions
+8. Tuned timing for 100% post-action data capture
+
+State Composition (92 features):
+- Stacked Observations: 19 metrics × 4 frames = 76 features
+- Stacked Actions (one-hot): 4 × 4 frames = 16 features
+- Total: 92 features
+
+Benefits:
+- Agent sees velocity/trends (is latency rising or falling?)
+- Agent knows full action history via one-hot encoding
+- Example: [1,0,0,0, 0,0,1,0, 0,0,0,0, 0,1,0,0] = noop→video→noop→voice
+- Prevents sawtooth over-correction patterns
 
 Author: Research Team
 """
@@ -65,11 +76,17 @@ log.setLevel(logging.INFO)
 # =============================================================================
 # Network
 HIDDEN_DIM = 128
-STATE_DIM = 13  # Compact state: 3 queues × 4 features + 1 global
-ACTION_DIM = 4  # no-op, change_voice, change_video, change_best
+RAW_STATE_DIM = 19      # Raw state: 3 queues × 6 features + 1 global (metrics only)
+STACK_SIZE = 4          # Frame stacking: keep last 4 states for velocity/trend detection
+ACTION_DIM = 4          # no-op, change_voice, change_video, change_best
+# State composition: stacked observations + stacked one-hot actions
+# Observations: 19 metrics × 4 frames = 76
+# Actions: 4 (one-hot) × 4 frames = 16
+# Total: 76 + 16 = 92
+STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)  # 92 input features
 
 # Learning
-LR = 3e-4
+LR = 1e-5  # Reduced from 1e-4 to prevent weight oscillation (fix limit cycle)
 GAMMA = 0.95  # Lower discount - focus on immediate effects of routing changes
 BATCH_SIZE = 32
 MIN_REPLAY_SIZE = 500  # Start learning much sooner
@@ -84,22 +101,23 @@ PER_BETA_STEPS = 10_000
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 5_000
+EPS_DECAY_STEPS = 10_000  # Extended from 5k to match slower LR
 
-# Target network
-TARGET_UPDATE_FREQ = 100  # Hard update every N steps
-TAU = 0.005  # Soft update rate (if using soft updates)
+# Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
+TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
 
-# Environment
-WINDOW_SECONDS = 2  # Longer window for stable metrics
-SAFETY_LAG_MS = 500
-COOLDOWN_SECONDS = 1.0  # Shorter cooldown for faster learning
-DELAY_AFTER_ACTION = 2.5
-DELAY_NO_ACTION = 0.1
+# Environment timing - tuned for 100% post-action data capture
+# Based on sync test results: first_change ~0.28s, query RTT ~0.3s
+# Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
+WINDOW_SECONDS = 3          # 3-second observation window
+SAFETY_LAG_MS = 500         # 500ms safety lag for InfluxDB
+COOLDOWN_SECONDS = 0.5      # Short cooldown for faster learning
+DELAY_AFTER_ACTION = 4.0    # Wait 4s for 100% post-action data (3+0.5+0.3+margin)
+DELAY_NO_ACTION = 1.0       # Low-pass filter: smooth observations during stable periods
 
 # Episode
 MAX_EPISODE_STEPS = 100
-SLA_STREAK_TO_END = 15  # End episode early if SLA consistently met
+# Note: No early termination - let agent learn to maintain good state, not just fix bad state
 
 # QoS thresholds (ms) - for reward calculation
 SLA_THRESHOLDS = {
@@ -115,13 +133,14 @@ UTIL_CAP = 100.0  # percentage
 
 # Reward weights - TUNED for stability
 REWARD_SLA_MET_SCALE = 1.0          # Max reward per queue when lat=0
-REWARD_SLA_VIOLATED_SCALE = 1.5     # Penalty multiplier for violations
-REWARD_DROP_PENALTY = 1.0           # INCREASED: Drops are actionable signal
-REWARD_ACTION_COST = 0.05           # Reduced: Don't discourage necessary actions
-REWARD_IMPROVEMENT_BONUS = 0.5      # Bonus for improving from previous state
+REWARD_SLA_VIOLATED_SCALE = 0.8     # Reduced: latency less punishing than drops
+REWARD_DROP_PENALTY = 1.5           # Drops are most punishing (with sqrt compression)
+REWARD_ACTION_COST = 0.25           # Make actions expensive - default to No-Op unless major SLA violation
+# REWARD_IMPROVEMENT_BONUS removed - was causing instability by rewarding random jitter
+# Frame stacking now provides velocity information instead
 
 # Soft margin around SLA (reduces reward flip-flopping)
-SLA_SOFT_MARGIN = 0.1  # 10% buffer zone around SLA threshold
+SLA_SOFT_MARGIN = 0.2  # 20% buffer zone - ignore measurement jitter
 
 # =============================================================================
 #                        PRIORITIZED REPLAY BUFFER
@@ -403,9 +422,15 @@ class DQNAgent:
         # Update priorities
         self.replay_buffer.update_priorities(indices, td_errors)
         
-        # Update target network periodically
-        if self.step_count % TARGET_UPDATE_FREQ == 0:
-            self.target_net.load_state_dict(self.online_net.state_dict())
+        # Soft update target network (Polyak averaging) - every step
+        # This smooths Q-value evolution instead of sudden jumps from hard copies
+        for target_param, online_param in zip(
+            self.target_net.parameters(),
+            self.online_net.parameters()
+        ):
+            target_param.data.copy_(
+                TAU * online_param.data + (1.0 - TAU) * target_param.data
+            )
         
         self.last_loss = loss.item()
         self.losses.append(self.last_loss)
@@ -455,14 +480,34 @@ class QoSRoutingEnv:
     """
     Environment for QoS-aware routing optimization using P4 INT metrics.
     
-    State: 13 features
-      - Per queue (3 queues × 4 features = 12):
-        - lat_ratio: p95 latency / SLA threshold, clipped to [0, 2]
-        - drop_norm: drop rate normalized to [0, 1]
-        - util_norm: tx utilization normalized to [0, 1]
-        - alt_available: 1.0 if alternate path exists, 0.0 otherwise
-      - Global (1 feature):
-        - max_pressure: maximum pressure across all queues
+    State: 92 features (stacked observations + stacked one-hot actions)
+      Frame stacking provides velocity/trend information to detect if metrics
+      are rising or falling, preventing over-correction (sawtooth patterns).
+      One-hot action history helps agent distinguish "I caused this" vs "happened naturally".
+      
+      State composition:
+        - Stacked observations (76 features): 19 metrics × 4 frames
+        - Stacked actions (16 features): 4 one-hot × 4 frames
+        - Total: 92 features
+      
+      Raw observation (19 features):
+        - Per queue (3 queues × 6 features = 18):
+          - lat_ratio: log1p(p95 latency / SLA threshold)
+          - drop_norm: drop rate normalized to [0, 1]
+          - util_norm: tx utilization normalized to [0, 1]
+          - alt_available: 1.0 if alternate path exists, 0.0 otherwise
+          - bottleneck_pressure: congestion at the bottleneck switch [0, 1]
+          - bottleneck_role: switch type (0=none, 0.33=tor, 0.66=agg, 1.0=core)
+        - Global (1 feature):
+          - max_pressure: maximum pressure across all queues
+      
+      Action one-hot encoding (4 features per action):
+        - Action 0 (No-op):       [1, 0, 0, 0]
+        - Action 1 (Voice):       [0, 1, 0, 0]
+        - Action 2 (Video):       [0, 0, 1, 0]
+        - Action 3 (Best-effort): [0, 0, 0, 1]
+      
+      State layout: [obs_t-3, obs_t-2, obs_t-1, obs_t, act_t-3, act_t-2, act_t-1, act_t]
     
     Actions: 4
       - 0: No-op (do nothing)
@@ -471,10 +516,12 @@ class QoSRoutingEnv:
       - 3: Change best-effort path (qid=7)
     
     Reward:
-      - +1.0 per queue meeting SLA
-      - -1.5 × violation_ratio per queue violating SLA
-      - -0.3 × drop_norm penalty
-      - -0.1 action cost (for non-noop actions)
+      - +1.0 per queue meeting SLA (with soft margin)
+      - -0.8 × violation_ratio per queue violating SLA
+      - -1.5 × sqrt(drop_norm) penalty (drops most punishing)
+      - -0.05 action cost (for non-noop actions)
+      - Symmetric clipping to [-2.5, +2.5]
+      - NO improvement bonus (frame stacking provides velocity instead)
     """
     
     # Action to queue mapping
@@ -506,22 +553,54 @@ class QoSRoutingEnv:
         
         # Cache snapshots for comparison
         self.last_snapshot = None
-        self.prev_snapshot = None  # For improvement tracking
         
-        # Reward baseline (exponential moving average)
-        self.reward_ema = 0.0
-        self.reward_ema_alpha = 0.1  # Smoothing factor
+        # Frame stacking for velocity/trend detection
+        # Stores last STACK_SIZE raw observation states (each 19-dim)
+        self.frame_stack: deque = deque(maxlen=STACK_SIZE)
+        
+        # Action stacking for causality tracking
+        # Stores last STACK_SIZE actions as one-hot vectors (each 4-dim)
+        self.action_stack: deque = deque(maxlen=STACK_SIZE)
+        
+        # Preserve action history across episodes to avoid "Reset Amnesia"
+        # Network switches persist, so agent should remember what it did
+        self.prev_episode_actions: Optional[deque] = None
+        
     
     def reset(self) -> np.ndarray:
-        """Reset episode and return initial state."""
+        """Reset episode and return initial stacked state.
+        
+        Note: Action history is preserved across episodes to avoid "Reset Amnesia".
+        Network switches persist their state, so the agent needs to remember
+        what actions it took previously to understand the current network state.
+        """
         self.episode_step = 0
         self.sla_streak = 0
         self.last_action = 0
         self.last_action_time = time.monotonic()
         
+        # Collect initial snapshot
         self.last_snapshot = self._collect_snapshot()
-        self.prev_snapshot = None  # No previous for first step
-        return self._build_state(self.last_snapshot)
+        raw_state = self._build_raw_state(self.last_snapshot)
+        
+        # Initialize frame stack with copies of initial observation
+        self.frame_stack.clear()
+        for _ in range(STACK_SIZE):
+            self.frame_stack.append(raw_state.copy())
+        
+        # Preserve action history across episodes (fix "Reset Amnesia")
+        # Network state persists, so agent should remember its previous actions
+        if self.prev_episode_actions is not None:
+            # Use actions from previous episode
+            self.action_stack = deque(self.prev_episode_actions, maxlen=STACK_SIZE)
+        else:
+            # First episode: initialize with no-ops
+            noop_onehot = self._action_to_onehot(0)
+            self.action_stack.clear()
+            for _ in range(STACK_SIZE):
+                self.action_stack.append(noop_onehot.copy())
+        
+        return self._build_stacked_state()
     
     def _time_window(self) -> Tuple[str, str]:
         """Get time window for queries."""
@@ -554,6 +633,9 @@ class QoSRoutingEnv:
             'hot_dst_ip': None,
             'alt_exists': False,
             'bottleneck_sid': None,
+            'bottleneck_drop': 0.0,  # Bottleneck switch drop rate
+            'bottleneck_lat': 0.0,   # Bottleneck switch latency
+            'bottleneck_role': 'other',  # Bottleneck switch role (tor/agg/core/other)
             'path_nodes': [],
         } for qid in QIDS}
         
@@ -703,21 +785,35 @@ class QoSRoutingEnv:
         
         snap_q['bottleneck_sid'] = best_sid
         
+        # Store bottleneck metrics for state representation
+        if best_sid is not None:
+            bn_metrics = rows.get(best_sid, {'drop': 0, 'lat': 0})
+            snap_q['bottleneck_drop'] = bn_metrics.get('drop', 0)
+            snap_q['bottleneck_lat'] = bn_metrics.get('lat', 0)
+            snap_q['bottleneck_role'] = self.controller.switch_id_role.get(best_sid, 'other')
+        
         # Check if alternate path exists
         if best_sid is not None:
             snap_q['alt_exists'] = self.controller.has_alternate_for_worst(best_sid, path)
     
-    def _build_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
+    def _build_raw_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Build compact 13-dimensional state vector.
+        Build 19-dimensional raw observation vector with bottleneck information.
+        (Actions are stacked separately as one-hot vectors)
         
         Layout:
-          [0-3]: Voice (lat_ratio, drop_norm, util_norm, alt_available)
-          [4-7]: Video
-          [8-11]: Best-effort
-          [12]: Global max pressure
+          [0-5]: Voice (lat_ratio, drop_norm, util_norm, alt_available, bn_pressure, bn_role)
+          [6-11]: Video
+          [12-17]: Best-effort
+          [18]: Global max pressure
+        
+        Args:
+            snapshot: Metrics snapshot from InfluxDB
         """
-        state = np.zeros(STATE_DIM, dtype=np.float32)
+        state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
+        
+        # Role encoding: none=0, tor=0.33, agg=0.66, core=1.0
+        role_map = {'other': 0.0, 'tor': 0.33, 'agg': 0.66, 'core': 1.0}
         
         pressures = []
         idx = 0
@@ -725,7 +821,7 @@ class QoSRoutingEnv:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             
-            # --- FIXED: Log-Space Latency ---
+            # --- Log-Space Latency ---
             # Standardize: ratio = 1.0 means we are AT the SLA.
             # np.log1p(x) calculates ln(1+x).
             # If lat = 0, ratio = 0 -> val = 0.0
@@ -743,17 +839,58 @@ class QoSRoutingEnv:
             
             alt_avail = 1.0 if q['alt_exists'] else 0.0
             
-            state[idx:idx+4] = [lat_metric, drop_norm, util_norm, alt_avail]
-            idx += 4
+            # Bottleneck pressure (combined congestion metric at bottleneck switch)
+            bn_drop = min(q.get('bottleneck_drop', 0), DROP_CAP) / DROP_CAP
+            bn_lat = min(q.get('bottleneck_lat', 0), sla) / sla
+            bottleneck_pressure = 0.6 * bn_drop + 0.4 * bn_lat
+            
+            # Bottleneck role encoding
+            bottleneck_role_enc = role_map.get(q.get('bottleneck_role', 'other'), 0.0)
+            
+            state[idx:idx+6] = [lat_metric, drop_norm, util_norm, alt_avail, 
+                                bottleneck_pressure, bottleneck_role_enc]
+            idx += 6
             
             # Track pressure (Weighted sum for global context)
             pressure = 0.5 * lat_metric + 0.3 * drop_norm + 0.2 * util_norm
             pressures.append(pressure)
         
         # Global max pressure
-        state[12] = max(pressures) if pressures else 0.0
+        state[18] = max(pressures) if pressures else 0.0
         
         return state
+    
+    def _action_to_onehot(self, action: int) -> np.ndarray:
+        """Convert action index to one-hot vector."""
+        onehot = np.zeros(ACTION_DIM, dtype=np.float32)
+        onehot[action] = 1.0
+        return onehot
+    
+    def _build_stacked_state(self) -> np.ndarray:
+        """
+        Build stacked state from observation stack + action stack.
+        
+        Returns:
+            92-dimensional state vector:
+              - [0-75]: Stacked observations (19 × 4 = 76 features)
+              - [76-91]: Stacked one-hot actions (4 × 4 = 16 features)
+            
+        Layout: [obs_t-3, obs_t-2, obs_t-1, obs_t, act_t-3, act_t-2, act_t-1, act_t]
+            
+        This allows the agent to see:
+        - Trends: If latency is rising or falling (from observation history)
+        - Causality: Full action history as one-hot vectors
+        - Example: If action_stack = [[1,0,0,0], [0,0,1,0], [1,0,0,0], [0,1,0,0]]
+                   means: noop → video → noop → voice
+        """
+        # Concatenate observations: oldest first, newest last
+        stacked_obs = np.concatenate(list(self.frame_stack), axis=0)
+        
+        # Concatenate one-hot actions: oldest first, newest last
+        stacked_actions = np.concatenate(list(self.action_stack), axis=0)
+        
+        # Combine: [76 obs features] + [16 action features] = 92 total
+        return np.concatenate([stacked_obs, stacked_actions], axis=0)
     
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
@@ -780,12 +917,11 @@ class QoSRoutingEnv:
         """
         Compute reward based on SLA compliance with improved stability.
         
-        Key improvements:
+        Key features:
         1. Soft margin around SLA to reduce flip-flopping
-        2. Higher drop penalty (more actionable signal)
-        3. Improvement bonus (credit for getting better)
-        4. Tanh compression to bound extreme values smoothly
-        5. EMA baseline subtraction for variance reduction
+        2. Higher drop penalty (drops are most actionable)
+        3. Tanh compression to bound extreme values smoothly [-2.5, +2.5]
+        4. Small action cost to discourage unnecessary changes
         
         Returns:
             (reward, info_dict)
@@ -799,10 +935,10 @@ class QoSRoutingEnv:
             lat = q['lat_p95']
             
             # Calculate ratio with soft margin
-            # SLA_SOFT_MARGIN=0.1 means 90-110% of SLA is "neutral zone"
+            # SLA_SOFT_MARGIN=0.2 means 80-120% of SLA is "neutral zone"
             ratio = lat / sla
-            margin_low = 1.0 - SLA_SOFT_MARGIN   # 0.9
-            margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.1
+            margin_low = 1.0 - SLA_SOFT_MARGIN   # 0.8
+            margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.2
             
             if ratio <= margin_low:
                 # Clearly under SLA: positive reward
@@ -826,10 +962,11 @@ class QoSRoutingEnv:
             
             raw_reward += component
             
-            # 2. Drop Penalty - SIGNIFICANTLY INCREASED
-            # Drops are a clearer signal of actionable congestion
-            drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
-            drop_penalty = REWARD_DROP_PENALTY * drop_norm
+            # 2. Drop Penalty - sqrt compression for stability
+            # Drops are most punishing but sqrt reduces spike sensitivity
+            # sqrt(x): 0.25→0.5, 0.5→0.71, 1.0→1.0 (compresses low-mid range)
+            drop_raw = min(q['drop_p95'], DROP_CAP) / DROP_CAP
+            drop_penalty = REWARD_DROP_PENALTY * np.sqrt(drop_raw)
             raw_reward -= drop_penalty
             
             # Store per-queue info for debugging
@@ -840,71 +977,31 @@ class QoSRoutingEnv:
                 'drop_penalty': drop_penalty
             }
         
-        # 3. Improvement Bonus
-        # Reward getting better compared to previous step
-        improvement_bonus = 0.0
-        if self.prev_snapshot is not None:
-            for qid in QIDS:
-                prev_lat = self.prev_snapshot[qid]['lat_p95']
-                curr_lat = snapshot[qid]['lat_p95']
-                sla = SLA_THRESHOLDS[qid]
-                
-                # Improvement = reduction in latency ratio
-                prev_ratio = prev_lat / sla
-                curr_ratio = curr_lat / sla
-                improvement = prev_ratio - curr_ratio
-                
-                # Only reward improvement, don't penalize degradation (already penalized above)
-                if improvement > 0:
-                    improvement_bonus += REWARD_IMPROVEMENT_BONUS * min(improvement, 0.5)
-                
-                # Drop improvement
-                prev_drop = self.prev_snapshot[qid]['drop_p95']
-                curr_drop = snapshot[qid]['drop_p95']
-                drop_improvement = (prev_drop - curr_drop) / max(DROP_CAP, 1)
-                if drop_improvement > 0:
-                    improvement_bonus += REWARD_IMPROVEMENT_BONUS * 0.5 * min(drop_improvement, 1.0)
-        
-        raw_reward += improvement_bonus
-        info['improvement_bonus'] = improvement_bonus
-        
-        # 4. Action Cost (reduced - don't discourage necessary actions)
+        # 3. Action Cost (reduced - don't discourage necessary actions)
         if action != 0:
             raw_reward -= REWARD_ACTION_COST
         
-        # 5. Stability: Soft clipping with tanh instead of hard clip
-        # Maps roughly [-10, +5] to [-3, +2.5] range
-        if raw_reward < 0:
-            reward = -3.0 * np.tanh(-raw_reward / 3.0)
-        else:
-            reward = 2.5 * np.tanh(raw_reward / 2.5)
+        # 4. Stability: Symmetric soft clipping with tanh
+        # Maps to [-2.5, +2.5] range - symmetric to reduce bias
+        reward = 2.5 * np.tanh(raw_reward / 2.5)
         
-        # 6. Variance Reduction: Subtract EMA baseline
-        # This helps the agent distinguish its actions from environmental noise
-        adjusted_reward = reward - self.reward_ema
-        self.reward_ema = self.reward_ema * (1 - self.reward_ema_alpha) + reward * self.reward_ema_alpha
-        
-        info['raw_reward'] = raw_reward
-        info['clipped_reward'] = reward
-        info['adjusted_reward'] = adjusted_reward
-        info['reward_ema'] = self.reward_ema
-        info['total_reward'] = reward  # Keep using clipped reward for training
+        info['raw_reward'] = raw_reward  # Pre-clipping for debugging
         
         return reward, info
     
-    def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> bool:
+    def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str]]:
         """
         Apply routing action.
         
         Returns:
-            True if action was successfully applied
+            (ok, alt_switch_name) where ok indicates if action succeeded
         """
         if action == 0:
-            return False  # No-op
+            return False, None  # No-op
         
         qid = self.ACTION_TO_QID.get(action)
         if qid is None:
-            return False
+            return False, None
         
         q = snapshot[qid]
         src_ip = q.get('hot_src_ip')
@@ -914,12 +1011,12 @@ class QoSRoutingEnv:
         
         if not (src_ip and dst_ip and bottleneck_sid):
             log.warning(f"Cannot apply action {action}: missing path info for qid={qid}")
-            return False
+            return False, None
         
         alt = self.controller.find_alternate_for_worst(int(bottleneck_sid), path)
         if not alt:
             log.warning(f"Cannot apply action {action}: no alternate found for qid={qid}")
-            return False
+            return False, None
         
         ok, msg = self.controller.reroute_one_demand_symmetric(
             src_ip=src_ip, dst_ip=dst_ip, qid=qid,
@@ -931,7 +1028,7 @@ class QoSRoutingEnv:
         else:
             log.warning(f"[ACTION {action}] Reroute failed for qid={qid}: {msg}")
         
-        return ok
+        return ok, alt
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         """
@@ -942,6 +1039,7 @@ class QoSRoutingEnv:
         
         Returns:
             (next_state, reward, done, info)
+            next_state is a 76-dim stacked state (4 frames × 19 features)
         """
         self.episode_step += 1
         
@@ -949,7 +1047,7 @@ class QoSRoutingEnv:
         current_snapshot = self.last_snapshot
         
         # Apply action
-        action_applied = self._apply_action(action, current_snapshot)
+        action_applied, alt_used = self._apply_action(action, current_snapshot)
         
         # Update last action tracking
         if action != 0:
@@ -973,20 +1071,32 @@ class QoSRoutingEnv:
         else:
             self.sla_streak = 0
         
-        done = (
-            self.episode_step >= MAX_EPISODE_STEPS or
-            self.sla_streak >= SLA_STREAK_TO_END
-        )
+        # Episode ends only at MAX_EPISODE_STEPS - no early termination
+        # This lets agent learn "maintenance" (sustaining good state), not just "fixing"
+        done = self.episode_step >= MAX_EPISODE_STEPS
         
         info['episode_step'] = self.episode_step
         info['sla_streak'] = self.sla_streak
         info['action_applied'] = action_applied
+        if alt_used is not None:
+            info['alt_used'] = alt_used
         info['all_sla_met'] = all_sla_met
         
-        # Build next state and update snapshot history
-        next_state = self._build_state(next_snapshot)
-        self.prev_snapshot = self.last_snapshot  # Track for improvement bonus
+        # Build raw observation and add to frame stack
+        raw_state = self._build_raw_state(next_snapshot)
+        self.frame_stack.append(raw_state)
+        
+        # Convert action to one-hot and add to action stack
+        action_onehot = self._action_to_onehot(action)
+        self.action_stack.append(action_onehot)
+        
+        # Build stacked state (92-dim: 76 obs + 16 actions)
+        next_state = self._build_stacked_state()
         self.last_snapshot = next_snapshot
+        
+        # Save action history for next episode (fix "Reset Amnesia")
+        if done:
+            self.prev_episode_actions = deque(self.action_stack, maxlen=STACK_SIZE)
         
         return next_state, reward, done, info
     
@@ -996,34 +1106,44 @@ class QoSRoutingEnv:
     
     def write_training_metrics(self, step: int, agent_stats: Dict, 
                                 reward: float, action: int, info: Dict):
-        """Write training metrics to InfluxDB."""
+        """
+        Write training metrics to InfluxDB for Grafana monitoring.
+        
+        Metrics logged:
+        - step: Training step number
+        - action: Action taken (0=noop, 1=voice, 2=video, 3=best)
+        - reward: Actual reward (tanh-clipped to [-2.5, +2.5])
+        - raw_reward: Pre-clipping reward for debugging
+        - eps: Epsilon (exploration rate)
+        - avg_loss: Average DQN loss over last 100 steps
+        - avg_reward_100: Rolling average reward over last 100 steps
+        - buffer_size: Replay buffer size
+        - episode_step: Step within current episode
+        - sla_met_count: Number of queues meeting SLA (0-3)
+        - sla_streak: Consecutive steps with all SLAs met
+        - alt_used: Which alternate switch was used (if action taken)
+        """
         try:
             p = (
                 Point("rl_training_v4")
-                .tag("action", str(action))
                 .field("step", int(step))
+                .field("action", int(action))
                 .field("reward", float(reward))
                 .field("eps", float(agent_stats['eps']))
-                .field("beta", float(agent_stats['beta']))
-                .field("buffer_size", int(agent_stats['buffer_size']))
                 .field("avg_loss", float(agent_stats['avg_loss']))
                 .field("avg_reward_100", float(agent_stats['avg_reward']))
+                .field("buffer_size", int(agent_stats['buffer_size']))
                 .field("episode_step", int(info.get('episode_step', 0)))
-                .field("sla_streak", int(info.get('sla_streak', 0)))
                 .field("sla_met_count", len(info.get('sla_met', [])))
+                .field("sla_streak", int(info.get('sla_streak', 0)))
                 .time(datetime.utcnow())
             )
             
-            if agent_stats['last_loss'] is not None:
-                p = p.field("last_loss", float(agent_stats['last_loss']))
-            
-            # New metrics for reward debugging
+            # Optional fields
             if 'raw_reward' in info:
                 p = p.field("raw_reward", float(info['raw_reward']))
-            if 'improvement_bonus' in info:
-                p = p.field("improvement_bonus", float(info['improvement_bonus']))
-            if 'reward_ema' in info:
-                p = p.field("reward_ema", float(info['reward_ema']))
+            if info.get('alt_used'):
+                p = p.field("alt_used", str(info['alt_used']))
             
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
@@ -1044,16 +1164,17 @@ class QoSRoutingEnv:
 def train(args):
     """Main training loop."""
     log.info("=" * 60)
-    log.info("Starting RL Training - DQN Agent v4")
+    log.info("Starting RL Training - DQN Agent v4 (Stacked Obs + Actions)")
     log.info("=" * 60)
     log.info(f"Configuration:")
-    log.info(f"  State dim: {STATE_DIM}, Action dim: {ACTION_DIM}")
+    log.info(f"  State dim: {STATE_DIM} ({RAW_STATE_DIM} obs × {STACK_SIZE} + {ACTION_DIM} act × {STACK_SIZE})")
+    log.info(f"  Action dim: {ACTION_DIM} (one-hot encoded in state)")
     log.info(f"  Hidden dim: {HIDDEN_DIM}")
     log.info(f"  Learning rate: {LR}, Gamma: {GAMMA}")
     log.info(f"  Batch size: {BATCH_SIZE}, Replay capacity: {REPLAY_CAPACITY}")
     log.info(f"  Min replay: {MIN_REPLAY_SIZE}")
     log.info(f"  Epsilon: {EPS_START} -> {EPS_END} over {EPS_DECAY_STEPS} steps")
-    log.info(f"  Window: {WINDOW_SECONDS}s, Cooldown: {COOLDOWN_SECONDS}s")
+    log.info(f"  Timing: Window={WINDOW_SECONDS}s, Delay={DELAY_AFTER_ACTION}s, Cooldown={COOLDOWN_SECONDS}s")
     log.info(f"  Max steps: {args.steps}")
     log.info("=" * 60)
     
@@ -1070,6 +1191,17 @@ def train(args):
     env = QoSRoutingEnv(args.influx_bucket, args.influx_token, 
                         args.influx_org, args.influx_url)
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        resume_path = args.resume
+        if not resume_path.endswith('.pth'):
+            resume_path = os.path.join(args.save_dir, f"dqn_v4_{args.resume}.pth")
+        if os.path.exists(resume_path):
+            agent.load(resume_path)
+            log.info(f"Resumed training from {resume_path}")
+        else:
+            log.warning(f"Checkpoint not found: {resume_path}, starting fresh")
     
     # Training state
     total_steps = 0
@@ -1091,8 +1223,8 @@ def train(args):
     csv_file = open(csv_path, 'w', newline='')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
-        'step', 'episode', 'action', 'reward', 'raw_reward', 'improvement_bonus',
-        'reward_ema', 'sla_met', 'sla_streak', 'eps', 'loss', 'avg_reward_100', 'timestamp'
+        'step', 'episode', 'action', 'reward', 'raw_reward',
+        'sla_met', 'sla_streak', 'eps', 'loss', 'avg_reward_100', 'alt_used', 'timestamp'
     ])
     log.info(f"Training log: {csv_path}")
     
@@ -1132,14 +1264,12 @@ def train(args):
                 
                 if total_steps % args.log_every == 0:
                     loss_str = f"{stats['last_loss']:.4f}" if stats['last_loss'] is not None else "N/A"
-                    imp_bonus = info.get('improvement_bonus', 0)
-                    ema = info.get('reward_ema', 0)
+                    alt_used = info.get('alt_used', '-')
                     log.info(
                         f"[Step {total_steps}] "
                         f"action={action_name:6s} "
+                        f"alt={alt_used:4s} "
                         f"reward={reward:+.2f} "
-                        f"imp={imp_bonus:+.2f} "
-                        f"ema={ema:+.2f} "
                         f"eps={stats['eps']:.3f} "
                         f"buffer={stats['buffer_size']:5d} "
                         f"loss={loss_str:>8} "
@@ -1153,10 +1283,10 @@ def train(args):
                 # Write to local CSV
                 csv_writer.writerow([
                     total_steps, episode, action, reward,
-                    info.get('raw_reward', 0), info.get('improvement_bonus', 0),
-                    info.get('reward_ema', 0), len(info['sla_met']), info['sla_streak'],
-                    stats['eps'], stats['last_loss'] or 0, stats['avg_reward'],
-                    datetime.now().isoformat()
+                    info.get('raw_reward', 0),
+                    len(info['sla_met']), info['sla_streak'],
+                    stats['eps'], stats['avg_loss'], stats['avg_reward'],
+                    info.get('alt_used', ''), datetime.now().isoformat()
                 ])
                 csv_file.flush()  # Ensure data is written immediately
                 
@@ -1274,7 +1404,7 @@ def main():
                         help='Training or evaluation mode')
     
     # Training parameters
-    parser.add_argument('--steps', type=int, default=10000,
+    parser.add_argument('--steps', type=int, default=30000,
                         help='Total training/eval steps')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
@@ -1286,6 +1416,8 @@ def main():
                         help='Directory to save/load model weights')
     parser.add_argument('--weights-tag', default='final',
                         help='Weight file tag for evaluation (e.g., final, best, 50pct)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume training from checkpoint (e.g., 50pct, best, or path to .pth file)')
     
     # InfluxDB
     parser.add_argument('--influx-url', default='http://192.168.201.1:8086')
