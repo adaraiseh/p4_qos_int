@@ -41,6 +41,11 @@ class Controller:
         # Dict[int, list[change_record]]
         self.change_history_by_qid = {}
 
+        # === Usage tracking for alternatives (for RL state) ===
+        self.switch_usage = {}  # alt_name → usage_count
+        self.queue_changes = {0: 0, 1: 0, 7: 0}  # qid → total_changes
+        self.queue_last_change_step = {0: 0, 1: 0, 7: 0}  # qid → global_step
+
         self.connect_to_switches()
         self.build_network_graph()
         self.compute_forwarding_entries()  # also fills self.path_map
@@ -298,20 +303,35 @@ class Controller:
         return len(cur_tors & cand_tors) > 0
 
     def find_alternate_for_worst(self, worst_switch_id: int, path: list[str]):
+        """Legacy method for backward compatibility."""
+        alts = self.find_all_alternates(worst_switch_id, path)
+        if not alts:
+            return None
+        last_idx = self.alt_rr_pos.get(int(worst_switch_id), -1)
+        next_idx = (last_idx + 1) % len(alts)
+        self.alt_rr_pos[int(worst_switch_id)] = next_idx
+        return alts[next_idx]
+
+    def find_all_alternates(self, worst_switch_id: int, path: list[str]) -> list[str]:
+        """Return all valid alternative switches for the worst node in the path."""
         worst_name = self.switch_id_to_name.get(int(worst_switch_id))
         if not worst_name:
-            return None
+            return []
 
         role = self._role_of_sid(worst_switch_id)
         if role == "tor":
-            return None
+            return []
 
         if not path or worst_name not in path:
-            return None
+            return []
 
-        idx = path.index(worst_name)
+        try:
+            idx = path.index(worst_name)
+        except ValueError:
+            return []
+
         if idx == 0 or idx == len(path) - 1:
-            return None
+            return []
 
         prev_node = path[idx - 1]
         next_node = path[idx + 1]
@@ -321,19 +341,47 @@ class Controller:
         sw_nodes.discard(prev_node)
         sw_nodes.discard(next_node)
 
-        # Stable ordering, but pick in round-robin fashion so repeated actions cycle alternates
-        candidates = [cand for cand in sorted(sw_nodes)
-                      if self.net_graph.has_edge(prev_node, cand) and self.net_graph.has_edge(cand, next_node)]
-        if not candidates:
-            return None
-
-        last_idx = self.alt_rr_pos.get(int(worst_switch_id), -1)
-        next_idx = (last_idx + 1) % len(candidates)
-        self.alt_rr_pos[int(worst_switch_id)] = next_idx
-        return candidates[next_idx]
+        # Candidates must be connected to both prev and next nodes in the graph
+        candidates = []
+        for cand in sorted(sw_nodes):
+            has_prev = self.net_graph.has_edge(prev_node, cand)
+            has_next = self.net_graph.has_edge(cand, next_node)
+            if has_prev and has_next:
+                candidates.append(cand)
+        
+        # Debug logging
+        # print(f"[DEBUG] find_all_alternates: worst={worst_name}, prev={prev_node}, next={next_node}, candidates={candidates}")
+        
+        return candidates
 
     def has_alternate_for_worst(self, worst_switch_id: int, path: list[str]) -> bool:
-        return self.find_alternate_for_worst(int(worst_switch_id), path) is not None
+        return bool(self.find_all_alternates(int(worst_switch_id), path))
+    
+    def get_all_switch_ids(self) -> list[int]:
+        """Return sorted list of all known switch IDs."""
+        return sorted(list(self.switch_id_to_name.keys()))
+    
+    def track_usage(self, alt_name: str):
+        """Track usage count for an alternative switch."""
+        self.switch_usage[alt_name] = self.switch_usage.get(alt_name, 0) + 1
+    
+    def get_usage_count(self, alt_name: str) -> int:
+        """Get usage count for a switch."""
+        return self.switch_usage.get(alt_name, 0)
+    
+    def record_queue_change(self, qid: int, global_step: int):
+        """Track that a queue was changed at this global step."""
+        qid = int(qid)
+        self.queue_changes[qid] = self.queue_changes.get(qid, 0) + 1
+        self.queue_last_change_step[qid] = global_step
+    
+    def get_queue_history(self, qid: int, current_step: int) -> tuple:
+        """Returns (total_changes, steps_since_change) for a queue."""
+        qid = int(qid)
+        total = self.queue_changes.get(qid, 0)
+        last_change = self.queue_last_change_step.get(qid, 0)
+        return total, current_step - last_change
+
 
     # -----------------------
     # Per-queue change tracking / revert

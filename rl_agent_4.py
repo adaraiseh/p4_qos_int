@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 rl_agent_4.py - Simplified DQN for per-queue QoS path optimization using P4 INT reports
 
@@ -13,8 +14,8 @@ Key Design Principles:
 8. Tuned timing for 100% post-action data capture
 
 State Composition (92 features):
-- Stacked Observations: 19 metrics × 4 frames = 76 features
-- Stacked Actions (one-hot): 4 × 4 frames = 16 features
+- Stacked Observations: 169 metrics * 4 frames = 676 features
+- Stacked Actions (one-hot): 10 * 4 frames = 40 features
 - Total: 92 features
 
 Benefits:
@@ -75,20 +76,20 @@ log.setLevel(logging.INFO)
 #                           HYPERPARAMETERS
 # =============================================================================
 # Network
-HIDDEN_DIM = 128
-RAW_STATE_DIM = 19      # Raw state: 3 queues × 6 features + 1 global (metrics only)
-STACK_SIZE = 4          # Frame stacking: keep last 4 states for velocity/trend detection
-ACTION_DIM = 4          # no-op, change_voice, change_video, change_best
+HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
+RAW_STATE_DIM = 82      # Down from 169 (removed One-Hot IDs)
+STACK_SIZE = 6          # Keep at 6 to capture 4-step action delay
+ACTION_DIM = 10         # No-op + 3 queues * 3 alts
 # State composition: stacked observations + stacked one-hot actions
-# Observations: 19 metrics × 4 frames = 76
-# Actions: 4 (one-hot) × 4 frames = 16
-# Total: 76 + 16 = 92
-STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)  # 92 input features
+# Observations: 82 metrics * 6 frames = 492
+# Actions: 10 (one-hot) * 6 frames = 60
+# Total: 492 + 60 = 552
+STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
 
 # Learning
-LR = 1e-5  # Reduced from 1e-4 to prevent weight oscillation (fix limit cycle)
-GAMMA = 0.95  # Lower discount - focus on immediate effects of routing changes
-BATCH_SIZE = 32
+LR = 1e-4  # Increased from 1e-5 for faster convergence
+GAMMA = 0.99  # Kept at 0.99 (correct for 4-step delay: gamma^4 = 0.96)
+BATCH_SIZE = 64  # Increased from 32 for more stable gradients
 MIN_REPLAY_SIZE = 500  # Start learning much sooner
 REPLAY_CAPACITY = 50_000
 
@@ -101,7 +102,7 @@ PER_BETA_STEPS = 10_000
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 10_000  # Extended from 5k to match slower LR
+EPS_DECAY_STEPS = 5_000  # Reduced from 10k for faster exploration->exploitation
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
@@ -109,11 +110,11 @@ TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
 # Environment timing - tuned for 100% post-action data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
 # Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
-WINDOW_SECONDS = 3          # 3-second observation window
-SAFETY_LAG_MS = 500         # 500ms safety lag for InfluxDB
-COOLDOWN_SECONDS = 0.5      # Short cooldown for faster learning
-DELAY_AFTER_ACTION = 4.0    # Wait 4s for 100% post-action data (3+0.5+0.3+margin)
-DELAY_NO_ACTION = 1.0       # Low-pass filter: smooth observations during stable periods
+WINDOW_SECONDS = 2          # 3-second observation window
+SAFETY_LAG_MS = 300         # 500ms safety lag for InfluxDB
+COOLDOWN_SECONDS = 0.0      # Short cooldown for faster learning
+DELAY_AFTER_ACTION = 2.5    # Wait 4s for 100% post-action data (3+0.5+0.3+margin)
+DELAY_NO_ACTION = 2.5       # Low-pass filter: smooth observations during stable periods
 
 # Episode
 MAX_EPISODE_STEPS = 100
@@ -131,11 +132,11 @@ QIDS = (0, 1, 7)
 DROP_CAP = 5.0  # drops per 100ms
 UTIL_CAP = 100.0  # percentage
 
-# Reward weights - TUNED for stability
-REWARD_SLA_MET_SCALE = 1.0          # Max reward per queue when lat=0
-REWARD_SLA_VIOLATED_SCALE = 0.8     # Reduced: latency less punishing than drops
-REWARD_DROP_PENALTY = 1.5           # Drops are most punishing (with sqrt compression)
-REWARD_ACTION_COST = 0.25           # Make actions expensive - default to No-Op unless major SLA violation
+# Reward weights - TUNED to prevent tanh saturation
+REWARD_SLA_MET_SCALE = 0.5          # Reduced from 1.0
+REWARD_SLA_VIOLATED_SCALE = 0.4     # Reduced from 0.8
+REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
+REWARD_ACTION_COST = 0.50           # Increased from 0.30 to reduce network churn
 # REWARD_IMPROVEMENT_BONUS removed - was causing instability by rewarding random jitter
 # Frame stacking now provides velocity information instead
 
@@ -480,57 +481,39 @@ class QoSRoutingEnv:
     """
     Environment for QoS-aware routing optimization using P4 INT metrics.
     
-    State: 92 features (stacked observations + stacked one-hot actions)
-      Frame stacking provides velocity/trend information to detect if metrics
-      are rising or falling, preventing over-correction (sawtooth patterns).
-      One-hot action history helps agent distinguish "I caused this" vs "happened naturally".
+    State: 552 features (6-frame stacking to capture 4-step action delay)
+      Frame stacking provides velocity/trend information.
       
-      State composition:
-        - Stacked observations (76 features): 19 metrics × 4 frames
-        - Stacked actions (16 features): 4 one-hot × 4 frames
-        - Total: 92 features
+      Raw observation (82 features):
+        - Per queue (27 features × 3 = 81):
+            - Basic metrics: lat_ratio, drop_norm, util_norm (3)
+            - Bottleneck: present, drop, lat (3)
+            - Alternatives (3 × 6 = 18):
+                - available, drop_vs_bn, lat_vs_bn, role, is_current, usage (6)
+            - History: total_changes, steps_since_change, has_pending (3)
+        - Global (1): max_pressure
       
-      Raw observation (19 features):
-        - Per queue (3 queues × 6 features = 18):
-          - lat_ratio: log1p(p95 latency / SLA threshold)
-          - drop_norm: drop rate normalized to [0, 1]
-          - util_norm: tx utilization normalized to [0, 1]
-          - alt_available: 1.0 if alternate path exists, 0.0 otherwise
-          - bottleneck_pressure: congestion at the bottleneck switch [0, 1]
-          - bottleneck_role: switch type (0=none, 0.33=tor, 0.66=agg, 1.0=core)
-        - Global (1 feature):
-          - max_pressure: maximum pressure across all queues
-      
-      Action one-hot encoding (4 features per action):
-        - Action 0 (No-op):       [1, 0, 0, 0]
-        - Action 1 (Voice):       [0, 1, 0, 0]
-        - Action 2 (Video):       [0, 0, 1, 0]
-        - Action 3 (Best-effort): [0, 0, 0, 1]
-      
-      State layout: [obs_t-3, obs_t-2, obs_t-1, obs_t, act_t-3, act_t-2, act_t-1, act_t]
-    
-    Actions: 4
-      - 0: No-op (do nothing)
-      - 1: Change voice path (qid=0)
-      - 2: Change video path (qid=1)
-      - 3: Change best-effort path (qid=7)
+    Actions: 10
+      - 0: No-op
+      - 1-3: Queue 0 -> Alt 0, 1, 2
+      - 4-6: Queue 1 -> Alt 0, 1, 2
+      - 7-9: Queue 7 -> Alt 0, 1, 2
     
     Reward:
-      - +1.0 per queue meeting SLA (with soft margin)
-      - -0.8 × violation_ratio per queue violating SLA
-      - -1.5 × sqrt(drop_norm) penalty (drops most punishing)
-      - -0.05 action cost (for non-noop actions)
-      - Symmetric clipping to [-2.5, +2.5]
-      - NO improvement bonus (frame stacking provides velocity instead)
+      - SLA-based with soft margin, drop penalty, action cost
     """
     
-    # Action to queue mapping
-    ACTION_TO_QID = {
-        0: None,  # No-op
-        1: 0,     # Voice
-        2: 1,     # Video
-        3: 7,     # Best-effort
+    # Action to (queue, alt_index) mapping
+    # alt_index is 0-based index into the available alternatives list
+    ACTION_MAP = {
+        0: None,           # No-op
+        1: (0, 0), 2: (0, 1), 3: (0, 2),  # Voice alts
+        4: (1, 0), 5: (1, 1), 6: (1, 2),  # Video alts
+        7: (7, 0), 8: (7, 1), 9: (7, 2),  # BE alts
     }
+    
+    MAX_ALTS = 3
+    NUM_SWITCHES = 10  # Standard topology size (a1-4, c1-2, t1-4)
     
     def __init__(self, bucket: str, token: str, org: str, url: str, verbose: bool = False):
         self.bucket = bucket
@@ -545,6 +528,17 @@ class QoSRoutingEnv:
         # Controller for routing changes
         self.controller = Controller(verbose=verbose)
         
+        # Initialize switch mapping for One-Hot encoding
+        # We need a stable mapping of switch IDs to indices 0..N-1
+        self.all_switch_ids = self.controller.get_all_switch_ids()
+        # Ensure we have at least NUM_SWITCHES capacity (padding if necessary)
+        # For this topology, we expect ~10 switches. 
+        self.sid_to_idx = {sid: i for i, sid in enumerate(self.all_switch_ids)}
+        log.info(f"Initialized switch mapping: {self.sid_to_idx}")
+        
+        # Global step counter (persists across episodes)
+        self.global_step = 0
+       
         # Episode state
         self.episode_step = 0
         self.sla_streak = 0
@@ -566,6 +560,10 @@ class QoSRoutingEnv:
         # Network switches persist, so agent should remember what it did
         self.prev_episode_actions: Optional[deque] = None
         
+        # Preserve observation history across episodes to avoid "Reset Amnesia"
+        # Network state persists, so agent should remember what it observed
+        self.prev_episode_frames: Optional[deque] = None
+        
     
     def reset(self) -> np.ndarray:
         """Reset episode and return initial stacked state.
@@ -583,10 +581,19 @@ class QoSRoutingEnv:
         self.last_snapshot = self._collect_snapshot()
         raw_state = self._build_raw_state(self.last_snapshot)
         
-        # Initialize frame stack with copies of initial observation
-        self.frame_stack.clear()
-        for _ in range(STACK_SIZE):
-            self.frame_stack.append(raw_state.copy())
+        # Debug assertion to catch dimension mismatches early
+        assert len(raw_state) == RAW_STATE_DIM, f"State dim mismatch: {len(raw_state)} != {RAW_STATE_DIM}"
+        
+        # Preserve observation history across episodes (fix "Reset Amnesia")
+        # Network state persists, so agent should remember what it observed
+        if self.prev_episode_frames is not None:
+            # We are continuing from a previous episode, so keep the observation history too!
+            self.frame_stack = deque(self.prev_episode_frames, maxlen=STACK_SIZE)
+        else:
+            # Cold start (only for the very first episode)
+            self.frame_stack.clear()
+            for _ in range(STACK_SIZE):
+                self.frame_stack.append(raw_state.copy())
         
         # Preserve action history across episodes (fix "Reset Amnesia")
         # Network state persists, so agent should remember its previous actions
@@ -684,16 +691,140 @@ class QoSRoutingEnv:
         except Exception as e:
             log.warning(f"Failed to query metrics: {e}")
         
-        # Get hottest demand and path info for each queue
-        for qid in QIDS:
-            hot = self._get_hottest_demand(qid)
-            if hot:
-                src_ip, dst_ip = hot
-                snapshot[qid]['hot_src_ip'] = src_ip
-                snapshot[qid]['hot_dst_ip'] = dst_ip
-                self._fill_path_info(qid, snapshot[qid])
+        # 2. Get Path and Bottleneck Info
+        # Also identify ALL relevant switches (bottlenecks + all alts) to query in one go
+        switches_to_query = set()
         
+        for qid in QIDS:
+            # Find hottest demand
+            hot = self._get_hottest_demand(qid)
+            if not hot:
+                log.info(f"[Snapshot] Queue {qid}: No hot demand found, skipping bottleneck detection")
+                continue
+            
+            src_ip, dst_ip = hot
+            log.info(f"[Snapshot] Queue {qid}: hot_demand=({src_ip}, {dst_ip})")
+            snapshot[qid]['hot_src_ip'] = src_ip
+            snapshot[qid]['hot_dst_ip'] = dst_ip
+            
+            # Get current path
+            path = self.controller.get_path_by_ips(src_ip, dst_ip)
+            if not path:
+                log.info(f"[Snapshot] Queue {qid}: No path found for ({src_ip}, {dst_ip})")
+                continue
+            
+            snapshot[qid]['path_nodes'] = list(path)
+            
+            # Local identification of bottleneck (based on previous knowledge? No, we don't have update stats yet)
+            # Actually, to identify the bottleneck, we MUST query path metrics first.
+            # So this has to be a two-step process:
+            # Step A: Get path nodes -> Query their metrics -> Find bottleneck
+            # Step B: Get alternatives for bottleneck -> Query Alt metrics
+            
+            # --- Step A: Path Metrics ---
+            sw_names = [n for n in path if isinstance(n, str) and n[0] in ('t', 'a', 'c')]
+            sw_ids = [self.controller.switch_name_to_id.get(n) for n in sw_names]
+            sw_ids = [int(s) for s in sw_ids if s is not None]
+            
+            if not sw_ids:
+                continue
+                
+            # Query just these path switches first to find bottleneck
+            path_metrics = self._query_switch_metrics(sw_ids)
+            
+            # Identify Bottleneck (SKIP ToR switches - they have no alternatives)
+            best_sid, best_score = None, -1.0
+            for sid in sw_ids:
+                # Skip ToR switches - they're at edge and have no alt paths
+                role = self.controller._role_of_sid(sid)
+                if role == 'tor':
+                    continue
+                
+                r = path_metrics.get(sid, {'drop': 0, 'lat': 0})
+                drop_norm = min(r['drop'], DROP_CAP) / DROP_CAP
+                lat_norm = min(r['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
+                score = 0.6 * drop_norm + 0.4 * lat_norm
+                if score > best_score:
+                    best_sid, best_score = sid, score
+            
+            snapshot[qid]['bottleneck_sid'] = best_sid
+            
+            if best_sid is not None:
+                # Store bottleneck stats
+                bm = path_metrics.get(best_sid, {'drop': 0, 'lat': 0})
+                snapshot[qid]['bottleneck_drop'] = bm['drop']
+                snapshot[qid]['bottleneck_lat'] = bm['lat']
+                snapshot[qid]['bottleneck_role'] = self.controller._role_of_sid(best_sid)
+                
+                # --- Step B: Alternatives ---
+                # Get alternatives for this bottleneck
+                alts = self.controller.find_all_alternates(best_sid, path)
+                log.info(f"[Snapshot] Queue {qid}: bottleneck={best_sid}, role={snapshot[qid]['bottleneck_role']}, alternatives={alts}")
+                
+                # Filter alts (ignore if name not known)
+                valid_alts = []
+                for alt_name in alts:
+                    alt_sid = self.controller.switch_name_to_id.get(alt_name)
+                    if alt_sid is not None:
+                        valid_alts.append((alt_name, int(alt_sid)))
+                        switches_to_query.add(int(alt_sid))
+                
+                snapshot[qid]['_candidate_alts'] = valid_alts
+        
+        # 3. Query Alternatives Metrics (Bulk)
+        if switches_to_query:
+            alt_metrics = self._query_switch_metrics(list(switches_to_query))
+            
+            # Fill alternative stats
+            for qid in QIDS:
+                candidates = snapshot[qid].get('_candidate_alts', [])
+                final_alts = []
+                for name, sid in candidates:
+                    m = alt_metrics.get(sid, {'drop': 0, 'lat': 0})
+                    final_alts.append({
+                        'name': name,
+                        'drop': m['drop'],
+                        'lat': m['lat']
+                    })
+                snapshot[qid]['alternatives'] = final_alts
+                snapshot[qid]['alt_exists'] = bool(final_alts)
+                
         return snapshot
+
+    def _query_switch_metrics(self, sw_ids: List[int]) -> Dict[int, Dict]:
+        """Query drop and latency for a list of switch IDs."""
+        if not sw_ids:
+            return {}
+            
+        sid_filter = " or ".join([f'r.switch_id == "{sid}"' for sid in sw_ids])
+        start, stop = self._time_window()
+        
+        flux = f'''
+        from(bucket:"{self.bucket}")
+            |> range(start:{start}, stop:{stop})
+            |> filter(fn: (r) => {sid_filter})
+            |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms" or r._measurement == "switch_latency")
+            |> toFloat()
+            |> group(columns:["switch_id", "_measurement"])
+            |> max(column:"_value")
+            |> group(columns:["switch_id"])
+            |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
+        '''
+        
+        results = {}
+        try:
+            tables = self.query_api.query(org=self.org, query=flux)
+            for table in tables or []:
+                for record in table.records:
+                    sid = int(record.values.get('switch_id', 0) or 0)
+                    results[sid] = {
+                        'drop': float(record.values.get('q_drop_rate_100ms', 0) or 0),
+                        'lat': float(record.values.get('switch_latency', 0) or 0),
+                    }
+        except Exception as e:
+            log.debug(f"Failed to query switch metrics: {e}")
+            
+        return results
     
     def _get_hottest_demand(self, qid: int) -> Optional[Tuple[str, str]]:
         """Get the demand with highest latency for a queue."""
@@ -798,65 +929,115 @@ class QoSRoutingEnv:
     
     def _build_raw_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Build 19-dimensional raw observation vector with bottleneck information.
+        Build 82-dimensional raw observation vector with relative metrics encoding.
         (Actions are stacked separately as one-hot vectors)
         
-        Layout:
-          [0-5]: Voice (lat_ratio, drop_norm, util_norm, alt_available, bn_pressure, bn_role)
-          [6-11]: Video
-          [12-17]: Best-effort
-          [18]: Global max pressure
+        Layout per queue (27 features):
+          [0-2]: Basic metrics (lat_ratio, drop_norm, util_norm)
+          [3-5]: Bottleneck info (present, drop, lat)
+          [6-23]: Alternatives 3 × 6 = 18 (available, drop_vs_bn, lat_vs_bn, role, is_current, usage)
+          [24-26]: History (total_changes, steps_since_change, has_pending)
         
-        Args:
-            snapshot: Metrics snapshot from InfluxDB
+        Global (1): Max pressure
+        
+        Total: 3×27 + 1 = 82 features
         """
         state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
         
-        # Role encoding: none=0, tor=0.33, agg=0.66, core=1.0
-        role_map = {'other': 0.0, 'tor': 0.33, 'agg': 0.66, 'core': 1.0}
+        # Role encoding: tor=0, agg=0.5, core=1.0
+        role_map = {'tor': 0.0, 'agg': 0.5, 'core': 1.0, 'other': 0.0}
         
         pressures = []
         idx = 0
+        
         for qid in QIDS:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             
-            # --- Log-Space Latency ---
-            # Standardize: ratio = 1.0 means we are AT the SLA.
-            # np.log1p(x) calculates ln(1+x).
-            # If lat = 0, ratio = 0 -> val = 0.0
-            # If lat = SLA, ratio = 1 -> val = 0.69
-            # If lat = 2*SLA, ratio = 2 -> val = 1.09
-            # If lat = 10*SLA, ratio = 10 -> val = 2.39 (Soft compression, no hard cap)
-            raw_ratio = q['lat_p95'] / sla
-            lat_metric = np.log1p(raw_ratio)
-            
-            # Drops are already capped/normalized in snapshot, but good to ensure range
+            # --- 1. Basic Metrics (3) ---
+            # Use LINEAR scaling (not log) for consistency with reward
+            lat_ratio = q['lat_p95'] / sla
             drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
-            
-            # Utilization remains linear [0, 1]
             util_norm = min(q['util_p95'], UTIL_CAP) / UTIL_CAP
             
-            alt_avail = 1.0 if q['alt_exists'] else 0.0
+            state[idx] = lat_ratio
+            state[idx+1] = drop_norm
+            state[idx+2] = util_norm
+            idx += 3
             
-            # Bottleneck pressure (combined congestion metric at bottleneck switch)
-            bn_drop = min(q.get('bottleneck_drop', 0), DROP_CAP) / DROP_CAP
-            bn_lat = min(q.get('bottleneck_lat', 0), sla) / sla
-            bottleneck_pressure = 0.6 * bn_drop + 0.4 * bn_lat
+            # --- 2. Bottleneck Info (3) ---
+            bn_sid = q.get('bottleneck_sid')
+            if bn_sid is not None:
+                state[idx] = 1.0  # Present
+                bn_drop = min(q.get('bottleneck_drop', 0), DROP_CAP) / DROP_CAP
+                bn_lat = q.get('bottleneck_lat', 0) / sla
+                state[idx+1] = bn_drop
+                state[idx+2] = bn_lat
+            else:
+                # No bottleneck identified
+                state[idx] = 0.0
+                bn_drop = 0.0
+                bn_lat = 0.0
             
-            # Bottleneck role encoding
-            bottleneck_role_enc = role_map.get(q.get('bottleneck_role', 'other'), 0.0)
+            idx += 3
             
-            state[idx:idx+6] = [lat_metric, drop_norm, util_norm, alt_avail, 
-                                bottleneck_pressure, bottleneck_role_enc]
-            idx += 6
+            # --- 3. Alternatives (3 × 6 = 18) ---
+            alts = q.get('alternatives', [])
+            path = q.get('path_nodes', [])
             
-            # Track pressure (Weighted sum for global context)
-            pressure = 0.5 * lat_metric + 0.3 * drop_norm + 0.2 * util_norm
+            # Normalize usage counts for this queue
+            max_usage = max(self.controller.get_usage_count(a['name']) for a in alts) if alts else 1
+            if max_usage == 0:
+                max_usage = 1
+            
+            for i in range(self.MAX_ALTS):
+                if i < len(alts):
+                    alt = alts[i]
+                    alt_name = alt['name']
+                    
+                    # Available
+                    state[idx] = 1.0
+                    
+                    # Relative metrics (vs bottleneck)
+                    alt_drop = min(alt.get('drop', 0), DROP_CAP) / DROP_CAP
+                    alt_lat = alt.get('lat', 0) / sla
+                    state[idx+1] = alt_drop - bn_drop  # Negative = better than bottleneck
+                    state[idx+2] = alt_lat - bn_lat
+                    
+                    # Role (topology info)
+                    alt_sid = self.controller.switch_name_to_id.get(alt_name)
+                    alt_role = self.controller._role_of_sid(alt_sid) if alt_sid else 'other'
+                    state[idx+3] = role_map.get(alt_role, 0.0)
+                    
+                    # Is on current path?
+                    state[idx+4] = 1.0 if alt_name in path else 0.0
+                    
+                    # Usage count (normalized)
+                    usage = self.controller.get_usage_count(alt_name)
+                    state[idx+5] = usage / max_usage
+                else:
+                    # No alternative at this index
+                    state[idx:idx+6] = 0.0
+                
+                idx += 6
+            
+            # --- 4. History (3) ---
+            total_changes, steps_since = self.controller.get_queue_history(qid, self.global_step)
+            has_pending = 1.0 if self.controller.has_pending_change_for_qid(qid) else 0.0
+            
+            # Normalize change counts (soft cap at 100)
+            state[idx] = min(total_changes, 100) / 100.0
+            # Normalize steps since change (soft cap at 1000)
+            state[idx+1] = min(steps_since, 1000) / 1000.0
+            state[idx+2] = has_pending
+            idx += 3
+            
+            # Track pressure for global feature
+            pressure = 0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm
             pressures.append(pressure)
         
         # Global max pressure
-        state[18] = max(pressures) if pressures else 0.0
+        state[idx] = max(pressures) if pressures else 0.0
         
         return state
     
@@ -871,9 +1052,9 @@ class QoSRoutingEnv:
         Build stacked state from observation stack + action stack.
         
         Returns:
-            92-dimensional state vector:
-              - [0-75]: Stacked observations (19 × 4 = 76 features)
-              - [76-91]: Stacked one-hot actions (4 × 4 = 16 features)
+            552-dimensional state vector:
+              - [0-491]: Stacked observations (82 * 6 = 492 features)
+              - [492-551]: Stacked one-hot actions (10 * 6 = 60 features)
             
         Layout: [obs_t-3, obs_t-2, obs_t-1, obs_t, act_t-3, act_t-2, act_t-1, act_t]
             
@@ -881,7 +1062,7 @@ class QoSRoutingEnv:
         - Trends: If latency is rising or falling (from observation history)
         - Causality: Full action history as one-hot vectors
         - Example: If action_stack = [[1,0,0,0], [0,0,1,0], [1,0,0,0], [0,1,0,0]]
-                   means: noop → video → noop → voice
+                   means: noop -> video -> noop -> voice
         """
         # Concatenate observations: oldest first, newest last
         stacked_obs = np.concatenate(list(self.frame_stack), axis=0)
@@ -894,10 +1075,7 @@ class QoSRoutingEnv:
     
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Get mask of valid actions.
-        
-        - No-op (0) is always valid
-        - Change actions (1-3) valid only if alternate exists and not in cooldown
+        Get mask of valid actions based on available alternatives.
         """
         mask = np.zeros(ACTION_DIM, dtype=bool)
         mask[0] = True  # No-op always valid
@@ -906,9 +1084,16 @@ class QoSRoutingEnv:
         in_cooldown = (now - self.last_action_time) < COOLDOWN_SECONDS
         
         if not in_cooldown:
-            for action, qid in self.ACTION_TO_QID.items():
-                if qid is not None:
-                    if snapshot[qid]['alt_exists'] and snapshot[qid]['bottleneck_sid'] is not None:
+            for action, mapping in self.ACTION_MAP.items():
+                if mapping is None:  # Skip no-op
+                    continue
+                qid, alt_idx = mapping
+                
+                # Check if this queue has enough alternatives
+                q = snapshot[qid]
+                if q.get('bottleneck_sid') is not None:
+                    alts = q.get('alternatives', [])
+                    if alt_idx < len(alts):
                         mask[action] = True
         
         return mask
@@ -991,44 +1176,50 @@ class QoSRoutingEnv:
     
     def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str]]:
         """
-        Apply routing action.
-        
-        Returns:
-            (ok, alt_switch_name) where ok indicates if action succeeded
+        Apply routing action based on explicit alternative selection.
         """
         if action == 0:
             return False, None  # No-op
         
-        qid = self.ACTION_TO_QID.get(action)
-        if qid is None:
+        # Parse action from map
+        mapping = self.ACTION_MAP.get(action)
+        if not mapping:
             return False, None
+            
+        qid, alt_idx = mapping
         
         q = snapshot[qid]
         src_ip = q.get('hot_src_ip')
         dst_ip = q.get('hot_dst_ip')
         bottleneck_sid = q.get('bottleneck_sid')
-        path = q.get('path_nodes', [])
+        alts = q.get('alternatives', [])
         
         if not (src_ip and dst_ip and bottleneck_sid):
-            log.warning(f"Cannot apply action {action}: missing path info for qid={qid}")
+            log.warning(f"Cannot apply action {action} (q={qid}): missing path info")
             return False, None
-        
-        alt = self.controller.find_alternate_for_worst(int(bottleneck_sid), path)
-        if not alt:
-            log.warning(f"Cannot apply action {action}: no alternate found for qid={qid}")
+            
+        # Check if requested alternative index exists
+        if alt_idx >= len(alts):
+            log.warning(f"Cannot apply action {action}: alt index {alt_idx} out of range ({len(alts)} avail)")
             return False, None
+            
+        target_alt = alts[alt_idx]
+        alt_name = target_alt['name']
         
         ok, msg = self.controller.reroute_one_demand_symmetric(
             src_ip=src_ip, dst_ip=dst_ip, qid=qid,
-            worst_switch_id=int(bottleneck_sid), alt_switch_name=alt
+            worst_switch_id=int(bottleneck_sid), alt_switch_name=alt_name
         )
         
         if ok:
-            log.info(f"[ACTION {action}] Rerouted qid={qid}: {src_ip}->{dst_ip} via {alt} (was bottleneck sid={bottleneck_sid})")
+            log.info(f"[ACTION {action}] Rerouted qid={qid} to Alt {alt_idx} ({alt_name}) [bn={bottleneck_sid}]")
+            # Track usage and history
+            self.controller.track_usage(alt_name)
+            self.controller.record_queue_change(qid, self.global_step)
         else:
-            log.warning(f"[ACTION {action}] Reroute failed for qid={qid}: {msg}")
+            log.warning(f"[ACTION {action}] Reroute failed: {msg}")
         
-        return ok, alt
+        return ok, alt_name
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         """
@@ -1039,8 +1230,10 @@ class QoSRoutingEnv:
         
         Returns:
             (next_state, reward, done, info)
-            next_state is a 76-dim stacked state (4 frames × 19 features)
+            next_state is a 716-dim stacked state
         """
+        # Increment global step counter (persists across episodes)
+        self.global_step += 1
         self.episode_step += 1
         
         # Get current snapshot
@@ -1094,9 +1287,10 @@ class QoSRoutingEnv:
         next_state = self._build_stacked_state()
         self.last_snapshot = next_snapshot
         
-        # Save action history for next episode (fix "Reset Amnesia")
+        # Save action and observation history for next episode (fix "Reset Amnesia")
         if done:
             self.prev_episode_actions = deque(self.action_stack, maxlen=STACK_SIZE)
+            self.prev_episode_frames = deque(self.frame_stack, maxlen=STACK_SIZE)
         
         return next_state, reward, done, info
     
@@ -1167,7 +1361,7 @@ def train(args):
     log.info("Starting RL Training - DQN Agent v4 (Stacked Obs + Actions)")
     log.info("=" * 60)
     log.info(f"Configuration:")
-    log.info(f"  State dim: {STATE_DIM} ({RAW_STATE_DIM} obs × {STACK_SIZE} + {ACTION_DIM} act × {STACK_SIZE})")
+    log.info(f"  State dim: {STATE_DIM} ({RAW_STATE_DIM} obs * {STACK_SIZE} + {ACTION_DIM} act * {STACK_SIZE})")
     log.info(f"  Action dim: {ACTION_DIM} (one-hot encoded in state)")
     log.info(f"  Hidden dim: {HIDDEN_DIM}")
     log.info(f"  Learning rate: {LR}, Gamma: {GAMMA}")
@@ -1259,16 +1453,24 @@ def train(args):
                 state = next_state
                 
                 # Logging
-                action_name = ['noop', 'voice', 'video', 'best'][action]
                 stats = agent.get_stats()
                 
                 if total_steps % args.log_every == 0:
                     loss_str = f"{stats['last_loss']:.4f}" if stats['last_loss'] is not None else "N/A"
-                    alt_used = info.get('alt_used', '-')
+                    # Map action to readable name
+                    if action == 0:
+                        action_name = "noop"
+                    elif 1 <= action <= 3:
+                        action_name = f"v0-alt{action-1}"
+                    elif 4 <= action <= 6:
+                        action_name = f"v1-alt{action-4}"
+                    elif 7 <= action <= 9:
+                        action_name = f"be-alt{action-7}"
+                    else:
+                        action_name = str(action)
                     log.info(
                         f"[Step {total_steps}] "
-                        f"action={action_name:6s} "
-                        f"alt={alt_used:4s} "
+                        f"action={action_name:8s} "
                         f"reward={reward:+.2f} "
                         f"eps={stats['eps']:.3f} "
                         f"buffer={stats['buffer_size']:5d} "
@@ -1367,7 +1569,16 @@ def evaluate(args):
             sla_met_total += len(info['sla_met'])
             sla_checks += len(QIDS)
             
-            action_name = ['noop', 'voice', 'video', 'best'][action]
+            if action == 0:
+                action_name = "noop"
+            elif 1 <= action <= 3:
+                action_name = f"voice-{action-1}"
+            elif 4 <= action <= 6:
+                action_name = f"video-{action-4}"
+            elif 7 <= action <= 9:
+                action_name = f"best-{action-7}"
+            else:
+                action_name = str(action)
             
             if step % args.log_every == 0:
                 log.info(
