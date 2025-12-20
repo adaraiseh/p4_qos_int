@@ -5,23 +5,24 @@ rl_agent_4.py - Simplified DQN for per-queue QoS path optimization using P4 INT 
 
 Key Design Principles:
 1. Single centralized DQN agent (not multi-agent) - eliminates coordination overhead
-2. Frame stacking (92 features) - stacked observations + stacked one-hot actions
+2. Frame stacking (426 features) - stacked observations + stacked one-hot actions
 3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
 4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
-5. Focused action space (4 actions) - no-op + one change per queue
+5. Focused action space (10 actions) - no-op + 3 queues × 3 alternates
 6. Prioritized Experience Replay - learn from rare important events
 7. Proper episode boundaries - clear termination conditions
 8. Tuned timing for 100% post-action data capture
+9. Queue-specific bottleneck detection and alternative metrics
 
-State Composition (92 features):
-- Stacked Observations: 169 metrics * 4 frames = 676 features
-- Stacked Actions (one-hot): 10 * 4 frames = 40 features
-- Total: 92 features
+State Composition (426 features):
+- Stacked Observations: 61 metrics * 6 frames = 366 features
+- Stacked Actions (one-hot): 10 * 6 frames = 60 features
+- Total: 426 features
 
 Benefits:
 - Agent sees velocity/trends (is latency rising or falling?)
 - Agent knows full action history via one-hot encoding
-- Example: [1,0,0,0, 0,0,1,0, 0,0,0,0, 0,1,0,0] = noop→video→noop→voice
+- Queue-specific metrics ensure accurate comparison between bottleneck and alternatives
 - Prevents sawtooth over-correction patterns
 
 Author: Research Team
@@ -34,6 +35,7 @@ import random
 import logging
 import argparse
 import csv
+import math
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Dict, List, Tuple, Optional
@@ -77,13 +79,13 @@ log.setLevel(logging.INFO)
 # =============================================================================
 # Network
 HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
-RAW_STATE_DIM = 82      # Down from 169 (removed One-Hot IDs)
+RAW_STATE_DIM = 61      # Simplified: added sla_met, bn_util, alt_util; removed role, usage, steps_since
 STACK_SIZE = 6          # Keep at 6 to capture 4-step action delay
 ACTION_DIM = 10         # No-op + 3 queues * 3 alts
 # State composition: stacked observations + stacked one-hot actions
-# Observations: 82 metrics * 6 frames = 492
+# Observations: 61 metrics * 6 frames = 366
 # Actions: 10 (one-hot) * 6 frames = 60
-# Total: 492 + 60 = 552
+# Total: 366 + 60 = 426
 STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
 
 # Learning
@@ -102,7 +104,7 @@ PER_BETA_STEPS = 10_000
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 5_000  # Reduced from 10k for faster exploration->exploitation
+EPS_DECAY_STEPS = 5_000
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
@@ -110,11 +112,14 @@ TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
 # Environment timing - tuned for 100% post-action data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
 # Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
-WINDOW_SECONDS = 2          # 3-second observation window
-SAFETY_LAG_MS = 300         # 500ms safety lag for InfluxDB
+WINDOW_SECONDS = 2          # 2-second observation window
+SAFETY_LAG_MS = 300         # 300ms safety lag for InfluxDB
 COOLDOWN_SECONDS = 0.0      # Short cooldown for faster learning
-DELAY_AFTER_ACTION = 2.5    # Wait 4s for 100% post-action data (3+0.5+0.3+margin)
+DELAY_AFTER_ACTION = 2.5    # Wait 2.5s for post-action data (2+0.3+margin)
 DELAY_NO_ACTION = 2.5       # Low-pass filter: smooth observations during stable periods
+
+# Freshness validation - minimum data points required per metric in window
+MIN_POINTS_PER_METRIC = 2   # Require at least 2 points to detect stale data
 
 # Episode
 MAX_EPISODE_STEPS = 100
@@ -131,14 +136,20 @@ QIDS = (0, 1, 7)
 # Normalization caps
 DROP_CAP = 5.0  # drops per 100ms
 UTIL_CAP = 100.0  # percentage
+LAT_RATIO_CAP = 3.0  # Cap latency ratio at 3x SLA (prevents instability)
+LAT_DIFF_CAP = 2.0   # Cap lat difference features to [-2, +2]
 
 # Reward weights - TUNED to prevent tanh saturation
 REWARD_SLA_MET_SCALE = 0.5          # Reduced from 1.0
 REWARD_SLA_VIOLATED_SCALE = 0.4     # Reduced from 0.8
 REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
-REWARD_ACTION_COST = 0.50           # Increased from 0.30 to reduce network churn
-# REWARD_IMPROVEMENT_BONUS removed - was causing instability by rewarding random jitter
-# Frame stacking now provides velocity information instead
+
+# Queue-specific action cost (replaces pressure-based approach)
+# Cost depends on whether the TARGETED queue's SLA is met:
+#   - If targeting a healthy queue → high cost (risky, don't break what works)
+#   - If targeting a sick queue → low cost (encouraged to fix)
+REWARD_ACTION_COST_HEALTHY = 0.3   # Cost when targeting a queue with SLA met
+REWARD_ACTION_COST_SICK = 0.05      # Cost when targeting a queue with SLA violated
 
 # Soft margin around SLA (reduces reward flip-flopping)
 SLA_SOFT_MARGIN = 0.2  # 20% buffer zone - ignore measurement jitter
@@ -481,16 +492,15 @@ class QoSRoutingEnv:
     """
     Environment for QoS-aware routing optimization using P4 INT metrics.
     
-    State: 552 features (6-frame stacking to capture 4-step action delay)
+    State: 426 features (6-frame stacking to capture 4-step action delay)
       Frame stacking provides velocity/trend information.
       
-      Raw observation (82 features):
-        - Per queue (27 features × 3 = 81):
-            - Basic metrics: lat_ratio, drop_norm, util_norm (3)
-            - Bottleneck: present, drop, lat (3)
-            - Alternatives (3 × 6 = 18):
-                - available, drop_vs_bn, lat_vs_bn, role, is_current, usage (6)
-            - History: total_changes, steps_since_change, has_pending (3)
+      Raw observation (61 features):
+        - Per queue (20 features × 3 = 60):
+            - Basic metrics: lat_ratio, drop_norm, util_norm, sla_met (4)
+            - Bottleneck: present, drop, lat, util (4)
+            - Alternatives (3 × 4 = 12):
+                - available, drop_vs_bn, lat_vs_bn, util_norm (4)
         - Global (1): max_pressure
       
     Actions: 10
@@ -589,6 +599,8 @@ class QoSRoutingEnv:
         if self.prev_episode_frames is not None:
             # We are continuing from a previous episode, so keep the observation history too!
             self.frame_stack = deque(self.prev_episode_frames, maxlen=STACK_SIZE)
+            # CRITICAL: Append current snapshot so t=now is present (not stale)
+            self.frame_stack.append(raw_state.copy())
         else:
             # Cold start (only for the very first episode)
             self.frame_stack.clear()
@@ -600,6 +612,8 @@ class QoSRoutingEnv:
         if self.prev_episode_actions is not None:
             # Use actions from previous episode
             self.action_stack = deque(self.prev_episode_actions, maxlen=STACK_SIZE)
+            # CRITICAL: Append no-op marker so t=now action slot is current
+            self.action_stack.append(self._action_to_onehot(0))
         else:
             # First episode: initialize with no-ops
             noop_onehot = self._action_to_onehot(0)
@@ -632,6 +646,7 @@ class QoSRoutingEnv:
         start, stop = self._time_window()
         
         # Initialize snapshot with defaults
+        # data_valid starts False, set True when we get real telemetry data
         snapshot = {qid: {
             'lat_p95': SLA_THRESHOLDS[qid] * 2,  # Default: 2x SLA (bad)
             'drop_p95': DROP_CAP,
@@ -644,6 +659,7 @@ class QoSRoutingEnv:
             'bottleneck_lat': 0.0,   # Bottleneck switch latency
             'bottleneck_role': 'other',  # Bottleneck switch role (tor/agg/core/other)
             'path_nodes': [],
+            'data_valid': False,  # Track telemetry validity
         } for qid in QIDS}
         
         # Query aggregated metrics
@@ -674,6 +690,9 @@ class QoSRoutingEnv:
         union(tables:[lat_p95, drop_p95, util_p95])
         '''
         
+        # Track which metrics were received per queue
+        metrics_received = {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS}
+        
         try:
             tables = self.query_api.query(org=self.org, query=flux)
             for table in tables or []:
@@ -686,24 +705,55 @@ class QoSRoutingEnv:
                         value = record.get_value()
                         if value is not None:
                             snapshot[qid][measurement] = float(value)
+                            # Track which metrics we received (not defaults)
+                            if measurement == 'lat_p95':
+                                metrics_received[qid]['lat'] = True
+                            elif measurement == 'drop_p95':
+                                metrics_received[qid]['drop'] = True
+                            elif measurement == 'util_p95':
+                                metrics_received[qid]['util'] = True
                     except (ValueError, TypeError):
                         continue
         except Exception as e:
             log.warning(f"Failed to query metrics: {e}")
         
-        # 2. Get Path and Bottleneck Info
-        # Also identify ALL relevant switches (bottlenecks + all alts) to query in one go
-        switches_to_query = set()
+        # Mark data_valid only if ALL 3 metrics were returned, values are sane, AND data is fresh
+        for qid in QIDS:
+            m = metrics_received[qid]
+            metrics_present = m['lat'] and m['drop'] and m['util']
+            values_sane = self._metric_sane(snapshot[qid]) if metrics_present else False
+            # Check freshness (data points in window)
+            data_fresh = self._check_data_freshness(qid)
+            snapshot[qid]['data_valid'] = metrics_present and values_sane and data_fresh
+            snapshot[qid]['data_fresh'] = data_fresh  # For debugging
+        
+        # Log telemetry status for monitoring
+        valid_count = sum(1 for qid in QIDS if snapshot[qid]['data_valid'])
+        if valid_count < len(QIDS):
+            missing = [qid for qid in QIDS if not snapshot[qid]['data_valid']]
+            reasons = []
+            for qid in missing:
+                if not metrics_received[qid]['lat'] or not metrics_received[qid]['drop'] or not metrics_received[qid]['util']:
+                    reasons.append(f"q{qid}:missing_metrics")
+                elif not self._metric_sane(snapshot[qid]):
+                    reasons.append(f"q{qid}:insane_values")
+                elif not snapshot[qid].get('data_fresh', True):
+                    reasons.append(f"q{qid}:stale_data")
+            log.warning(f"[Telemetry] Invalid data for queues {missing} ({', '.join(reasons)}) - only {valid_count}/{len(QIDS)} valid")
+        
+        # 2. Get Path and Bottleneck Info (Queue-Specific)
+        # Each queue gets its own bottleneck detection and alternative metrics
+        # This ensures accurate per-queue congestion identification
         
         for qid in QIDS:
-            # Find hottest demand
+            # Find hottest demand for this queue
             hot = self._get_hottest_demand(qid)
             if not hot:
                 log.info(f"[Snapshot] Queue {qid}: No hot demand found, skipping bottleneck detection")
                 continue
             
             src_ip, dst_ip = hot
-            log.info(f"[Snapshot] Queue {qid}: hot_demand=({src_ip}, {dst_ip})")
+            log.debug(f"[Snapshot] Queue {qid}: hot_demand=({src_ip}, {dst_ip})")
             snapshot[qid]['hot_src_ip'] = src_ip
             snapshot[qid]['hot_dst_ip'] = dst_ip
             
@@ -715,13 +765,8 @@ class QoSRoutingEnv:
             
             snapshot[qid]['path_nodes'] = list(path)
             
-            # Local identification of bottleneck (based on previous knowledge? No, we don't have update stats yet)
-            # Actually, to identify the bottleneck, we MUST query path metrics first.
-            # So this has to be a two-step process:
-            # Step A: Get path nodes -> Query their metrics -> Find bottleneck
-            # Step B: Get alternatives for bottleneck -> Query Alt metrics
-            
-            # --- Step A: Path Metrics ---
+            # --- Step A: Path Metrics (Queue-Specific) ---
+            # Query metrics filtered by this queue_id for accurate bottleneck detection
             sw_names = [n for n in path if isinstance(n, str) and n[0] in ('t', 'a', 'c')]
             sw_ids = [self.controller.switch_name_to_id.get(n) for n in sw_names]
             sw_ids = [int(s) for s in sw_ids if s is not None]
@@ -729,8 +774,8 @@ class QoSRoutingEnv:
             if not sw_ids:
                 continue
                 
-            # Query just these path switches first to find bottleneck
-            path_metrics = self._query_switch_metrics(sw_ids)
+            # Query path switches with queue_id filter for accurate per-queue bottleneck
+            path_metrics = self._query_switch_metrics_for_queue(sw_ids, qid)
             
             # Identify Bottleneck (SKIP ToR switches - they have no alternatives)
             best_sid, best_score = None, -1.0
@@ -750,60 +795,74 @@ class QoSRoutingEnv:
             snapshot[qid]['bottleneck_sid'] = best_sid
             
             if best_sid is not None:
-                # Store bottleneck stats
-                bm = path_metrics.get(best_sid, {'drop': 0, 'lat': 0})
+                # Store bottleneck stats (queue-specific)
+                bm = path_metrics.get(best_sid, {'drop': 0, 'lat': 0, 'util': 0})
                 snapshot[qid]['bottleneck_drop'] = bm['drop']
                 snapshot[qid]['bottleneck_lat'] = bm['lat']
+                snapshot[qid]['bottleneck_util'] = bm['util']
                 snapshot[qid]['bottleneck_role'] = self.controller._role_of_sid(best_sid)
                 
-                # --- Step B: Alternatives ---
-                # Get alternatives for this bottleneck
+                # --- Step B: Alternatives (Queue-Specific) ---
+                # Get alternatives for this bottleneck and query their queue-specific metrics
                 alts = self.controller.find_all_alternates(best_sid, path)
-                log.info(f"[Snapshot] Queue {qid}: bottleneck={best_sid}, role={snapshot[qid]['bottleneck_role']}, alternatives={alts}")
+                log.debug(f"[Snapshot] Queue {qid}: bottleneck={best_sid}, role={snapshot[qid]['bottleneck_role']}, alternatives={alts}")
                 
-                # Filter alts (ignore if name not known)
+                # Collect valid alt switch IDs for this queue
                 valid_alts = []
+                alt_sids = []
                 for alt_name in alts:
                     alt_sid = self.controller.switch_name_to_id.get(alt_name)
                     if alt_sid is not None:
                         valid_alts.append((alt_name, int(alt_sid)))
-                        switches_to_query.add(int(alt_sid))
+                        alt_sids.append(int(alt_sid))
                 
-                snapshot[qid]['_candidate_alts'] = valid_alts
+                # Query alternative metrics for THIS queue specifically
+                if alt_sids:
+                    alt_metrics = self._query_switch_metrics_for_queue(alt_sids, qid)
+                    
+                    # Build alternatives list with queue-specific metrics
+                    final_alts = []
+                    for name, sid in valid_alts:
+                        m = alt_metrics.get(sid, {'drop': 0, 'lat': 0, 'util': 0})
+                        final_alts.append({
+                            'name': name,
+                            'drop': m['drop'],
+                            'lat': m['lat'],
+                            'util': m['util'],
+                        })
+                    snapshot[qid]['alternatives'] = final_alts
+                    snapshot[qid]['alt_exists'] = bool(final_alts)
+                else:
+                    snapshot[qid]['alternatives'] = []
+                    snapshot[qid]['alt_exists'] = False
         
-        # 3. Query Alternatives Metrics (Bulk)
-        if switches_to_query:
-            alt_metrics = self._query_switch_metrics(list(switches_to_query))
-            
-            # Fill alternative stats
-            for qid in QIDS:
-                candidates = snapshot[qid].get('_candidate_alts', [])
-                final_alts = []
-                for name, sid in candidates:
-                    m = alt_metrics.get(sid, {'drop': 0, 'lat': 0})
-                    final_alts.append({
-                        'name': name,
-                        'drop': m['drop'],
-                        'lat': m['lat']
-                    })
-                snapshot[qid]['alternatives'] = final_alts
-                snapshot[qid]['alt_exists'] = bool(final_alts)
-                
         return snapshot
 
-    def _query_switch_metrics(self, sw_ids: List[int]) -> Dict[int, Dict]:
-        """Query drop and latency for a list of switch IDs."""
+    def _query_switch_metrics_for_queue(self, sw_ids: List[int], qid: int) -> Dict[int, Dict]:
+        """
+        Query drop, latency, and utilization for a list of switch IDs,
+        filtered by a specific queue_id for accurate per-queue metrics.
+        
+        Args:
+            sw_ids: List of switch IDs to query
+            qid: Queue ID to filter metrics by (0=voice, 1=video, 7=BE)
+            
+        Returns:
+            Dict mapping switch_id -> {'drop': float, 'lat': float, 'util': float}
+        """
         if not sw_ids:
             return {}
             
         sid_filter = " or ".join([f'r.switch_id == "{sid}"' for sid in sw_ids])
         start, stop = self._time_window()
         
+        # Query metrics WITH queue_id filter for queue-specific accuracy
         flux = f'''
         from(bucket:"{self.bucket}")
             |> range(start:{start}, stop:{stop})
             |> filter(fn: (r) => {sid_filter})
-            |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms" or r._measurement == "switch_latency")
+            |> filter(fn: (r) => r.queue_id == "{qid}")
+            |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms" or r._measurement == "switch_latency" or r._measurement == "tx_utilization")
             |> toFloat()
             |> group(columns:["switch_id", "_measurement"])
             |> max(column:"_value")
@@ -820,11 +879,51 @@ class QoSRoutingEnv:
                     results[sid] = {
                         'drop': float(record.values.get('q_drop_rate_100ms', 0) or 0),
                         'lat': float(record.values.get('switch_latency', 0) or 0),
+                        'util': float(record.values.get('tx_utilization', 0) or 0),
                     }
         except Exception as e:
-            log.debug(f"Failed to query switch metrics: {e}")
+            log.debug(f"Failed to query switch metrics for queue {qid}: {e}")
             
         return results
+    
+    def _check_data_freshness(self, qid: int) -> bool:
+        """
+        Check if we have fresh data points in the observation window.
+        Prevents treating stale/cached values as valid.
+        
+        Returns True if we have at least MIN_POINTS_PER_METRIC data points
+        for each of the key metrics (latency, drop, util) in the window.
+        """
+        start, stop = self._time_window()
+        
+        flux = f'''
+        from(bucket:"{self.bucket}")
+            |> range(start:{start}, stop:{stop})
+            |> filter(fn: (r) => r.queue_id == "{qid}")
+            |> filter(fn: (r) => r._measurement == "flow_latency" or r._measurement == "q_drop_rate_100ms" or r._measurement == "tx_utilization")
+            |> group(columns:["_measurement"])
+            |> count()
+        '''
+        
+        counts = {'flow_latency': 0, 'q_drop_rate_100ms': 0, 'tx_utilization': 0}
+        
+        try:
+            tables = self.query_api.query(org=self.org, query=flux)
+            for table in tables or []:
+                for record in table.records:
+                    measurement = record.get_measurement()
+                    count = record.get_value()
+                    if measurement in counts and count is not None:
+                        counts[measurement] = int(count)
+        except Exception as e:
+            log.debug(f"Failed to check data freshness for qid={qid}: {e}")
+            return False  # On query failure, assume stale
+        
+        # All metrics must have minimum points
+        fresh = all(c >= MIN_POINTS_PER_METRIC for c in counts.values())
+        if not fresh:
+            log.debug(f"[Freshness] Queue {qid} has insufficient points: {counts}")
+        return fresh
     
     def _get_hottest_demand(self, qid: int) -> Optional[Tuple[str, str]]:
         """Get the demand with highest latency for a queue."""
@@ -852,100 +951,53 @@ class QoSRoutingEnv:
             log.debug(f"Failed to get hottest demand for qid={qid}: {e}")
         return None
     
-    def _fill_path_info(self, qid: int, snap_q: Dict):
-        """Fill path information including bottleneck and alternate availability."""
-        src_ip = snap_q.get('hot_src_ip')
-        dst_ip = snap_q.get('hot_dst_ip')
-        if not (src_ip and dst_ip):
-            return
+    def _metric_sane(self, q: Dict) -> bool:
+        """
+        Sanity check metric values to catch NaN/inf/stale/wrong-tagged data.
         
-        path = self.controller.get_path_by_ips(src_ip, dst_ip)
-        if not path:
-            return
-        
-        snap_q['path_nodes'] = list(path)
-        
-        # Get switch IDs on path
-        sw_names = [n for n in path if isinstance(n, str) and n[0] in ('t', 'a', 'c')]
-        sw_ids = [self.controller.switch_name_to_id.get(n) for n in sw_names]
-        sw_ids = [int(s) for s in sw_ids if s is not None]
-        
-        if not sw_ids:
-            return
-        
-        # Query per-switch metrics to find bottleneck
-        sid_filter = " or ".join([f'r.switch_id == "{sid}"' for sid in sw_ids])
-        start, stop = self._time_window()
-        
-        flux = f'''
-        from(bucket:"{self.bucket}")
-            |> range(start:{start}, stop:{stop})
-            |> filter(fn: (r) => r.queue_id == "{qid}" and ({sid_filter}))
-            |> filter(fn: (r) => r._measurement == "q_drop_rate_100ms" or r._measurement == "switch_latency")
-            |> toFloat()
-            |> group(columns:["switch_id", "_measurement"])
-            |> max(column:"_value")
-            |> group(columns:["switch_id"])
-            |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
-        '''
-        
-        rows = {}
+        Returns True if values are within reasonable bounds.
+        Uses wide bounds since normalization caps are applied later.
+        """
         try:
-            tables = self.query_api.query(org=self.org, query=flux)
-            for table in tables or []:
-                for record in table.records:
-                    sid = int(record.values.get('switch_id', 0) or 0)
-                    if sid not in sw_ids:
-                        continue
-                    rows[sid] = {
-                        'drop': float(record.values.get('q_drop_rate_100ms', 0) or 0),
-                        'lat': float(record.values.get('switch_latency', 0) or 0),
-                    }
-        except Exception as e:
-            log.debug(f"Failed to query path metrics: {e}")
+            lat = float(q.get('lat_p95', -1))
+            drop = float(q.get('drop_p95', -1))
+            util = float(q.get('util_p95', -1))
+        except (TypeError, ValueError):
+            return False
         
-        # Find bottleneck (highest combined score)
-        best_sid, best_score = None, -1.0
-        for sid in sw_ids:
-            r = rows.get(sid, {'drop': 0, 'lat': 0})
-            drop_norm = min(r['drop'], DROP_CAP) / DROP_CAP
-            lat_norm = min(r['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
-            score = 0.6 * drop_norm + 0.4 * lat_norm
-            if score > best_score:
-                best_sid, best_score = sid, score
+        # Reject NaN/inf explicitly
+        if not all(math.isfinite(x) for x in [lat, drop, util]):
+            log.debug(f"[Sanity] Non-finite values: lat={lat}, drop={drop}, util={util}")
+            return False
         
-        snap_q['bottleneck_sid'] = best_sid
+        # Latency: must be positive and < 10 seconds (10,000 ms)
+        lat_ok = 0 < lat < 10_000
+        # Drop rate: allow wide range for bursts; normalization caps later
+        # (was DROP_CAP*2=10, now 10_000 to avoid rejecting valid burst data)
+        drop_ok = 0 <= drop < 10_000
+        # Utilization: 0 to 100%
+        util_ok = 0 <= util <= 100
         
-        # Store bottleneck metrics for state representation
-        if best_sid is not None:
-            bn_metrics = rows.get(best_sid, {'drop': 0, 'lat': 0})
-            snap_q['bottleneck_drop'] = bn_metrics.get('drop', 0)
-            snap_q['bottleneck_lat'] = bn_metrics.get('lat', 0)
-            snap_q['bottleneck_role'] = self.controller.switch_id_role.get(best_sid, 'other')
+        if not (lat_ok and drop_ok and util_ok):
+            log.debug(f"[Sanity] Out of bounds: lat={lat}({lat_ok}), drop={drop}({drop_ok}), util={util}({util_ok})")
         
-        # Check if alternate path exists
-        if best_sid is not None:
-            snap_q['alt_exists'] = self.controller.has_alternate_for_worst(best_sid, path)
+        return lat_ok and drop_ok and util_ok
     
     def _build_raw_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Build 82-dimensional raw observation vector with relative metrics encoding.
+        Build 61-dimensional raw observation vector with relative metrics encoding.
         (Actions are stacked separately as one-hot vectors)
         
-        Layout per queue (27 features):
-          [0-2]: Basic metrics (lat_ratio, drop_norm, util_norm)
-          [3-5]: Bottleneck info (present, drop, lat)
-          [6-23]: Alternatives 3 × 6 = 18 (available, drop_vs_bn, lat_vs_bn, role, is_current, usage)
-          [24-26]: History (total_changes, steps_since_change, has_pending)
+        Layout per queue (20 features):
+          [0-3]: Basic metrics (lat_ratio, drop_norm, util_norm, sla_met)
+          [4-7]: Bottleneck info (present, drop, lat, util)
+          [8-19]: Alternatives 3 × 4 = 12 (available, drop_vs_bn, lat_vs_bn, util_norm)
         
         Global (1): Max pressure
         
-        Total: 3×27 + 1 = 82 features
+        Total: 3×20 + 1 = 61 features
         """
         state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
-        
-        # Role encoding: tor=0, agg=0.5, core=1.0
-        role_map = {'tor': 0.0, 'agg': 0.5, 'core': 1.0, 'other': 0.0}
         
         pressures = []
         idx = 0
@@ -954,83 +1006,64 @@ class QoSRoutingEnv:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             
-            # --- 1. Basic Metrics (3) ---
-            # Use LINEAR scaling (not log) for consistency with reward
-            lat_ratio = q['lat_p95'] / sla
+            # --- 1. Basic Metrics (4) ---
+            lat_ratio_raw = q['lat_p95'] / sla
+            lat_ratio = min(lat_ratio_raw, LAT_RATIO_CAP)  # Cap to prevent instability
             drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
             util_norm = min(q['util_p95'], UTIL_CAP) / UTIL_CAP
+            sla_met = 1.0 if lat_ratio_raw <= 1.0 else 0.0  # Use raw for accurate SLA check
             
             state[idx] = lat_ratio
             state[idx+1] = drop_norm
             state[idx+2] = util_norm
-            idx += 3
+            state[idx+3] = sla_met
+            idx += 4
             
-            # --- 2. Bottleneck Info (3) ---
+            # --- 2. Bottleneck Info (4) ---
             bn_sid = q.get('bottleneck_sid')
             if bn_sid is not None:
                 state[idx] = 1.0  # Present
                 bn_drop = min(q.get('bottleneck_drop', 0), DROP_CAP) / DROP_CAP
-                bn_lat = q.get('bottleneck_lat', 0) / sla
+                bn_lat = min(q.get('bottleneck_lat', 0) / sla, LAT_RATIO_CAP)  # Capped
+                bn_util = min(q.get('bottleneck_util', 0), UTIL_CAP) / UTIL_CAP
                 state[idx+1] = bn_drop
                 state[idx+2] = bn_lat
+                state[idx+3] = bn_util
             else:
                 # No bottleneck identified
                 state[idx] = 0.0
                 bn_drop = 0.0
                 bn_lat = 0.0
+                bn_util = 0.0
             
-            idx += 3
+            idx += 4
             
-            # --- 3. Alternatives (3 × 6 = 18) ---
+            # --- 3. Alternatives (3 × 4 = 12) ---
             alts = q.get('alternatives', [])
-            path = q.get('path_nodes', [])
-            
-            # Normalize usage counts for this queue
-            max_usage = max(self.controller.get_usage_count(a['name']) for a in alts) if alts else 1
-            if max_usage == 0:
-                max_usage = 1
             
             for i in range(self.MAX_ALTS):
                 if i < len(alts):
                     alt = alts[i]
-                    alt_name = alt['name']
                     
                     # Available
                     state[idx] = 1.0
                     
                     # Relative metrics (vs bottleneck)
                     alt_drop = min(alt.get('drop', 0), DROP_CAP) / DROP_CAP
-                    alt_lat = alt.get('lat', 0) / sla
+                    alt_lat = min(alt.get('lat', 0) / sla, LAT_RATIO_CAP)  # Capped
                     state[idx+1] = alt_drop - bn_drop  # Negative = better than bottleneck
-                    state[idx+2] = alt_lat - bn_lat
+                    # Cap lat difference to bounded range
+                    lat_diff = alt_lat - bn_lat
+                    state[idx+2] = max(-LAT_DIFF_CAP, min(lat_diff, LAT_DIFF_CAP))
                     
-                    # Role (topology info)
-                    alt_sid = self.controller.switch_name_to_id.get(alt_name)
-                    alt_role = self.controller._role_of_sid(alt_sid) if alt_sid else 'other'
-                    state[idx+3] = role_map.get(alt_role, 0.0)
-                    
-                    # Is on current path?
-                    state[idx+4] = 1.0 if alt_name in path else 0.0
-                    
-                    # Usage count (normalized)
-                    usage = self.controller.get_usage_count(alt_name)
-                    state[idx+5] = usage / max_usage
+                    # Utilization (absolute, normalized)
+                    alt_util = min(alt.get('util', 0), UTIL_CAP) / UTIL_CAP
+                    state[idx+3] = alt_util
                 else:
                     # No alternative at this index
-                    state[idx:idx+6] = 0.0
+                    state[idx:idx+4] = 0.0
                 
-                idx += 6
-            
-            # --- 4. History (3) ---
-            total_changes, steps_since = self.controller.get_queue_history(qid, self.global_step)
-            has_pending = 1.0 if self.controller.has_pending_change_for_qid(qid) else 0.0
-            
-            # Normalize change counts (soft cap at 100)
-            state[idx] = min(total_changes, 100) / 100.0
-            # Normalize steps since change (soft cap at 1000)
-            state[idx+1] = min(steps_since, 1000) / 1000.0
-            state[idx+2] = has_pending
-            idx += 3
+                idx += 4
             
             # Track pressure for global feature
             pressure = 0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm
@@ -1052,17 +1085,18 @@ class QoSRoutingEnv:
         Build stacked state from observation stack + action stack.
         
         Returns:
-            552-dimensional state vector:
-              - [0-491]: Stacked observations (82 * 6 = 492 features)
-              - [492-551]: Stacked one-hot actions (10 * 6 = 60 features)
+            426-dimensional state vector:
+              - [0-365]: Stacked observations (61 * 6 = 366 features)
+              - [366-425]: Stacked one-hot actions (10 * 6 = 60 features)
             
-        Layout: [obs_t-3, obs_t-2, obs_t-1, obs_t, act_t-3, act_t-2, act_t-1, act_t]
+        Layout: [obs_t-5, obs_t-4, obs_t-3, obs_t-2, obs_t-1, obs_t, 
+                 act_t-5, act_t-4, act_t-3, act_t-2, act_t-1, act_t]
             
         This allows the agent to see:
         - Trends: If latency is rising or falling (from observation history)
         - Causality: Full action history as one-hot vectors
-        - Example: If action_stack = [[1,0,0,0], [0,0,1,0], [1,0,0,0], [0,1,0,0]]
-                   means: noop -> video -> noop -> voice
+        - Example: If action_stack = [[1,0,...], [0,0,0,0,1,0,...], ...]
+                   means: noop -> video-alt-0 -> ...
         """
         # Concatenate observations: oldest first, newest last
         stacked_obs = np.concatenate(list(self.frame_stack), axis=0)
@@ -1070,7 +1104,7 @@ class QoSRoutingEnv:
         # Concatenate one-hot actions: oldest first, newest last
         stacked_actions = np.concatenate(list(self.action_stack), axis=0)
         
-        # Combine: [76 obs features] + [16 action features] = 92 total
+        # Combine: [366 obs features] + [60 action features] = 426 total
         return np.concatenate([stacked_obs, stacked_actions], axis=0)
     
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
@@ -1098,7 +1132,7 @@ class QoSRoutingEnv:
         
         return mask
     
-    def _compute_reward(self, snapshot: Dict[int, Dict], action: int) -> Tuple[float, Dict]:
+    def _compute_reward(self, snapshot: Dict[int, Dict]) -> Tuple[float, Dict]:
         """
         Compute reward based on SLA compliance with improved stability.
         
@@ -1106,7 +1140,9 @@ class QoSRoutingEnv:
         1. Soft margin around SLA to reduce flip-flopping
         2. Higher drop penalty (drops are most actionable)
         3. Tanh compression to bound extreme values smoothly [-2.5, +2.5]
-        4. Small action cost to discourage unnecessary changes
+        
+        Note: Action cost is applied separately in step() only for successful actions.
+        This prevents penalizing failed reroute attempts.
         
         Returns:
             (reward, info_dict)
@@ -1162,11 +1198,7 @@ class QoSRoutingEnv:
                 'drop_penalty': drop_penalty
             }
         
-        # 3. Action Cost (reduced - don't discourage necessary actions)
-        if action != 0:
-            raw_reward -= REWARD_ACTION_COST
-        
-        # 4. Stability: Symmetric soft clipping with tanh
+        # Stability: Symmetric soft clipping with tanh
         # Maps to [-2.5, +2.5] range - symmetric to reduce bias
         reward = 2.5 * np.tanh(raw_reward / 2.5)
         
@@ -1174,17 +1206,20 @@ class QoSRoutingEnv:
         
         return reward, info
     
-    def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str]]:
+    def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str], Optional[int]]:
         """
         Apply routing action based on explicit alternative selection.
+        
+        Returns:
+            (success, alt_name, alt_idx) - alt_name for logging, alt_idx for InfluxDB
         """
         if action == 0:
-            return False, None  # No-op
+            return False, None, None  # No-op
         
         # Parse action from map
         mapping = self.ACTION_MAP.get(action)
         if not mapping:
-            return False, None
+            return False, None, None
             
         qid, alt_idx = mapping
         
@@ -1196,12 +1231,12 @@ class QoSRoutingEnv:
         
         if not (src_ip and dst_ip and bottleneck_sid):
             log.warning(f"Cannot apply action {action} (q={qid}): missing path info")
-            return False, None
+            return False, None, None
             
         # Check if requested alternative index exists
         if alt_idx >= len(alts):
             log.warning(f"Cannot apply action {action}: alt index {alt_idx} out of range ({len(alts)} avail)")
-            return False, None
+            return False, None, None
             
         target_alt = alts[alt_idx]
         alt_name = target_alt['name']
@@ -1219,7 +1254,7 @@ class QoSRoutingEnv:
         else:
             log.warning(f"[ACTION {action}] Reroute failed: {msg}")
         
-        return ok, alt_name
+        return ok, alt_name, alt_idx
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         """
@@ -1240,7 +1275,7 @@ class QoSRoutingEnv:
         current_snapshot = self.last_snapshot
         
         # Apply action
-        action_applied, alt_used = self._apply_action(action, current_snapshot)
+        action_applied, alt_name, alt_idx = self._apply_action(action, current_snapshot)
         
         # Update last action tracking
         if action != 0:
@@ -1254,8 +1289,60 @@ class QoSRoutingEnv:
         # Collect new snapshot
         next_snapshot = self._collect_snapshot()
         
-        # Compute reward
-        reward, info = self._compute_reward(next_snapshot, action)
+        # Compute base reward (action cost applied separately below)
+        reward, info = self._compute_reward(next_snapshot)
+        
+        # Always compute network pressure for state representation and logging
+        # Uses same formula as _build_raw_state() for consistency
+        pressure = 0.0
+        for qid in QIDS:
+            q = next_snapshot[qid]
+            sla = SLA_THRESHOLDS[qid]
+            lat_ratio = q['lat_p95'] / sla
+            drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
+            util_norm = min(q['util_p95'], UTIL_CAP) / UTIL_CAP
+            q_pressure = 0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm
+            pressure = max(pressure, q_pressure)
+        
+        info['pressure'] = pressure  # Always available for logging
+        
+        # Apply queue-specific action cost ONLY for successful actions
+        # Cost depends on whether the TARGETED queue's SLA is met
+        if action != 0 and action_applied:
+            # Get which queue this action targets
+            mapping = self.ACTION_MAP.get(action)
+            targeted_qid = mapping[0] if mapping else None
+            
+            if targeted_qid is not None:
+                # Check if targeted queue's SLA was met BEFORE the action
+                # We must look at current_snapshot (pre-action), not info/next_snapshot
+                q_pre = current_snapshot[targeted_qid]
+                sla_pre = SLA_THRESHOLDS[targeted_qid]
+                
+                # Determine health using the same logic as _compute_reward margin
+                # If pre-action latency was within "safe zone" (ratio <= 1.2), it was "Healthy"
+                ratio_pre = q_pre['lat_p95'] / sla_pre
+                margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.2
+                
+                if ratio_pre <= margin_high:
+                    # Targeting a healthy queue → high cost (risky)
+                    action_cost = REWARD_ACTION_COST_HEALTHY
+                else:
+                    # Targeting a sick queue → low cost (encouraged)
+                    action_cost = REWARD_ACTION_COST_SICK
+            else:
+                action_cost = REWARD_ACTION_COST_HEALTHY  # Fallback
+            
+            # Apply cost and re-clip with tanh
+            raw_reward_with_cost = info['raw_reward'] - action_cost
+            reward = 2.5 * np.tanh(raw_reward_with_cost / 2.5)
+            
+            info['action_cost'] = action_cost
+            info['action_cost_applied'] = True
+            info['targeted_qid'] = targeted_qid
+        else:
+            info['action_cost'] = 0.0
+            info['action_cost_applied'] = False
         
         # Check episode termination
         all_sla_met = len(info['sla_met']) == len(QIDS)
@@ -1271,19 +1358,76 @@ class QoSRoutingEnv:
         info['episode_step'] = self.episode_step
         info['sla_streak'] = self.sla_streak
         info['action_applied'] = action_applied
-        if alt_used is not None:
-            info['alt_used'] = alt_used
+        if alt_name is not None:
+            info['alt_used'] = alt_name  # String name for stdout/CSV
+            info['alt_idx'] = alt_idx    # Numeric index for InfluxDB
         info['all_sla_met'] = all_sla_met
         
-        # Build raw observation and add to frame stack
+        # DATA VALIDITY CHECK:
+        # Key insight: validity must key off action != 0, not action_applied
+        # - If action == 0 (noop): relaxed (2/3 queues valid is OK)
+        # - If action != 0: strict - ALL 3 queues valid AND action context AND action_applied
+        #   (Failed actions should not be stored as they confuse learning)
+        
+        valid_count = sum(1 for qid in QIDS if next_snapshot[qid].get('data_valid', False))
+        invalid_qs = [qid for qid in QIDS if not next_snapshot[qid].get('data_valid', False)]
+        
+        # Action context check - for ANY non-zero action (not just applied ones)
+        action_context_valid = True
+        if action != 0:
+            # Get the targeted queue from action mapping
+            mapping = self.ACTION_MAP.get(action)
+            if mapping:
+                targeted_qid = mapping[0]
+                # Check if the PRE-ACTION snapshot had valid routing context
+                q_pre = current_snapshot[targeted_qid]
+                has_context = (q_pre.get('hot_src_ip') is not None and 
+                               q_pre.get('hot_dst_ip') is not None and 
+                               q_pre.get('bottleneck_sid') is not None)
+                if not has_context:
+                    action_context_valid = False
+                    log.debug(f"[Step {self.episode_step}] Action {action} targeted queue {targeted_qid} lacked routing context")
+        
+        # Determine validity based on action type (key off action != 0, not action_applied)
+        if action == 0:
+            # Noop: relaxed - at least 2/3 queues valid
+            data_valid = valid_count >= 2
+        else:
+            # Non-zero action attempted:
+            # Strict: all 3 queues valid + action context + action must have succeeded
+            # Failed actions (attempted but controller rejected) should NOT be stored
+            # as they create confusing transitions ("I tried X but nothing changed")
+            data_valid = (valid_count == len(QIDS)) and action_context_valid and action_applied
+        
+        info['data_valid'] = data_valid
+        info['valid_count'] = valid_count
+        info['invalid_queues'] = invalid_qs
+        
+        if not data_valid:
+            reasons = []
+            if valid_count < len(QIDS):
+                reasons.append(f"telemetry incomplete ({valid_count}/3): queues {invalid_qs}")
+            if action != 0 and not action_context_valid:
+                reasons.append("action lacked routing context")
+            if action != 0 and not action_applied:
+                reasons.append("action was not applied (controller rejected)")
+            log.warning(f"[Step {self.episode_step}] Invalid transition (action={action}) - {', '.join(reasons)}")
+        
+        # Build raw observation - ONLY update state stacks if data is valid
+        # This prevents corrupting observation history with invalid/stale data
         raw_state = self._build_raw_state(next_snapshot)
-        self.frame_stack.append(raw_state)
         
-        # Convert action to one-hot and add to action stack
-        action_onehot = self._action_to_onehot(action)
-        self.action_stack.append(action_onehot)
+        if data_valid:
+            # Valid transition: update frame and action stacks normally
+            self.frame_stack.append(raw_state)
+            action_onehot = self._action_to_onehot(action)
+            self.action_stack.append(action_onehot)
+        else:
+            # Invalid transition: keep stacks unchanged to preserve valid history
+            # The returned next_state will still be built from current stacks
+            log.debug(f"[Step {self.episode_step}] Skipping state stack update due to invalid data")
         
-        # Build stacked state (92-dim: 76 obs + 16 actions)
+        # Build stacked state (426-dim: 366 obs + 60 actions)
         next_state = self._build_stacked_state()
         self.last_snapshot = next_snapshot
         
@@ -1299,13 +1443,13 @@ class QoSRoutingEnv:
         return self._get_valid_actions(self.last_snapshot)
     
     def write_training_metrics(self, step: int, agent_stats: Dict, 
-                                reward: float, action: int, info: Dict):
+                                reward: float, action: int, prev_action: int, info: Dict):
         """
         Write training metrics to InfluxDB for Grafana monitoring.
         
         Metrics logged:
         - step: Training step number
-        - action: Action taken (0=noop, 1=voice, 2=video, 3=best)
+        - action: Action taken (0=noop, 1-3=voice alts, 4-6=video alts, 7-9=BE alts)
         - reward: Actual reward (tanh-clipped to [-2.5, +2.5])
         - raw_reward: Pre-clipping reward for debugging
         - eps: Epsilon (exploration rate)
@@ -1316,6 +1460,9 @@ class QoSRoutingEnv:
         - sla_met_count: Number of queues meeting SLA (0-3)
         - sla_streak: Consecutive steps with all SLAs met
         - alt_used: Which alternate switch was used (if action taken)
+        - action_change: 1 if action != prev_action, else 0 (measures churn)
+        - noop_action: 1 if action == 0, else 0 (measures inactivity)
+        - action_cost: Applied action cost (pressure-adaptive)
         """
         try:
             p = (
@@ -1333,11 +1480,25 @@ class QoSRoutingEnv:
                 .time(datetime.utcnow())
             )
             
+            # Action churn metrics
+            action_change = 1 if action != prev_action else 0
+            noop_action = 1 if action == 0 else 0
+            p = p.field("action_change", int(action_change))
+            p = p.field("noop_action", int(noop_action))
+            
             # Optional fields
             if 'raw_reward' in info:
                 p = p.field("raw_reward", float(info['raw_reward']))
-            if info.get('alt_used'):
-                p = p.field("alt_used", str(info['alt_used']))
+            if info.get('alt_idx') is not None:
+                p = p.field("alt_idx", int(info['alt_idx']))
+            if 'action_cost' in info:
+                p = p.field("action_cost", float(info['action_cost']))
+            if 'pressure' in info:
+                p = p.field("pressure", float(info['pressure']))
+            
+            # Data validity metrics for monitoring
+            p = p.field("data_valid", int(info.get('data_valid', False)))
+            p = p.field("valid_count", int(info.get('valid_count', 0)))
             
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
@@ -1429,6 +1590,7 @@ def train(args):
             episode_reward = 0.0
             episode_steps = 0
             done = False
+            prev_action = 0  # Track previous action for churn metrics
             
             log.info(f"\n{'='*50}")
             log.info(f"Episode {episode} started (total steps: {total_steps})")
@@ -1444,10 +1606,16 @@ def train(args):
                 # Take step
                 next_state, reward, done, info = env.step(action)
                 
-                # Store experience and train
-                agent.push_experience(state, action, reward, next_state, done)
+                # Only store experience and update epsilon if telemetry data is valid
+                # Invalid data (fallback values: 2x SLA, DROP_CAP, UTIL_CAP) would poison the replay buffer
+                if info.get('data_valid', False):
+                    agent.push_experience(state, action, reward, next_state, done)
+                    agent.update_epsilon()
+                else:
+                    log.debug(f"[Step {total_steps}] Skipping experience storage - invalid telemetry")
+                
+                # Always try to train from existing valid experiences in the buffer
                 loss = agent.train_step()
-                agent.update_epsilon()
                 
                 episode_reward += reward
                 state = next_state
@@ -1479,8 +1647,9 @@ def train(args):
                         f"streak={info['sla_streak']}"
                     )
                 
-                # Write metrics to InfluxDB
-                env.write_training_metrics(total_steps, stats, reward, action, info)
+                # Write metrics to InfluxDB (includes action churn tracking)
+                env.write_training_metrics(total_steps, stats, reward, action, prev_action, info)
+                prev_action = action  # Update for next step's churn calculation
                 
                 # Write to local CSV
                 csv_writer.writerow([

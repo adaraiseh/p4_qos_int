@@ -38,7 +38,7 @@ monitor:
 
 # run RL agent v4 (recommended) in training mode
 train:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 30000 --log-every 1 $(VERBOSE_FLAG)
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 20000 --log-every 1 $(VERBOSE_FLAG)
 
 # resume RL agent v4 training from checkpoint (default: 50pct)
 # Usage: make resume or make resume CHECKPOINT=best
@@ -46,7 +46,7 @@ ifndef CHECKPOINT
 CHECKPOINT = 50pct
 endif
 resume:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 30000 --resume $(CHECKPOINT) --log-every 1 $(VERBOSE_FLAG)
+	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 --resume $(CHECKPOINT) --log-every 1 $(VERBOSE_FLAG)
 
 # run RL agent v4 in evaluation mode
 test:
