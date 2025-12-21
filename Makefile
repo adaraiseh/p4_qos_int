@@ -39,7 +39,7 @@ monitor:
 
 # run RL agent v4 (recommended) in training mode
 train:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 15000 --log-every 1 $(VERBOSE_FLAG)
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 25000 --log-every 1 $(VERBOSE_FLAG)
 
 # resume RL agent v4 training from checkpoint (default: 50pct)
 # Usage: make resume or make resume CHECKPOINT=best

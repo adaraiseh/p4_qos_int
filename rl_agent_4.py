@@ -50,6 +50,7 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 from controller import Controller
+from traffic_generator import TrafficManager
 
 # =============================================================================
 #                              LOGGING SETUP
@@ -112,11 +113,11 @@ TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
 # Environment timing - tuned for 100% post-action data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
 # Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
-WINDOW_SECONDS = 2          # 2-second observation window
+WINDOW_SECONDS = 1.4        # 1.4-second observation window (faster training)
 SAFETY_LAG_MS = 300         # 300ms safety lag for InfluxDB
 COOLDOWN_SECONDS = 0.0      # Short cooldown for faster learning
-DELAY_AFTER_ACTION = 2.5    # Wait 2.5s for post-action data (2+0.3+margin)
-DELAY_NO_ACTION = 2.5       # Low-pass filter: smooth observations during stable periods
+DELAY_AFTER_ACTION = 2.0    # Wait 2.0s for post-action data (1.4+0.3+margin)
+DELAY_NO_ACTION = 2.0       # Low-pass filter: smooth observations during stable periods
 
 # Freshness validation - minimum data points required per metric in window
 MIN_POINTS_PER_METRIC = 2   # Require at least 2 points to detect stale data
@@ -148,7 +149,7 @@ REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
 # Cost depends on whether the TARGETED queue's SLA is met:
 #   - If targeting a healthy queue → high cost (risky, don't break what works)
 #   - If targeting a sick queue → low cost (encouraged to fix)
-REWARD_ACTION_COST_HEALTHY = 0.60   # Cost when targeting a queue with SLA met
+REWARD_ACTION_COST_HEALTHY = 0.50   # Cost when targeting a queue with SLA met
 REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA violated
 
 # Soft margin around SLA (reduces reward flip-flopping)
@@ -578,8 +579,11 @@ class QoSRoutingEnv:
         self.action_stack: deque = deque(maxlen=STACK_SIZE)
         
         # Traffic manager for dynamic profile changes (training only)
-        #self.traffic_manager = get_traffic_manager() if reset_network else None
+        self.traffic_manager = TrafficManager() if reset_network else None
         
+        # Current traffic profile for logging
+        self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", etc.
+        self.current_traffic_category = ""  # "light", "medium", "high"
     
     def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
         """Reset episode and return initial stacked state.
@@ -615,9 +619,13 @@ class QoSRoutingEnv:
         else:
             log.info("=== WARM START: Continuing from current routing state ===")
         
-        # Always randomize traffic profile for new episode (if training mode)
-        # if self.traffic_manager:
-        #     self.traffic_manager.randomize_traffic()
+        # Start randomized traffic for new episode (training mode only)
+        if self.traffic_manager:
+            log.info("Starting randomized traffic profile...")
+            profile_info = self.traffic_manager.start_traffic()
+            self.current_traffic_profile = profile_info['profile_name']
+            self.current_traffic_category = profile_info['profile_category']
+            log.info(f"Traffic profile: {self.current_traffic_profile} ({self.current_traffic_category})")
         
         # Cool-down period for traffic to stabilize (regardless of reset type)
         cooldown = 5.0 if do_reset else 2.0  # Less cooldown for warm-start
@@ -1535,6 +1543,12 @@ class QoSRoutingEnv:
             p = p.field("data_valid", int(info.get('data_valid', False)))
             p = p.field("valid_count", int(info.get('valid_count', 0)))
             
+            # Traffic profile for this episode
+            if info.get('traffic_profile'):
+                p = p.tag("traffic_profile", str(info['traffic_profile']))
+            if info.get('traffic_category'):
+                p = p.tag("traffic_category", str(info['traffic_category']))
+            
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
             log.debug(f"Failed to write training metrics: {e}")
@@ -1614,7 +1628,8 @@ def train(args):
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
         'step', 'episode', 'action', 'reward', 'raw_reward',
-        'sla_met', 'sla_streak', 'eps', 'loss', 'avg_reward_100', 'alt_used', 'timestamp'
+        'sla_met', 'sla_streak', 'eps', 'loss', 'avg_reward_100', 'alt_used',
+        'traffic_profile', 'traffic_category', 'timestamp'
     ])
     log.info(f"Training log: {csv_path}")
     
@@ -1639,6 +1654,7 @@ def train(args):
             reset_type = "BASELINE" if do_reset else "WARM"
             log.info(f"\n{'='*50}")
             log.info(f"Episode {episode} [{reset_type}] (total steps: {total_steps}, reset_prob={reset_prob:.2f})")
+            log.info(f"Traffic profile: {env.current_traffic_profile} ({env.current_traffic_category})")
             
             while not done and total_steps < args.steps:
                 total_steps += 1
@@ -1695,6 +1711,9 @@ def train(args):
                     )
                 
                 # Write metrics to InfluxDB (includes action churn tracking)
+                # Inject traffic profile into info dict for logging
+                info['traffic_profile'] = env.current_traffic_profile
+                info['traffic_category'] = env.current_traffic_category
                 env.write_training_metrics(total_steps, stats, reward, action, prev_action, info)
                 prev_action = action  # Update for next step's churn calculation
                 
@@ -1704,7 +1723,9 @@ def train(args):
                     info.get('raw_reward', 0),
                     len(info['sla_met']), info['sla_streak'],
                     stats['eps'], stats['avg_loss'], stats['avg_reward'],
-                    info.get('alt_used', ''), datetime.now().isoformat()
+                    info.get('alt_used', ''),
+                    env.current_traffic_profile, env.current_traffic_category,
+                    datetime.now().isoformat()
                 ])
                 csv_file.flush()  # Ensure data is written immediately
                 

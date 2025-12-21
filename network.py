@@ -292,51 +292,12 @@ def config_network(p4):
     net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
 
     # -----------------
-    # Generate traffic (half-host senders, hosts 1..8 only)
+    # Enable task schedulers on traffic hosts (h1-h8)
+    # Traffic generation is now managed dynamically by traffic_generator.py
+    # This allows per-episode randomization during RL training
     # -----------------
-
-    # Per-flow, per-queue Mbps (kept same shape, scaled by LOAD_FACTOR)
-    LOAD_FACTOR = 3.5
-    PER_QUEUE_BW = {
-        0: 0.1 * LOAD_FACTOR,
-        1: 0.1 * LOAD_FACTOR,
-        7: 0.4 * LOAD_FACTOR,
-    }
-    PER_QUEUE_LEN = {0: 1250, 1: 1250, 7: 1250}
-
-    # Define pods as pairs and pick only half (first) as senders
-    pods = [
-        ["h1", "h2"],
-        ["h3", "h4"],
-        ["h5", "h6"],
-        ["h7", "h8"],
-    ]
-    senders   = [pod[0] for pod in pods]  # h1, h3, h5, h7
-    receivers = [pod[1] for pod in pods]  # h2, h4, h6, h8  (used as pure receivers)
-
-    # Build src->dst pairs:
-    # For each sender in pod i, send to the *second* host of every other pod.
-    balanced_pairs = []
-    next_flow_id = 10
-    for i, s in enumerate(senders):
-        for j, pod in enumerate(pods):
-            if j == i:
-                continue  # skip same pod
-            dst = pod[1]  # the non-sender half from other pod
-            balanced_pairs.append((s, dst, next_flow_id))
-            next_flow_id += 1
-
-    # Schedule traffic for the selected pairs
-    for src, dst, fid in balanced_pairs:
-        generate_traffic(
-            net=net,
-            src_host=src,
-            dst_host=dst,
-            flow_id=fid,
-            queue_id="all",
-            per_queue_bw=PER_QUEUE_BW,   # Mbps per queue
-            per_queue_len=PER_QUEUE_LEN  # payload bytes
-        )
+    for host in hosts:
+        net.enableScheduler(host)
 
     # Nodes general options
     #net.enableCpuPortAll()
