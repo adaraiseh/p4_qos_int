@@ -1,6 +1,7 @@
 # controller.py
 
 import re
+import json
 import glob
 import os
 from contextlib import redirect_stdout, redirect_stderr
@@ -8,6 +9,9 @@ from pathlib import Path
 from ipaddress import ip_network
 
 import networkx as nx
+import warnings
+# Suppress NetworkX 3.6 future warning coming from p4utils
+warnings.filterwarnings("ignore", category=FutureWarning, module="networkx")
 from p4utils.utils.helper import load_topo
 from p4utils.utils.sswitch_thrift_API import SimpleSwitchThriftAPI
 
@@ -46,10 +50,15 @@ class Controller:
         self.queue_changes = {0: 0, 1: 0, 7: 0}  # qid → total_changes
         self.queue_last_change_step = {0: 0, 1: 0, 7: 0}  # qid → global_step
 
+        # === Per-queue path tracking (for visualization) ===
+        # value: { (src_host, dst_host): [nodes...] }
+        self.paths_per_queue = {0: {}, 1: {}, 7: {}}
+
         self.connect_to_switches()
         self.build_network_graph()
         self.compute_forwarding_entries()  # also fills self.path_map
         self.program_switches()
+        self.dump_paths_json()
 
     # -----------------------
     # Quiet helpers to suppress verbose P4Runtime prints
@@ -93,6 +102,8 @@ class Controller:
         self.forwarding_entries = {}
         self.paths.clear()
         self.path_map.clear()
+        for qid in self.paths_per_queue:
+            self.paths_per_queue[qid].clear()
 
         for src_host in hosts:
             for dst_host in hosts:
@@ -107,6 +118,9 @@ class Controller:
 
                 self.paths.append(f"Path from {src_host} to {dst_host}: {' -> '.join(path)}")
                 self.path_map[(src_host, dst_host)] = list(path)
+                # Initially, all queues follow the SPF path
+                for qid in self.paths_per_queue:
+                    self.paths_per_queue[qid][(src_host, dst_host)] = list(path)
 
                 dst_ip = self.topo.get_host_ip(dst_host).split('/')[0]
 
@@ -382,6 +396,47 @@ class Controller:
         last_change = self.queue_last_change_step.get(qid, 0)
         return total, current_step - last_change
 
+    def dump_paths_json(self):
+        """Export current paths per queue to JSON for visualization."""
+        # Convert tuple keys (src, dst) to string or list for JSON
+        export_data = {}
+        for qid, pmap in self.paths_per_queue.items():
+            # Structure: list of objects {src, dst, path}
+            q_list = []
+            for (src, dst), path in pmap.items():
+                q_list.append({
+                    "src": src,
+                    "dst": dst,
+                    "path": path
+                })
+            export_data[qid] = q_list
+            
+        final_path = "/tmp/p4_paths.json"
+        try:
+            # DIRECT WRITE strategy to allow non-root user to overwrite root-owned file (if 666)
+            # Atomic rename (os.replace) fails in sticky /tmp if we don't own the file.
+            # Truncating 'w' works if we have write permission.
+            
+            # If file doesn't exist, this creates it.
+            # If it exists, it truncates it.
+            with open(final_path, "w") as f:
+                json.dump(export_data, f)
+                # Ensure it's flushed to disk for the reader
+                f.flush()
+                os.fsync(f.fileno())
+                
+            # Try to ensure it's world writable so other users can write to it later
+            try:
+                os.chmod(final_path, 0o666)
+            except OSError:
+                pass # Might fail if we don't own it, but if we wrote to it, it handles the data.
+
+        except Exception as e:
+            # Log but don't crash
+            # Only print error if verbose or if it's a new error
+            # print(f"[ERROR] Failed to dump paths: {e}")
+            pass
+
 
     # -----------------------
     # Per-queue change tracking / revert
@@ -484,7 +539,32 @@ class Controller:
         if not stack:
             return False
         change = stack.pop()  # per-queue LIFO
-        return self._revert_change_object(change)
+        res = self._revert_change_object(change)
+        
+        # Update paths_per_queue local tracking
+        if res and change:
+            # fwd
+            fwd = change.get("fwd", {})
+            old_p = fwd.get("old_path")
+            if old_p:
+                src = old_p[0]
+                dst = old_p[-1]
+                self.paths_per_queue[qid][(src, dst)] = old_p
+            
+            # rev
+            rev = change.get("rev", {})
+            old_p_rev = rev.get("old_path")
+            if old_p_rev:
+                src = old_p_rev[0]
+                dst = old_p_rev[-1]
+                self.paths_per_queue[qid][(dst, src)] = old_p_rev # rev path is dst->src in map keys? 
+                # Wait, change object has "old_path" which is the list of nodes.
+                # In reroute, we store path_map[(src, dst)] = fwd_new_path.
+                # So keys are correct.
+            
+            self.dump_paths_json()
+            
+        return res
 
     # Back-compat: global revert (LIFO across all queues) — not used by RL env anymore
     def revert_last_change(self) -> bool:
@@ -625,6 +705,14 @@ class Controller:
             "rev": {"old_path": path_rev, "new_path": rev_new_path if rev_new_path else path_rev, "overlays": rev_changes or []},
         }
         self.change_history_by_qid.setdefault(int(qid), []).append(rec)
+
+        # Update paths_per_queue for this qid
+        if fwd_new_path:
+            self.paths_per_queue[int(qid)][(src_host, dst_host)] = fwd_new_path
+        if rev_new_path:
+            self.paths_per_queue[int(qid)][(dst_host, src_host)] = rev_new_path
+        self.dump_paths_json()
+
         return True, "ok"
 
     # ---------- Public helpers for RL agent logging ----------

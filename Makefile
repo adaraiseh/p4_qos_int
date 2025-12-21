@@ -28,6 +28,7 @@ clean: stop
 	sudo rm -f *.pcap
 	sudo rm -rf $(PCAP_DIR) $(LOG_DIR) $(RULE_DIR)/rule*
 	sudo rm -f topology.json
+	sudo rm -f /tmp/p4_paths.json
 	sudo rm -f $(P4SRC_DIR)/*.p4i $(P4SRC_DIR)/*.json
 
 collect:

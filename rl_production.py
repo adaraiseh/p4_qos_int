@@ -120,7 +120,7 @@ class ProductionAgent:
     
     def load(self, path: str):
         """Load model weights."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         self.network.load_state_dict(checkpoint['online_net'])
         log.info(f"Model loaded from {path}")
 

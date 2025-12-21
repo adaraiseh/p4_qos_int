@@ -364,6 +364,23 @@ def main():
     print("\nOSPF Shortest Paths:")
     controller.print_paths()
 
+    # Auto-launch visualization
+    import subprocess
+    import os
+    
+    viz_script = os.path.join(os.getcwd(), "visualize_routes.py")
+    if os.path.exists(viz_script):
+        print(f"\n[INFO] Auto-launching visualization: {viz_script}")
+        
+        cmd = ["python3", viz_script]
+        
+        # If running as root (sudo), try to launch as the original user to avoid GUI permission issues
+        sudo_user = os.environ.get('SUDO_USER')
+        if sudo_user:
+            cmd = ["sudo", "-u", sudo_user, "python3", viz_script]
+            
+        subprocess.Popen(cmd, start_new_session=True)
+
     net.enableCli()
     net.start_net_cli()
 
