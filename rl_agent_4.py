@@ -148,8 +148,8 @@ REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
 # Cost depends on whether the TARGETED queue's SLA is met:
 #   - If targeting a healthy queue → high cost (risky, don't break what works)
 #   - If targeting a sick queue → low cost (encouraged to fix)
-REWARD_ACTION_COST_HEALTHY = 0.3   # Cost when targeting a queue with SLA met
-REWARD_ACTION_COST_SICK = 0.05      # Cost when targeting a queue with SLA violated
+REWARD_ACTION_COST_HEALTHY = 0.60   # Cost when targeting a queue with SLA met
+REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA violated
 
 # Soft margin around SLA (reduces reward flip-flopping)
 SLA_SOFT_MARGIN = 0.2  # 20% buffer zone - ignore measurement jitter
