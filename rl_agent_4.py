@@ -211,12 +211,15 @@ class PrioritizedReplayBuffer:
         self.tree = SumTree(capacity)
         self.capacity = capacity
         self.alpha = alpha
+        # max_priority stores RAW priority (|TD| + eps), NOT exponentiated
+        # This avoids double-alpha bug when push() applies alpha
         self.max_priority = 1.0
         self.epsilon = 1e-5
     
-    def push(self, state, action, reward, next_state, done):
-        """Add experience with max priority."""
-        data = (state, action, reward, next_state, done)
+    def push(self, state, action, reward, next_state, terminated):
+        """Add experience with max priority (ensures new samples get sampled)."""
+        data = (state, action, reward, next_state, terminated)
+        # Apply alpha once here (max_priority is raw, not exponentiated)
         priority = self.max_priority ** self.alpha
         self.tree.add(priority, data)
     
@@ -242,14 +245,14 @@ class PrioritizedReplayBuffer:
         weights = (self.tree.n_entries * sampling_probs) ** (-beta)
         weights /= weights.max()  # Normalize
         
-        states, actions, rewards, next_states, dones = zip(*samples)
+        states, actions, rewards, next_states, terminateds = zip(*samples)
         
         return (
             np.array(states),
             actions,
             rewards,
             np.array(next_states),
-            dones,
+            terminateds,
             indices,
             weights
         )
@@ -257,9 +260,12 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, indices: List[int], td_errors: np.ndarray):
         """Update priorities based on TD errors."""
         for idx, td_error in zip(indices, td_errors):
-            priority = (abs(td_error) + self.epsilon) ** self.alpha
-            self.max_priority = max(self.max_priority, priority)
-            self.tree.update(idx, priority)
+            # Raw priority (before alpha exponentiation)
+            raw_priority = abs(td_error) + self.epsilon
+            # Update max_priority with RAW value (alpha applied in push())
+            self.max_priority = max(self.max_priority, raw_priority)
+            # Tree stores exponentiated priority
+            self.tree.update(idx, raw_priority ** self.alpha)
     
     def __len__(self) -> int:
         return self.tree.n_entries
@@ -382,9 +388,9 @@ class DQNAgent:
         beta_progress = min(1.0, self.step_count / PER_BETA_STEPS)
         self.beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * beta_progress
     
-    def push_experience(self, state, action, reward, next_state, done):
+    def push_experience(self, state, action, reward, next_state, terminated):
         """Add experience to replay buffer."""
-        self.replay_buffer.push(state, action, reward, next_state, done)
+        self.replay_buffer.push(state, action, reward, next_state, terminated)
         self.rewards.append(reward)
     
     def train_step(self) -> Optional[float]:
@@ -398,7 +404,7 @@ class DQNAgent:
             return None
         
         # Sample from prioritized replay buffer
-        (states, actions, rewards, next_states, dones, 
+        (states, actions, rewards, next_states, terminateds, 
          indices, weights) = self.replay_buffer.sample(BATCH_SIZE, self.beta)
         
         # Convert to tensors
@@ -406,7 +412,7 @@ class DQNAgent:
         actions_t = torch.LongTensor(actions).to(self.device)
         rewards_t = torch.FloatTensor(rewards).to(self.device)
         next_states_t = torch.FloatTensor(next_states).to(self.device)
-        dones_t = torch.BoolTensor(dones).to(self.device)
+        terminated_t = torch.BoolTensor(terminateds).to(self.device)
         weights_t = torch.FloatTensor(weights).to(self.device)
         
         # Current Q values
@@ -416,7 +422,7 @@ class DQNAgent:
         with torch.no_grad():
             next_actions = self.online_net(next_states_t).argmax(dim=1)
             next_q = self.target_net(next_states_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            next_q[dones_t] = 0.0
+            next_q[terminated_t] = 0.0  # Only zero bootstrap for true terminals, not truncations
             target_q = rewards_t + GAMMA * next_q
         
         # TD errors for priority update
@@ -525,7 +531,7 @@ class QoSRoutingEnv:
     MAX_ALTS = 3
     NUM_SWITCHES = 10  # Standard topology size (a1-4, c1-2, t1-4)
     
-    def __init__(self, bucket: str, token: str, org: str, url: str, verbose: bool = False):
+    def __init__(self, bucket: str, token: str, org: str, url: str, verbose: bool = False, reset_network: bool = True, production_mode: bool = False):
         self.bucket = bucket
         self.org = org
         self.url = url
@@ -537,6 +543,11 @@ class QoSRoutingEnv:
         
         # Controller for routing changes
         self.controller = Controller(verbose=verbose)
+        
+        # Reset behavior: if True, perform full network reset on each episode
+        # If False (production mode), preserve network state across resets
+        self.reset_network = reset_network
+        self.production_mode = production_mode
         
         # Initialize switch mapping for One-Hot encoding
         # We need a stable mapping of switch IDs to indices 0..N-1
@@ -559,67 +570,85 @@ class QoSRoutingEnv:
         self.last_snapshot = None
         
         # Frame stacking for velocity/trend detection
-        # Stores last STACK_SIZE raw observation states (each 19-dim)
+        # Stores last STACK_SIZE raw observation states (each 61-dim)
         self.frame_stack: deque = deque(maxlen=STACK_SIZE)
         
         # Action stacking for causality tracking
-        # Stores last STACK_SIZE actions as one-hot vectors (each 4-dim)
+        # Stores last STACK_SIZE actions as one-hot vectors (each 10-dim)
         self.action_stack: deque = deque(maxlen=STACK_SIZE)
         
-        # Preserve action history across episodes to avoid "Reset Amnesia"
-        # Network switches persist, so agent should remember what it did
-        self.prev_episode_actions: Optional[deque] = None
-        
-        # Preserve observation history across episodes to avoid "Reset Amnesia"
-        # Network state persists, so agent should remember what it observed
-        self.prev_episode_frames: Optional[deque] = None
+        # Traffic manager for dynamic profile changes (training only)
+        #self.traffic_manager = get_traffic_manager() if reset_network else None
         
     
-    def reset(self) -> np.ndarray:
+    def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
         """Reset episode and return initial stacked state.
         
-        Note: Action history is preserved across episodes to avoid "Reset Amnesia".
-        Network switches persist their state, so the agent needs to remember
-        what actions it took previously to understand the current network state.
+        Args:
+            force_reset: Override reset behavior for this episode.
+                - None: use self.reset_network default
+                - True: force baseline reset (clear tables, reprogram OSPF)
+                - False: warm-start from current state
+        
+        Curriculum-based training can use this to mix baseline-starts and warm-starts:
+        - Early training: mostly baseline-starts (agent learns from clean state)
+        - Late training: mostly warm-starts (agent learns stability/recovery)
         """
+        # Determine whether to reset this episode
+        do_reset = force_reset if force_reset is not None else self.reset_network
+        
+        # Perform full network reset if requested
+        if do_reset:
+            log.info("=== BASELINE START: Resetting network to OSPF ===")
+            
+            # Step 1: Clear all P4 tables
+            self.controller.clear_all_tables()
+            log.info("Cleared all P4 tables")
+            
+            # Step 2: Recompute baseline OSPF paths
+            self.controller.compute_forwarding_entries()
+            log.info("Recomputed OSPF forwarding entries")
+            
+            # Step 3: Program switches with baseline
+            self.controller.program_switches()
+            log.info("Programmed switches with baseline routing")
+        else:
+            log.info("=== WARM START: Continuing from current routing state ===")
+        
+        # Always randomize traffic profile for new episode (if training mode)
+        # if self.traffic_manager:
+        #     self.traffic_manager.randomize_traffic()
+        
+        # Cool-down period for traffic to stabilize (regardless of reset type)
+        cooldown = 5.0 if do_reset else 2.0  # Less cooldown for warm-start
+        log.info(f"Waiting {cooldown}s for traffic to stabilize...")
+        time.sleep(cooldown)
+        log.info("Episode start complete")
+        
+        # Reset episode counters
         self.episode_step = 0
         self.sla_streak = 0
         self.last_action = 0
         self.last_action_time = time.monotonic()
         
-        # Collect initial snapshot
+        # Collect initial snapshot (after reset if applicable)
         self.last_snapshot = self._collect_snapshot()
         raw_state = self._build_raw_state(self.last_snapshot)
         
         # Debug assertion to catch dimension mismatches early
         assert len(raw_state) == RAW_STATE_DIM, f"State dim mismatch: {len(raw_state)} != {RAW_STATE_DIM}"
         
-        # Preserve observation history across episodes (fix "Reset Amnesia")
-        # Network state persists, so agent should remember what it observed
-        if self.prev_episode_frames is not None:
-            # We are continuing from a previous episode, so keep the observation history too!
-            self.frame_stack = deque(self.prev_episode_frames, maxlen=STACK_SIZE)
-            # CRITICAL: Append current snapshot so t=now is present (not stale)
+        # Initialize frame stack with replicated first observation
+        # This provides a clean slate for each episode
+        self.frame_stack.clear()
+        for _ in range(STACK_SIZE):
             self.frame_stack.append(raw_state.copy())
-        else:
-            # Cold start (only for the very first episode)
-            self.frame_stack.clear()
-            for _ in range(STACK_SIZE):
-                self.frame_stack.append(raw_state.copy())
         
-        # Preserve action history across episodes (fix "Reset Amnesia")
-        # Network state persists, so agent should remember its previous actions
-        if self.prev_episode_actions is not None:
-            # Use actions from previous episode
-            self.action_stack = deque(self.prev_episode_actions, maxlen=STACK_SIZE)
-            # CRITICAL: Append no-op marker so t=now action slot is current
-            self.action_stack.append(self._action_to_onehot(0))
-        else:
-            # First episode: initialize with no-ops
-            noop_onehot = self._action_to_onehot(0)
-            self.action_stack.clear()
-            for _ in range(STACK_SIZE):
-                self.action_stack.append(noop_onehot.copy())
+        # Initialize action stack with no-ops
+        noop_onehot = self._action_to_onehot(0)
+        self.action_stack.clear()
+        for _ in range(STACK_SIZE):
+            self.action_stack.append(noop_onehot.copy())
         
         return self._build_stacked_state()
     
@@ -1256,16 +1285,18 @@ class QoSRoutingEnv:
         
         return ok, alt_name, alt_idx
     
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute one environment step.
         
         Args:
-            action: Action index (0-3)
+            action: Action index (0-9)
         
         Returns:
-            (next_state, reward, done, info)
-            next_state is a 716-dim stacked state
+            (next_state, reward, terminated, truncated, info)
+            - next_state: 426-dim stacked state
+            - terminated: True if absorbing state (always False for this env)
+            - truncated: True if horizon reached (episode_step >= MAX_EPISODE_STEPS)
         """
         # Increment global step counter (persists across episodes)
         self.global_step += 1
@@ -1351,13 +1382,22 @@ class QoSRoutingEnv:
         else:
             self.sla_streak = 0
         
-        # Episode ends only at MAX_EPISODE_STEPS - no early termination
-        # This lets agent learn "maintenance" (sustaining good state), not just "fixing"
-        done = self.episode_step >= MAX_EPISODE_STEPS
+        # IMPORTANT: Distinguish truncation (timeout) from termination (absorbing state)
+        # This is a continuing task - traffic never "ends". Episodes are training windows only.
+        # Truncation should still bootstrap (gamma * next_Q), termination should not.
+        terminated = False  # No true terminal states in this environment
+        if self.production_mode:
+            # Production: never truncate, run continuously
+            truncated = False
+        else:
+            # Training: truncate at horizon
+            truncated = self.episode_step >= MAX_EPISODE_STEPS
         
         info['episode_step'] = self.episode_step
         info['sla_streak'] = self.sla_streak
         info['action_applied'] = action_applied
+        info['terminated'] = terminated
+        info['truncated'] = truncated
         if alt_name is not None:
             info['alt_used'] = alt_name  # String name for stdout/CSV
             info['alt_idx'] = alt_idx    # Numeric index for InfluxDB
@@ -1431,12 +1471,7 @@ class QoSRoutingEnv:
         next_state = self._build_stacked_state()
         self.last_snapshot = next_snapshot
         
-        # Save action and observation history for next episode (fix "Reset Amnesia")
-        if done:
-            self.prev_episode_actions = deque(self.action_stack, maxlen=STACK_SIZE)
-            self.prev_episode_frames = deque(self.frame_stack, maxlen=STACK_SIZE)
-        
-        return next_state, reward, done, info
+        return next_state, reward, terminated, truncated, info
     
     def get_valid_actions(self) -> np.ndarray:
         """Get valid action mask for current state."""
@@ -1586,14 +1621,24 @@ def train(args):
     try:
         while total_steps < args.steps:
             episode += 1
-            state = env.reset()
+            
+            # === CURRICULUM-BASED RESET STRATEGY ===
+            # Early training: mostly baseline-starts (learn to optimize from clean state)
+            # Late training: mostly warm-starts (learn stability/recovery)
+            # Schedule: 80% reset at start → 20% reset at end
+            progress = total_steps / args.steps
+            reset_prob = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
+            do_reset = random.random() < reset_prob
+            
+            state = env.reset(force_reset=do_reset)
             episode_reward = 0.0
             episode_steps = 0
             done = False
             prev_action = 0  # Track previous action for churn metrics
             
+            reset_type = "BASELINE" if do_reset else "WARM"
             log.info(f"\n{'='*50}")
-            log.info(f"Episode {episode} started (total steps: {total_steps})")
+            log.info(f"Episode {episode} [{reset_type}] (total steps: {total_steps}, reset_prob={reset_prob:.2f})")
             
             while not done and total_steps < args.steps:
                 total_steps += 1
@@ -1603,13 +1648,15 @@ def train(args):
                 valid_mask = env.get_valid_actions()
                 action = agent.select_action(state, valid_mask, explore=True)
                 
-                # Take step
-                next_state, reward, done, info = env.step(action)
+                # Take step - returns terminated, truncated separately
+                next_state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated  # For loop control
                 
                 # Only store experience and update epsilon if telemetry data is valid
                 # Invalid data (fallback values: 2x SLA, DROP_CAP, UTIL_CAP) would poison the replay buffer
+                # CRITICAL: Store 'terminated' not 'done' - truncation should still bootstrap!
                 if info.get('data_valid', False):
-                    agent.push_experience(state, action, reward, next_state, done)
+                    agent.push_experience(state, action, reward, next_state, terminated)
                     agent.update_epsilon()
                 else:
                     log.debug(f"[Step {total_steps}] Skipping experience storage - invalid telemetry")
@@ -1732,7 +1779,8 @@ def evaluate(args):
             valid_mask = env.get_valid_actions()
             action = agent.select_action(state, valid_mask, explore=False)
             
-            next_state, reward, done, info = env.step(action)
+            next_state, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
             
             total_reward += reward
             sla_met_total += len(info['sla_met'])

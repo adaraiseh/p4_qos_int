@@ -185,6 +185,34 @@ class Controller:
                     [next_hop_ip, str(egress_port)]
                 )
 
+    def clear_all_tables(self):
+        """
+        Clear all P4 tables on all switches and reset internal state.
+        Used for episodic resets in RL training.
+        """
+        for sw_name, controller in self.controllers.items():
+            try:
+                # Clear all three tables used in program_switches
+                self._call(controller.table_clear, "l3_forward.ipv4_lpm")
+                self._call(controller.table_clear, "port_forward.switching_table")
+                self._call(controller.table_clear, "port_forward.mac_rewriting_table")
+            except Exception as e:
+                print(f"[WARN] Failed to clear tables on {sw_name}: {e}")
+        
+        # Clear internal state to match physical state
+        self.forwarding_entries.clear()
+        self.change_history_by_qid.clear()
+        
+        # Reset usage tracking
+        self.switch_usage.clear()
+        self.queue_changes = {0: 0, 1: 0, 7: 0}
+        self.queue_last_change_step = {0: 0, 1: 0, 7: 0}
+        
+        # Clear paths per queue (will be repopulated by compute_forwarding_entries)
+        for qid in self.paths_per_queue:
+            self.paths_per_queue[qid].clear()
+
+
     # -----------------------
     # Table/aux helpers
     # -----------------------

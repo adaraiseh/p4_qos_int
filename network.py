@@ -299,8 +299,8 @@ def config_network(p4):
     LOAD_FACTOR = 3.5
     PER_QUEUE_BW = {
         0: 0.1 * LOAD_FACTOR,
-        1: 0.2 * LOAD_FACTOR,
-        7: 0.3 * LOAD_FACTOR,
+        1: 0.1 * LOAD_FACTOR,
+        7: 0.4 * LOAD_FACTOR,
     }
     PER_QUEUE_LEN = {0: 1250, 1: 1250, 7: 1250}
 

@@ -83,7 +83,7 @@ class ProductionAgent:
         self.network.eval()
         
         # Q-value tracking for metrics
-        self.last_q_values = None
+        self.last_stats = None
     
     def select_action(self, state: np.ndarray, valid_mask: np.ndarray) -> int:
         """
@@ -93,34 +93,57 @@ class ProductionAgent:
         valid_actions = np.where(valid_mask)[0]
         
         if len(valid_actions) == 0:
-            self.last_q_values = None
+            self.last_stats = None
             return 0  # Default to no-op
         
         with torch.no_grad():
             state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.network(state_t).squeeze(0).cpu().numpy()
             
-            # Store for metrics
-            self.last_q_values = q_values.copy()
+            # Mask invalid actions with -inf
+            q_values_masked = q_values.copy()
+            q_values_masked[~valid_mask] = -np.inf
             
-            # Mask invalid actions
-            q_values[~valid_mask] = -np.inf
-            return int(np.argmax(q_values))
+            # Select action
+            action = int(np.argmax(q_values_masked))
+            
+            # Compute stats on VALID actions only
+            valid_q = q_values[valid_mask]
+            chosen_q = float(q_values[action])
+            
+            # Gap: Difference between chosen Q and second best valid Q
+            if len(valid_q) > 1:
+                # Sort valid Qs descending
+                sorted_valid = np.sort(valid_q)[::-1]
+                # sorted_valid[0] is chosen_q (since check above ensures we picked max)
+                second_best = float(sorted_valid[1])
+                q_gap = chosen_q - second_best
+            else:
+                q_gap = 0.0
+                
+            self.last_stats = {
+                'q_max': float(np.max(valid_q)),
+                'q_mean': float(np.mean(valid_q)),
+                'q_min': float(np.min(valid_q)),
+                'chosen_q': chosen_q,
+                'q_gap': q_gap
+            }
+            
+            return action
     
     def get_q_stats(self) -> Dict:
         """Get Q-value statistics from last action selection."""
-        if self.last_q_values is None:
-            return {'q_max': 0.0, 'q_mean': 0.0, 'q_min': 0.0}
+        if self.last_stats is None:
+            return {'q_max': 0.0, 'q_mean': 0.0, 'q_min': 0.0, 'chosen_q': 0.0, 'q_gap': 0.0}
         
-        return {
-            'q_max': float(np.max(self.last_q_values)),
-            'q_mean': float(np.mean(self.last_q_values)),
-            'q_min': float(np.min(self.last_q_values)),
-        }
+        return self.last_stats
     
     def load(self, path: str):
         """Load model weights."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        try:
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['online_net'])
         log.info(f"Model loaded from {path}")
 
@@ -148,6 +171,7 @@ class ProductionMetricsWriter:
         self.cumulative_reward = 0.0
         self.total_sla_checks = 0
         self.total_sla_met = 0
+        self.total_steps = 0
         self.start_time = time.time()
     
     def write_metrics(self, step: int, action: int, reward: float, 
@@ -157,7 +181,9 @@ class ProductionMetricsWriter:
         
         Measurement: rl_production
         """
+
         # Update rolling stats
+        self.total_steps += 1
         self.rewards.append(reward)
         sla_met_count = len(info.get('sla_met', []))
         self.sla_met_history.append(sla_met_count == len(QIDS))
@@ -193,9 +219,10 @@ class ProductionMetricsWriter:
                 .field("reward", float(reward))
                 .field("raw_reward", float(info.get('raw_reward', reward)))
                 
-                # Q-value metrics
                 .field("q_values_max", float(q_stats['q_max']))
                 .field("q_values_mean", float(q_stats['q_mean']))
+                .field("chosen_q", float(q_stats.get('chosen_q', 0.0)))
+                .field("q_gap", float(q_stats.get('q_gap', 0.0)))
                 
                 # SLA metrics
                 .field("sla_met_count", int(sla_met_count))
@@ -240,7 +267,7 @@ class ProductionMetricsWriter:
     def get_summary(self) -> Dict:
         """Get summary statistics."""
         return {
-            'total_steps': len(self.rewards),
+            'total_steps': self.total_steps,
             'cumulative_reward': self.cumulative_reward,
             'avg_reward_100': np.mean(self.rewards) if self.rewards else 0.0,
             'overall_sla_compliance': (self.total_sla_met / max(1, self.total_sla_checks)) * 100,
@@ -299,7 +326,10 @@ class ProductionRunner:
         env = QoSRoutingEnv(
             args.influx_bucket, args.influx_token,
             args.influx_org, args.influx_url,
-            verbose=args.verbose
+            verbose=args.verbose,
+
+            reset_network=False,  # Production: never reset network state
+            production_mode=True  # Production: continuous operation
         )
         agent = ProductionAgent(STATE_DIM, ACTION_DIM, device)
         metrics = ProductionMetricsWriter(
@@ -321,8 +351,8 @@ class ProductionRunner:
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             'step', 'action', 'action_name', 'reward', 'raw_reward',
-            'q_max', 'q_mean', 'sla_met_count', 'sla_streak',
-            'action_applied', 'pressure', 'timestamp'
+            'q_max', 'q_mean', 'chosen_q', 'q_gap',
+            'sla_met_count', 'sla_streak', 'action_applied', 'pressure', 'timestamp'
         ])
         log.info(f"Production log: {csv_path}")
         
@@ -345,7 +375,7 @@ class ProductionRunner:
                 q_stats = agent.get_q_stats()
                 
                 # Take step
-                next_state, reward, done, info = env.step(action)
+                next_state, reward, terminated, truncated, info = env.step(action)
                 
                 # Write metrics to InfluxDB
                 metrics.write_metrics(self.step, action, reward, info, q_stats)
@@ -375,6 +405,7 @@ class ProductionRunner:
                     self.step, action, action_name, reward,
                     info.get('raw_reward', reward),
                     q_stats['q_max'], q_stats['q_mean'],
+                    q_stats.get('chosen_q', 0.0), q_stats.get('q_gap', 0.0),
                     len(info['sla_met']), info.get('sla_streak', 0),
                     int(info.get('action_applied', False)),
                     info.get('pressure', 0),
@@ -382,16 +413,8 @@ class ProductionRunner:
                 ])
                 csv_file.flush()
                 
-                # Update state (no episode reset)
+                # Update state (production mode never terminates/truncates)
                 state = next_state
-                
-                # If episode would end, just continue from current state
-                # (production mode runs continuously)
-                if done:
-                    log.info(f"Episode boundary reached at step {self.step}, continuing...")
-                    # Reset internal counters but keep state
-                    env.episode_step = 0
-                    env.sla_streak = 0
         
         except Exception as e:
             log.error(f"Production loop error: {e}", exc_info=True)
