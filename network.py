@@ -210,29 +210,37 @@ def config_network(p4):
         host = net.addHost(f'h{i}')
         hosts.append(host)
 
+    current_thrift_port = 9200
+
     # ToR (Edge) switches
     tor_switches = []
     for i in range(1, tor_nodes + 1):
         tor_switch = net.addP4Switch(f't{i}', priority_queues_num=8,
                                      max_link_bw=host_tor_bw,
+                                     thrift_port=current_thrift_port,
                                      cli_input=default_rule + f't{i}-commands.txt')
         tor_switches.append(tor_switch)
+        current_thrift_port += 1
 
     # Aggregate switches
     agg_switches = []
     for i in range(1, agg_nodes + 1):
         agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=8,
                                      max_link_bw=tor_agg_bw,
+                                     thrift_port=current_thrift_port,
                                      cli_input=default_rule + f'a{i}-commands.txt')
         agg_switches.append(agg_switch)
+        current_thrift_port += 1
 
     # Core switches
     core_switches = []
     for i in range(1, core_nodes + 1):
         core_switch = net.addP4Switch(f'c{i}', priority_queues_num=8,
                                       max_link_bw=agg_core_bw,
+                                      thrift_port=current_thrift_port,
                                       cli_input=default_rule + f'c{i}-commands.txt')
         core_switches.append(core_switch)
+        current_thrift_port += 1
 
     net.setP4SourceAll(p4)
 
