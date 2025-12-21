@@ -55,3 +55,11 @@ test:
 # run RL agent v4 with best model
 test_best:
 	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag best $(VERBOSE_FLAG) --log-every 1
+
+# run RL agent v4 in production mode (inference only, comprehensive metrics logging)
+production:
+	PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag best --log-every 1 $(VERBOSE_FLAG)
+
+# run production with final model
+production_final:
+	PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final --log-every 1 $(VERBOSE_FLAG)
