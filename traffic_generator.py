@@ -33,7 +33,7 @@ import time
 import random
 import subprocess
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from p4utils.utils.task_scheduler import Task, TaskClient
 
@@ -55,26 +55,66 @@ class TrafficManager:
     # Unique marker for identifying traffic processes (used by pkill)
     TRAFFIC_TAG = "__RL_TRAFFIC__"
     
-    # 6 Traffic profiles: 2 light, 2 medium, 2 high
-    # Format: {qid: (min_mbps, max_mbps)}
+    # 6 Training profiles: 2 light, 2 medium, 2 high
+    # Format: {qid: (min_mbps, max_mbps)} where qid 0=Voice, 1=Video, 7=BE
     # Network: ToR-Agg bottleneck at 5 Mbps, each sender has 3 flows
     TRAFFIC_PROFILES = {
-        # Light traffic (~10-35% of bottleneck capacity)
-        'light_1': {0: (0.05, 0.10), 1: (0.05, 0.15), 7: (0.10, 0.20)},
-        'light_2': {0: (0.08, 0.12), 1: (0.10, 0.18), 7: (0.15, 0.25)},
-        # Medium traffic (~30-65% of bottleneck capacity)
-        'medium_1': {0: (0.12, 0.20), 1: (0.15, 0.25), 7: (0.25, 0.40)},
-        'medium_2': {0: (0.15, 0.25), 1: (0.20, 0.30), 7: (0.30, 0.50)},
-        # High traffic (~65-120% of bottleneck - causes congestion)
-        'high_1': {0: (0.25, 0.35), 1: (0.30, 0.45), 7: (0.50, 0.80)},
-        'high_2': {0: (0.30, 0.45), 1: (0.35, 0.55), 7: (0.70, 1.00)},
+        # Light traffic (~35-65% of bottleneck capacity)
+        'light_1': {0: (0.16, 0.25), 1: (0.18, 0.32), 7: (0.29, 0.49)},
+        'light_2': {0: (0.22, 0.32), 1: (0.27, 0.42), 7: (0.42, 0.62)},
+        # Medium traffic (~60-100% of bottleneck capacity)
+        'medium_1': {0: (0.30, 0.43), 1: (0.38, 0.53), 7: (0.59, 0.83)},
+        'medium_2': {0: (0.36, 0.50), 1: (0.45, 0.65), 7: (0.70, 0.95)},
+        # High traffic (~80-125% of bottleneck - causes severe congestion)
+        'high_1': {0: (0.37, 0.53), 1: (0.46, 0.65), 7: (0.73, 0.98)},
+        'high_2': {0: (0.46, 0.65), 1: (0.57, 0.82), 7: (0.89, 1.22)},
     }
+    
+    # TEST profiles for production - NOT used in training
+    # These provide varied workload patterns to test agent robustness
+    TEST_TRAFFIC_PROFILES = {
+        # === BE-heavy scenarios (high BE, low voice/video) ===
+        'test_be_heavy_1': {0: (0.05, 0.10), 1: (0.10, 0.20), 7: (1.00, 1.40)},
+        'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.20, 1.60)},
+        
+        # === Video-heavy scenarios (high video, low voice/BE) ===
+        'test_video_heavy_1': {0: (0.08, 0.15), 1: (0.80, 1.10), 7: (0.20, 0.35)},
+        'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.00, 1.30), 7: (0.25, 0.40)},
+        
+        # === Voice-heavy scenarios (high voice, low video/BE) ===
+        'test_voice_heavy_1': {0: (0.60, 0.85), 1: (0.10, 0.20), 7: (0.20, 0.35)},
+        'test_voice_heavy_2': {0: (0.80, 1.10), 1: (0.15, 0.25), 7: (0.25, 0.40)},
+        
+        # === Imbalanced scenarios (one queue dominates) ===
+        'test_be_only': {0: (0.02, 0.05), 1: (0.02, 0.05), 7: (1.50, 2.00)},
+        'test_video_only': {0: (0.02, 0.05), 1: (1.20, 1.60), 7: (0.05, 0.10)},
+        'test_voice_only': {0: (0.90, 1.20), 1: (0.02, 0.05), 7: (0.05, 0.10)},
+        
+        # === Extreme congestion scenarios ===
+        'test_extreme_1': {0: (0.50, 0.70), 1: (0.70, 0.95), 7: (1.20, 1.50)},
+        'test_extreme_2': {0: (0.60, 0.85), 1: (0.80, 1.10), 7: (1.40, 1.80)},
+        
+        # === Minimal load (near idle) ===
+        'test_idle_1': {0: (0.02, 0.05), 1: (0.03, 0.08), 7: (0.05, 0.12)},
+        'test_idle_2': {0: (0.05, 0.10), 1: (0.08, 0.15), 7: (0.10, 0.20)},
+    }
+    
+    # Combined profiles for lookup (training + test)
+    ALL_PROFILES = {**TRAFFIC_PROFILES, **TEST_TRAFFIC_PROFILES}
     
     # Profile categories for logging
     PROFILE_CATEGORIES = {
+        # Training profiles
         'light_1': 'light', 'light_2': 'light',
         'medium_1': 'medium', 'medium_2': 'medium',
         'high_1': 'high', 'high_2': 'high',
+        # Test profiles
+        'test_be_heavy_1': 'test_be', 'test_be_heavy_2': 'test_be',
+        'test_video_heavy_1': 'test_video', 'test_video_heavy_2': 'test_video',
+        'test_voice_heavy_1': 'test_voice', 'test_voice_heavy_2': 'test_voice',
+        'test_be_only': 'test_extreme', 'test_video_only': 'test_extreme', 'test_voice_only': 'test_extreme',
+        'test_extreme_1': 'test_extreme', 'test_extreme_2': 'test_extreme',
+        'test_idle_1': 'test_idle', 'test_idle_2': 'test_idle',
     }
     
     # Host IP mapping (h1-h8)
@@ -118,10 +158,16 @@ class TrafficManager:
         self.current_profile_name: str = ""
         self.current_profile_category: str = ""
         
-        # Round-robin index for equal profile distribution
-        self._profile_index = 0
+        # Balanced random selection with 60-episode windows
         self._profile_names = list(self.TRAFFIC_PROFILES.keys())
-        random.shuffle(self._profile_names)
+        self._episode_count = 0
+        self._window_size = 60  # Rebalance weights every 60 episodes
+        self._usage_counts = {name: 0 for name in self._profile_names}
+        
+        # Burst state tracking
+        self._burst_active = False
+        self._burst_end_time = 0.0
+        self._next_burst_time = 0.0
     
     def _discover_traffic_hosts(self) -> List[str]:
         """Discover traffic hosts from topology (hosts with id < 100)."""
@@ -205,11 +251,17 @@ class TrafficManager:
             log.warning(f"Failed to kill traffic: {e}")
         time.sleep(0.5)
     
-    def start_traffic(self, packet_len: int = 1250) -> Dict[str, any]:
-        """Start traffic with a randomly selected profile (round-robin).
+    def start_traffic(self, packet_len: int = 1250,
+                       category_weights: Dict[str, float] = None,
+                       profile_name: str = None) -> Dict[str, any]:
+        """Start traffic with a selected profile.
         
         Args:
             packet_len: UDP packet length in bytes
+            category_weights: Optional category weights, e.g. {'light': 0.2, 'medium': 0.3, 'high': 0.5}
+                             If provided, selects category first then random profile within category.
+            profile_name: Optional specific profile name (e.g., 'high_1', 'medium_2').
+                         If provided, uses this profile directly (overrides category_weights).
             
         Returns:
             Dict with profile info for logging
@@ -217,13 +269,38 @@ class TrafficManager:
         self.stop_traffic()
         time.sleep(0.3)
         
-        # Select next profile (round-robin)
-        self.current_profile_name = self._profile_names[self._profile_index]
-        self._profile_index = (self._profile_index + 1) % len(self._profile_names)
+        if profile_name:
+            # Use specific profile by name (supports training and test profiles)
+            if profile_name not in self.ALL_PROFILES:
+                log.warning(f"Unknown profile '{profile_name}', using high_1")
+                profile_name = 'high_1'
+            self.current_profile_name = profile_name
+        elif category_weights:
+            # Select category based on weights, then random profile in that category
+            category = random.choices(
+                list(category_weights.keys()),
+                weights=list(category_weights.values())
+            )[0]
+            profiles_in_category = [p for p in self._profile_names 
+                                    if self.PROFILE_CATEGORIES[p] == category]
+            self.current_profile_name = random.choice(profiles_in_category)
+        else:
+            # Balanced selection with rebalancing every 60 episodes
+            self._episode_count += 1
+            
+            if self._episode_count % self._window_size == 1:
+                self._usage_counts = {name: 0 for name in self._profile_names}
+            
+            max_usage = max(self._usage_counts.values()) if any(self._usage_counts.values()) else 0
+            weights = [max_usage + 1 - self._usage_counts[name] for name in self._profile_names]
+            
+            self.current_profile_name = random.choices(self._profile_names, weights=weights, k=1)[0]
+            self._usage_counts[self.current_profile_name] += 1
+        
         self.current_profile_category = self.PROFILE_CATEGORIES[self.current_profile_name]
         
-        # Randomize load within profile ranges
-        profile_ranges = self.TRAFFIC_PROFILES[self.current_profile_name]
+        # Randomize load within profile ranges (use ALL_PROFILES for test profiles)
+        profile_ranges = self.ALL_PROFILES[self.current_profile_name]
         self.current_load = {
             qid: random.uniform(*rng) for qid, rng in profile_ranges.items()
         }
@@ -242,6 +319,55 @@ class TrafficManager:
             'profile_category': self.current_profile_category,
             'loads': self.current_load.copy(),
         }
+    
+    def check_burst(self, burst_interval: float = 60.0, min_duration: float = 10.0, 
+                    max_duration: float = 300.0) -> Optional[str]:
+        """Check and manage periodic BE burst traffic.
+        
+        Call this regularly from the production loop. It will:
+        - Start a burst every `burst_interval` seconds
+        - Each burst has a random duration between min and max
+        - Restart normal traffic when burst ends
+        
+        Args:
+            burst_interval: Seconds between burst starts (default 60)
+            min_duration: Minimum burst duration in seconds (default 10)
+            max_duration: Maximum burst duration in seconds (default 300 = 5 min)
+            
+        Returns:
+            Status message if state changed, None otherwise
+        """
+        current_time = time.time()
+        
+        # Initialize next burst time on first call
+        if self._next_burst_time == 0.0:
+            self._next_burst_time = current_time + burst_interval
+            return None
+        
+        # Check if burst should end
+        if self._burst_active and current_time >= self._burst_end_time:
+            self._burst_active = False
+            self._next_burst_time = current_time + burst_interval
+            # Restart with base profile (test_bursty uses medium-ish base load)
+            self.start_traffic(profile_name='medium_1')
+            return "BURST ENDED - Returning to normal traffic"
+        
+        # Check if burst should start
+        if not self._burst_active and current_time >= self._next_burst_time:
+            self._burst_active = True
+            burst_duration = random.uniform(min_duration, max_duration)
+            self._burst_end_time = current_time + burst_duration
+            
+            # Start burst with very high BE load
+            self.start_traffic(profile_name='test_be_only')
+            
+            # Log burst info
+            mins = int(burst_duration // 60)
+            secs = int(burst_duration % 60)
+            duration_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
+            return f"BURST STARTED - High BE traffic for {duration_str}"
+        
+        return None
     
     def _start_servers(self):
         """Start iperf3 servers on receiver hosts."""

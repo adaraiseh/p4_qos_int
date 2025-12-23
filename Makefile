@@ -38,16 +38,27 @@ monitor:
 	python3 monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
 
 # run RL agent v4 (recommended) in training mode
+# Traffic weights: 50% high, 30% medium, 20% light
 train:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 25000 --log-every 1 $(VERBOSE_FLAG)
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 30000 \
+		--traffic-weights "light:0.2,medium:0.3,high:0.5" \
+		--log-every 1 $(VERBOSE_FLAG)
+
+# quick training test (100 steps, 10-step episodes, no warm-start)
+train_test:
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 100 --max-episode-steps 10 --no-warm-start --log-every 1 $(VERBOSE_FLAG)
 
 # resume RL agent v4 training from checkpoint (default: 50pct)
 # Usage: make resume or make resume CHECKPOINT=best
+# Traffic weights: 50% high, 30% medium, 20% light
 ifndef CHECKPOINT
 CHECKPOINT = 50pct
 endif
 resume:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 --resume $(CHECKPOINT) --log-every 1 $(VERBOSE_FLAG)
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 \
+		--resume $(CHECKPOINT) --resume-eps 0.10 \
+		--traffic-weights "light:0.2,medium:0.3,high:0.5" \
+		--log-every 1 $(VERBOSE_FLAG)
 
 # run RL agent v4 in evaluation mode
 test:
@@ -58,9 +69,23 @@ test_best:
 	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag best $(VERBOSE_FLAG) --log-every 1
 
 # run RL agent v4 in production mode (inference only, comprehensive metrics logging)
+# Usage: make production or make production PROFILE=high_2
+ifndef PROFILE
+PROFILE = high_1
+endif
 production:
-	PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag best --log-every 1 $(VERBOSE_FLAG)
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag best \
+		--generate-traffic --traffic-profile $(PROFILE) \
+		--log-every 1 $(VERBOSE_FLAG)
 
 # run production with final model
 production_final:
-	PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final --log-every 1 $(VERBOSE_FLAG)
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final \
+		--generate-traffic --traffic-profile $(PROFILE) \
+		--log-every 1 $(VERBOSE_FLAG)
+
+# run production with periodic BE bursts (every 60s, 10s-5min duration)
+production_bursty:
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final \
+		--generate-traffic --traffic-profile medium_1 --bursty-mode \
+		--log-every 1 $(VERBOSE_FLAG)

@@ -42,6 +42,7 @@ from rl_agent_4 import (
     DuelingDQN, QoSRoutingEnv,
     STATE_DIM, ACTION_DIM, HIDDEN_DIM, QIDS, SLA_THRESHOLDS
 )
+from traffic_generator import TrafficManager
 
 # =============================================================================
 #                              LOGGING SETUP
@@ -344,6 +345,18 @@ class ProductionRunner:
             return
         agent.load(weights_path)
         
+        # Traffic generation (optional) - fixed profile for entire run
+        traffic_manager = None
+        if args.generate_traffic:
+            traffic_manager = TrafficManager()
+            log.info(f"Traffic generation enabled with profile: {args.traffic_profile}")
+            
+            # Start traffic with fixed profile
+            profile_info = traffic_manager.start_traffic(profile_name=args.traffic_profile)
+            log.info(f"Started traffic: {profile_info['profile_name']} ({profile_info['profile_category']})")
+            log.info("Waiting 20s for traffic to stabilize...")
+            time.sleep(20.0)
+        
         # CSV logging
         os.makedirs('data', exist_ok=True)
         csv_path = f"data/production_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -368,6 +381,12 @@ class ProductionRunner:
                 if args.steps > 0 and self.step > args.steps:
                     log.info(f"Reached step limit ({args.steps}), stopping...")
                     break
+                
+                # Check for bursty mode traffic changes
+                if traffic_manager and args.bursty_mode:
+                    burst_msg = traffic_manager.check_burst()
+                    if burst_msg:
+                        log.info(f"[Step {self.step}] {burst_msg}")
                 
                 # Get valid actions and select action (no exploration)
                 valid_mask = env.get_valid_actions()
@@ -438,6 +457,9 @@ class ProductionRunner:
             csv_file.close()
             metrics.close()
             env.close()
+            if traffic_manager:
+                traffic_manager.stop_traffic()
+                log.info("Stopped traffic generation")
             
             log.info(f"Production log saved to: {csv_path}")
             log.info("Shutdown complete.")
@@ -471,6 +493,14 @@ def main():
     # Controller
     parser.add_argument('--verbose', action='store_true',
                         help='Show verbose P4 controller output')
+    
+    # Traffic generation
+    parser.add_argument('--generate-traffic', action='store_true',
+                        help='Generate traffic with a fixed profile')
+    parser.add_argument('--traffic-profile', type=str, default='high_1',
+                        help='Traffic profile name: light_1, light_2, medium_1, medium_2, high_1, high_2, test_*')
+    parser.add_argument('--bursty-mode', action='store_true',
+                        help='Enable periodic BE bursts every 60s with random duration (10s-5min)')
     
     args = parser.parse_args()
     

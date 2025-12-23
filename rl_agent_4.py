@@ -105,7 +105,7 @@ PER_BETA_STEPS = 10_000
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 5_000
+EPS_DECAY_STEPS = 20_000  # Decay over 60% of training for thorough exploration
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
@@ -113,11 +113,11 @@ TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
 # Environment timing - tuned for 100% post-action data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
 # Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
-WINDOW_SECONDS = 1.4        # 1.4-second observation window (faster training)
-SAFETY_LAG_MS = 300         # 300ms safety lag for InfluxDB
+WINDOW_SECONDS = 1.5        # 0.9-second observation window (faster training)
+SAFETY_LAG_MS = 200         # 200ms safety lag for InfluxDB
 COOLDOWN_SECONDS = 0.0      # Short cooldown for faster learning
-DELAY_AFTER_ACTION = 2.0    # Wait 2.0s for post-action data (1.4+0.3+margin)
-DELAY_NO_ACTION = 2.0       # Low-pass filter: smooth observations during stable periods
+DELAY_AFTER_ACTION = 1.8    # Wait 1.0s for post-action data (1.5+200ms+margin)
+DELAY_NO_ACTION = 1.8       # Low-pass filter: smooth observations during stable periods
 
 # Freshness validation - minimum data points required per metric in window
 MIN_POINTS_PER_METRIC = 2   # Require at least 2 points to detect stale data
@@ -141,15 +141,15 @@ LAT_RATIO_CAP = 3.0  # Cap latency ratio at 3x SLA (prevents instability)
 LAT_DIFF_CAP = 2.0   # Cap lat difference features to [-2, +2]
 
 # Reward weights - TUNED to prevent tanh saturation
-REWARD_SLA_MET_SCALE = 0.5          # Reduced from 1.0
-REWARD_SLA_VIOLATED_SCALE = 0.4     # Reduced from 0.8
+REWARD_SLA_MET_SCALE = 0.5         # Reduced from 1.0
+REWARD_SLA_VIOLATED_SCALE = 0.1     # Reduced from 0.8
 REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
 
 # Queue-specific action cost (replaces pressure-based approach)
 # Cost depends on whether the TARGETED queue's SLA is met:
 #   - If targeting a healthy queue → high cost (risky, don't break what works)
 #   - If targeting a sick queue → low cost (encouraged to fix)
-REWARD_ACTION_COST_HEALTHY = 0.50   # Cost when targeting a queue with SLA met
+REWARD_ACTION_COST_HEALTHY = 0.65   # Cost when targeting a queue with SLA met
 REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA violated
 
 # Soft margin around SLA (reduces reward flip-flopping)
@@ -457,7 +457,7 @@ class DQNAgent:
         return self.last_loss
     
     def save(self, path: str):
-        """Save model checkpoint."""
+        """Save model checkpoint including replay buffer."""
         torch.save({
             'online_net': self.online_net.state_dict(),
             'target_net': self.target_net.state_dict(),
@@ -465,11 +465,17 @@ class DQNAgent:
             'step_count': self.step_count,
             'eps': self.eps,
             'beta': self.beta,
+            # Replay buffer state for resume continuity
+            'replay_tree': self.replay_buffer.tree.tree.copy(),
+            'replay_data': self.replay_buffer.tree.data.copy(),
+            'replay_write': self.replay_buffer.tree.write,
+            'replay_n_entries': self.replay_buffer.tree.n_entries,
+            'replay_max_priority': self.replay_buffer.max_priority,
         }, path)
-        log.info(f"Model saved to {path}")
+        log.info(f"Model saved to {path} (with replay buffer: {len(self.replay_buffer)} experiences)")
     
     def load(self, path: str):
-        """Load model checkpoint."""
+        """Load model checkpoint including replay buffer if available."""
         checkpoint = torch.load(path, map_location=self.device)
         self.online_net.load_state_dict(checkpoint['online_net'])
         self.target_net.load_state_dict(checkpoint['target_net'])
@@ -477,6 +483,18 @@ class DQNAgent:
         self.step_count = checkpoint.get('step_count', 0)
         self.eps = checkpoint.get('eps', EPS_END)
         self.beta = checkpoint.get('beta', PER_BETA_END)
+        
+        # Load replay buffer if available
+        if 'replay_tree' in checkpoint:
+            self.replay_buffer.tree.tree = checkpoint['replay_tree']
+            self.replay_buffer.tree.data = checkpoint['replay_data']
+            self.replay_buffer.tree.write = checkpoint['replay_write']
+            self.replay_buffer.tree.n_entries = checkpoint['replay_n_entries']
+            self.replay_buffer.max_priority = checkpoint['replay_max_priority']
+            log.info(f"Loaded replay buffer with {len(self.replay_buffer)} experiences")
+        else:
+            log.info("No replay buffer in checkpoint, starting fresh")
+        
         log.info(f"Model loaded from {path}")
     
     def get_stats(self) -> Dict:
@@ -584,6 +602,7 @@ class QoSRoutingEnv:
         # Current traffic profile for logging
         self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", etc.
         self.current_traffic_category = ""  # "light", "medium", "high"
+        self.traffic_category_weights = None  # Optional: {'light': 0.2, 'medium': 0.3, 'high': 0.5}
     
     def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
         """Reset episode and return initial stacked state.
@@ -622,14 +641,14 @@ class QoSRoutingEnv:
         # Start randomized traffic for new episode (training mode only)
         if self.traffic_manager:
             log.info("Starting randomized traffic profile...")
-            profile_info = self.traffic_manager.start_traffic()
+            profile_info = self.traffic_manager.start_traffic(category_weights=self.traffic_category_weights)
             self.current_traffic_profile = profile_info['profile_name']
             self.current_traffic_category = profile_info['profile_category']
-            log.info(f"Traffic profile: {self.current_traffic_profile} ({self.current_traffic_category})")
+            log.info(f"Traffic started: {self.current_traffic_profile} ({self.current_traffic_category})")
         
-        # Cool-down period for traffic to stabilize (regardless of reset type)
+        # Cool-down period for traffic to stabilize (traffic is now running)
         cooldown = 5.0 if do_reset else 2.0  # Less cooldown for warm-start
-        log.info(f"Waiting {cooldown}s for traffic to stabilize...")
+        log.info(f"Traffic running, waiting {cooldown}s for metrics to stabilize...")
         time.sleep(cooldown)
         log.info("Episode start complete")
         
@@ -1553,6 +1572,31 @@ class QoSRoutingEnv:
         except Exception as e:
             log.debug(f"Failed to write training metrics: {e}")
     
+    def write_episode_metrics(self, episode: int, episode_steps: int, episode_reward: float,
+                               rolling_avg_100: float, traffic_profile: str, traffic_category: str):
+        """Write episode summary metrics to InfluxDB.
+        
+        Args:
+            episode: Episode number
+            episode_steps: Steps in this episode
+            episode_reward: Average reward per step for this episode
+            rolling_avg_100: Rolling 100-episode average of episode_reward
+        """
+        try:
+            p = (
+                Point("rl_episode_v4")
+                .field("episode", int(episode))
+                .field("episode_steps", int(episode_steps))
+                .field("episode_reward", float(episode_reward))
+                .field("rolling_avg_100", float(rolling_avg_100))
+                .tag("traffic_profile", str(traffic_profile))
+                .tag("traffic_category", str(traffic_category))
+                .time(datetime.utcnow())
+            )
+            self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
+        except Exception as e:
+            log.debug(f"Failed to write episode metrics: {e}")
+    
     def close(self):
         """Clean up resources."""
         try:
@@ -1567,6 +1611,9 @@ class QoSRoutingEnv:
 # =============================================================================
 def train(args):
     """Main training loop."""
+    global MAX_EPISODE_STEPS
+    MAX_EPISODE_STEPS = args.max_episode_steps
+    
     log.info("=" * 60)
     log.info("Starting RL Training - DQN Agent v4 (Stacked Obs + Actions)")
     log.info("=" * 60)
@@ -1579,7 +1626,7 @@ def train(args):
     log.info(f"  Min replay: {MIN_REPLAY_SIZE}")
     log.info(f"  Epsilon: {EPS_START} -> {EPS_END} over {EPS_DECAY_STEPS} steps")
     log.info(f"  Timing: Window={WINDOW_SECONDS}s, Delay={DELAY_AFTER_ACTION}s, Cooldown={COOLDOWN_SECONDS}s")
-    log.info(f"  Max steps: {args.steps}")
+    log.info(f"  Max steps: {args.steps}, Max episode steps: {MAX_EPISODE_STEPS}")
     log.info("=" * 60)
     
     # Set seeds for reproducibility
@@ -1604,13 +1651,30 @@ def train(args):
         if os.path.exists(resume_path):
             agent.load(resume_path)
             log.info(f"Resumed training from {resume_path}")
+            
+            # Override epsilon if specified
+            if args.resume_eps is not None:
+                agent.eps = args.resume_eps
+                agent.step_count = 0  # Reset step count for fresh epsilon decay
+                log.info(f"Reset epsilon to {agent.eps} for resume training")
         else:
             log.warning(f"Checkpoint not found: {resume_path}, starting fresh")
+    
+    # Parse traffic weights if specified
+    category_weights = None
+    if args.traffic_weights:
+        category_weights = {}
+        for item in args.traffic_weights.split(','):
+            k, v = item.split(':')
+            category_weights[k.strip()] = float(v.strip())
+        env.traffic_category_weights = category_weights
+        log.info(f"Using traffic weights: {category_weights}")
     
     # Training state
     total_steps = 0
     episode = 0
     best_avg_reward = -float('inf')
+    episode_rewards = []  # Track episode rewards for rolling average
     
     # Checkpoints
     os.makedirs(args.save_dir, exist_ok=True)
@@ -1641,9 +1705,13 @@ def train(args):
             # Early training: mostly baseline-starts (learn to optimize from clean state)
             # Late training: mostly warm-starts (learn stability/recovery)
             # Schedule: 80% reset at start → 20% reset at end
-            progress = total_steps / args.steps
-            reset_prob = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
-            do_reset = random.random() < reset_prob
+            if args.no_warm_start:
+                do_reset = True
+                reset_prob = 1.0
+            else:
+                progress = total_steps / args.steps
+                reset_prob = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
+                do_reset = random.random() < reset_prob
             
             state = env.reset(force_reset=do_reset)
             episode_reward = 0.0
@@ -1736,20 +1804,33 @@ def train(args):
                     agent.save(path)
                     log.info(f"Checkpoint saved: {path}")
             
-            # Episode summary
+            # Episode summary - compute episode reward (avg reward per step)
+            ep_reward = episode_reward / episode_steps if episode_steps > 0 else 0.0
+            episode_rewards.append(ep_reward)
+            
+            # Rolling 100-episode average
+            rolling_100 = sum(episode_rewards[-100:]) / min(len(episode_rewards), 100)
+            
             log.info(
                 f"Episode {episode} finished: "
                 f"steps={episode_steps}, "
-                f"reward={episode_reward:.2f}, "
-                f"avg_reward_100={stats['avg_reward']:.2f}"
+                f"episode_reward={ep_reward:.3f}, "
+                f"rolling_avg_100={rolling_100:.3f}"
             )
             
-            # Track best model
-            if stats['avg_reward'] > best_avg_reward and len(agent.rewards) >= 50:
-                best_avg_reward = stats['avg_reward']
+            # Write episode metrics to InfluxDB
+            env.write_episode_metrics(
+                episode, episode_steps, ep_reward,
+                rolling_100,
+                env.current_traffic_profile, env.current_traffic_category
+            )
+            
+            # Track best model (based on rolling 100-episode average)
+            if rolling_100 > best_avg_reward and len(episode_rewards) >= 50:
+                best_avg_reward = rolling_100
                 path = os.path.join(args.save_dir, "dqn_v4_best.pth")
                 agent.save(path)
-                log.info(f"New best model saved: avg_reward={best_avg_reward:.3f}")
+                log.info(f"New best model saved: rolling_avg_100={best_avg_reward:.3f}")
     
     except KeyboardInterrupt:
         log.info("\nTraining interrupted by user")
@@ -1855,6 +1936,8 @@ def main():
     # Training parameters
     parser.add_argument('--steps', type=int, default=30000,
                         help='Total training/eval steps')
+    parser.add_argument('--max-episode-steps', type=int, default=100,
+                        help='Max steps per episode (default: 100)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
     parser.add_argument('--log-every', type=int, default=10,
@@ -1867,6 +1950,10 @@ def main():
                         help='Weight file tag for evaluation (e.g., final, best, 50pct)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume training from checkpoint (e.g., 50pct, best, or path to .pth file)')
+    parser.add_argument('--resume-eps', type=float, default=None,
+                        help='Reset epsilon to this value when resuming (e.g., 0.10)')
+    parser.add_argument('--traffic-weights', type=str, default=None,
+                        help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
     
     # InfluxDB
     parser.add_argument('--influx-url', default='http://192.168.201.1:8086')
@@ -1878,6 +1965,8 @@ def main():
     # Controller output verbosity
     parser.add_argument('--verbose', action='store_true',
                         help='Show verbose P4 controller output (route add/delete messages)')
+    parser.add_argument('--no-warm-start', action='store_true',
+                        help='Force baseline resets (no warm-start episodes)')
     
     args = parser.parse_args()
     
