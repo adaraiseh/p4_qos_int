@@ -179,6 +179,8 @@ class Collector:
         self.records_per_queue = {0: 0, 1: 0, 7: 0}  # per-queue counts
         self._lock = threading.Lock()
         self._last_log = time.time()
+        self._log_check_counter = 0  # rate-limit logging checks
+        self._log_check_interval = 500  # only check time every N packets
 
         # Aggregation controls/state
         self.aggregate_enabled = bool(aggregate_enabled)
@@ -217,6 +219,12 @@ class Collector:
 
     # ---------- Logging ----------
     def log_export_rate(self):
+        # Rate-limit: only check time every N packets to reduce overhead
+        self._log_check_counter += 1
+        if self._log_check_counter < self._log_check_interval:
+            return
+        self._log_check_counter = 0
+
         now = time.time()
         with self._lock:
             if now - self._last_log >= 1.0:   # once per second
@@ -277,10 +285,10 @@ class Collector:
         return (measurement, tuple(sorted(tags.items())))
 
     def _emit_point(self, measurement: str, tags: dict, avg_value: float, ts_ns: int):
-        p = Point(measurement)
-        for k, v in tags.items():
-            p = p.tag(k, v)
-        return p.field("value", float(avg_value)).time(int(ts_ns))
+        # Fast path: use line protocol string instead of Point objects
+        # Format: measurement,tag1=val1,tag2=val2 value=X timestamp
+        tag_str = ','.join(f'{k}={v}' for k, v in sorted(tags.items()))
+        return f"{measurement},{tag_str} value={avg_value} {int(ts_ns)}"
 
     def _emit_or_aggregate(self, measurement: str, tags: dict, value: float, timestamp_ns: int, out_points: list):
         """
@@ -494,11 +502,10 @@ class Collector:
                     record=points,
                     write_precision=WritePrecision.NS,
                 )
-                with self._lock:
-                    self.records_exported += len(points)
-                    # Increment per-queue counter
-                    if expected_queue_id in self.records_per_queue:
-                        self.records_per_queue[expected_queue_id] += len(points)
+                # Update counters without lock - acceptable for approximate logging stats
+                self.records_exported += len(points)
+                if expected_queue_id in self.records_per_queue:
+                    self.records_per_queue[expected_queue_id] += len(points)
 
         finally:
             flow_info.clear_metadata()
@@ -578,6 +585,4 @@ class Collector:
 
         # Count parsed packets (FYI)
         self.counter += 1
-        self.log_export_rate()
-        sys.stdout.flush()
         return flow_info

@@ -1671,45 +1671,24 @@ class QoSRoutingEnv:
                                 episode: int = 0):
         """
         Write training metrics to InfluxDB for Grafana monitoring.
-        
-        Metrics logged:
-        - step: Training step number
-        - episode: Current episode number
-        - action: Action taken (0=noop, 1-2=voice, 3-4=video, 5-6=BE, 7=multi)
-        - reward: Actual reward (tanh-clipped to [-2.5, +2.5])
-        - raw_reward: Pre-clipping reward for debugging
-        - eps: Epsilon (exploration rate)
-        - beta: PER importance sampling exponent
-        - avg_loss: Average DQN loss over last 100 steps
-        - avg_reward_100: Rolling average reward over last 100 steps
-        - buffer_size: Replay buffer size
-        - episode_step: Step within current episode
-        - sla_met_count: Number of queues meeting SLA (0-3)
-        - sla_streak: Consecutive steps with all SLAs met
-        - alt_used: Which alternate switch was used (if action taken)
-        - action_change: 1 if action != prev_action, else 0 (measures churn)
-        - noop_action: 1 if action == 0, else 0 (measures inactivity)
-        - action_cost: Applied action cost (queue-specific)
-        - q_max, q_mean: Q-value statistics
-        - queue_X_latency, queue_X_sla_met: Per-queue metrics
-        - multi_reroute_count: How many queues rerouted by multi-action
-        - traffic_profile, traffic_category: Current traffic (as fields, not tags)
+        Measurement: rl_training
         """
         try:
             p = (
-                Point("rl_training_v4")
+                Point("rl_training")
                 .field("step", int(step))
                 .field("episode", int(episode))
+                .field("episode_step", int(info.get('episode_step', 0)))
                 .field("action", int(action))
                 .field("reward", float(reward))
                 .field("eps", float(agent_stats['eps']))
                 .field("beta", float(agent_stats.get('beta', 0.4)))
-                .field("avg_loss", float(agent_stats['avg_loss']))
-                .field("avg_reward_100", float(agent_stats['avg_reward']))
+                .field("loss", float(agent_stats['avg_loss']))  # Renamed from avg_loss
+                .field("step_avg_reward_100", float(agent_stats['avg_reward']))  # Renamed
                 .field("buffer_size", int(agent_stats['buffer_size']))
-                .field("episode_step", int(info.get('episode_step', 0)))
                 .field("sla_met_count", len(info.get('sla_met', [])))
                 .field("sla_streak", int(info.get('sla_streak', 0)))
+                .field("pressure", float(info.get('pressure', 0.0)))
                 .time(datetime.utcnow())
             )
             
@@ -1719,40 +1698,21 @@ class QoSRoutingEnv:
             if 'q_mean' in agent_stats:
                 p = p.field("q_mean", float(agent_stats['q_mean']))
             
-            # Action churn metrics
-            action_change = 1 if action != prev_action else 0
-            noop_action = 1 if action == 0 else 0
-            p = p.field("action_change", int(action_change))
-            p = p.field("noop_action", int(noop_action))
-            
-            # Optional fields
-            if 'raw_reward' in info:
-                p = p.field("raw_reward", float(info['raw_reward']))
+            # Optional fields (useful only)
             if info.get('alt_idx') is not None:
                 p = p.field("alt_idx", int(info['alt_idx']))
-            if 'action_cost' in info:
-                p = p.field("action_cost", float(info['action_cost']))
-            if 'pressure' in info:
-                p = p.field("pressure", float(info['pressure']))
             
-            # Multi-action tracking
-            if info.get('multi_reroute_count') is not None:
-                p = p.field("multi_reroute_count", int(info['multi_reroute_count']))
-            
-            # Per-queue latencies and SLA status
+            # Per-queue latencies only (removed redundant sla_met flags)
             per_queue = info.get('per_queue', {})
-            sla_met_list = info.get('sla_met', [])
             for qid in QIDS:
                 if qid in per_queue:
                     q_lat = per_queue[qid].get('lat', 0.0)
                     p = p.field(f"queue_{qid}_latency", float(q_lat))
-                    p = p.field(f"queue_{qid}_sla_met", int(qid in sla_met_list))
             
-            # Data validity metrics for monitoring
+            # Data validity metrics (keep for debugging)
             p = p.field("data_valid", int(info.get('data_valid', False)))
-            p = p.field("valid_count", int(info.get('valid_count', 0)))
             
-            # Traffic profile as FIELDS (not tags) to avoid cardinality issues
+            # Traffic profile as FIELDS
             if info.get('traffic_profile'):
                 p = p.field("traffic_profile", str(info['traffic_profile']))
             if info.get('traffic_category'):
@@ -1765,22 +1725,17 @@ class QoSRoutingEnv:
     def write_episode_metrics(self, episode: int, episode_steps: int, episode_reward: float,
                                rolling_avg_100: float, traffic_profile: str, traffic_category: str):
         """Write episode summary metrics to InfluxDB.
-        
-        Args:
-            episode: Episode number
-            episode_steps: Steps in this episode
-            episode_reward: Average reward per step for this episode
-            rolling_avg_100: Rolling 100-episode average of episode_reward
+        Measurement: rl_training (same as steps for unified visualization)
         """
         try:
             p = (
-                Point("rl_episode_v4")
+                Point("rl_training")
                 .field("episode", int(episode))
                 .field("episode_steps", int(episode_steps))
                 .field("episode_reward", float(episode_reward))
-                .field("rolling_avg_100", float(rolling_avg_100))
-                .tag("traffic_profile", str(traffic_profile))
-                .tag("traffic_category", str(traffic_category))
+                .field("reward_rolling_avg", float(rolling_avg_100))  # User requested renaming to keep this clear
+                .field("traffic_profile", str(traffic_profile))    # FIELD not tag
+                .field("traffic_category", str(traffic_category))  # FIELD not tag
                 .time(datetime.utcnow())
             )
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])

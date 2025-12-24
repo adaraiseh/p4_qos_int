@@ -59,35 +59,31 @@ class TrafficManager:
     # Format: {qid: (min_mbps, max_mbps)} where qid 0=Voice, 1=Video, 7=BE
     # Network: ToR-Agg bottleneck at 5 Mbps, each sender has 3 flows
     TRAFFIC_PROFILES = {
-        # Light traffic (~35-65% of bottleneck capacity)
-        'light_1': {0: (0.16, 0.25), 1: (0.18, 0.32), 7: (0.29, 0.49)},
-        'light_2': {0: (0.22, 0.32), 1: (0.27, 0.42), 7: (0.42, 0.62)},
-        # Medium traffic (~60-100% of bottleneck capacity)
-        'medium_1': {0: (0.30, 0.43), 1: (0.38, 0.53), 7: (0.59, 0.83)},
-        'medium_2': {0: (0.36, 0.50), 1: (0.45, 0.65), 7: (0.70, 0.95)},
-        # High traffic (~80-125% of bottleneck - causes severe congestion)
-        'high_1': {0: (0.37, 0.53), 1: (0.46, 0.65), 7: (0.73, 0.98)},
-        'high_2': {0: (0.46, 0.65), 1: (0.57, 0.82), 7: (0.89, 1.22)},
+        # Light traffic (~10% increase)
+        'light_1': {0: (0.18, 0.28), 1: (0.20, 0.35), 7: (0.32, 0.54)},
+        'light_2': {0: (0.24, 0.35), 1: (0.30, 0.46), 7: (0.46, 0.68)},
+        # Medium traffic (~20% increase then -15% reduction = net ~2% increase over original)
+        'medium_1': {0: (0.31, 0.44), 1: (0.39, 0.54), 7: (0.60, 0.85)},
+        'medium_2': {0: (0.37, 0.51), 1: (0.46, 0.66), 7: (0.71, 0.97)},
+        # High traffic (~20% increase)
+        'high_1': {0: (0.44, 0.64), 1: (0.55, 0.78), 7: (0.88, 1.18)},
+        'high_2': {0: (0.55, 0.78), 1: (0.68, 0.98), 7: (1.07, 1.46)},
     }
     
     # TEST profiles for production - NOT used in training
     # These provide varied workload patterns to test agent robustness
     TEST_TRAFFIC_PROFILES = {
         # === BE-heavy scenarios (high BE, low voice/video) ===
-        'test_be_heavy_1': {0: (0.05, 0.10), 1: (0.10, 0.20), 7: (1.00, 1.40)},
-        'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.20, 1.60)},
+        'test_be_heavy_1': {0: (0.05, 0.10), 1: (0.10, 0.20), 7: (1.25, 1.75)},
+        'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.50, 2.00)},
         
         # === Video-heavy scenarios (high video, low voice/BE) ===
-        'test_video_heavy_1': {0: (0.08, 0.15), 1: (1.00, 1.40), 7: (0.20, 0.35)},
-        'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.20, 1.60), 7: (0.25, 0.40)},
+        'test_video_heavy_1': {0: (0.08, 0.15), 1: (1.25, 1.75), 7: (0.20, 0.35)},
+        'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.50, 2.00), 7: (0.25, 0.40)},
         
         # === Voice-heavy scenarios (high voice, low video/BE) ===
-        'test_voice_heavy_1': {0: (1.00, 1.40), 1: (0.10, 0.20), 7: (0.20, 0.35)},
-        'test_voice_heavy_2': {0: (1.20, 1.60), 1: (0.15, 0.25), 7: (0.25, 0.40)},
-        
-        # === Extreme congestion scenarios ===
-        'test_extreme_1': {0: (0.50, 0.70), 1: (0.70, 0.95), 7: (1.20, 1.50)},
-        'test_extreme_2': {0: (0.60, 0.85), 1: (0.80, 1.10), 7: (1.40, 1.80)},
+        'test_voice_heavy_1': {0: (1.25, 1.75), 1: (0.10, 0.20), 7: (0.20, 0.35)},
+        'test_voice_heavy_2': {0: (1.50, 2.00), 1: (0.15, 0.25), 7: (0.25, 0.40)},
         
         # === Minimal load (near idle) ===
         'test_idle_1': {0: (0.02, 0.05), 1: (0.03, 0.08), 7: (0.05, 0.12)},
@@ -100,14 +96,14 @@ class TrafficManager:
     # Burst starts at random step between burst_start_min and burst_start_max
     BURSTY_PROFILES = {
         # BE bursts - short and long variants
-        'bursty_be_1': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_be_heavy_1'},
-        'bursty_be_2': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_be_heavy_1'},
+        'bursty_be_1': {'burst_start_min': 2, 'burst_start_max': 84, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_be_heavy_1'},
+        'bursty_be_2': {'burst_start_min': 2, 'burst_start_max': 49, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_be_heavy_1'},
         # Video bursts
-        'bursty_vi_1': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_video_heavy_1'},
-        'bursty_vi_2': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_video_heavy_1'},
+        'bursty_vi_1': {'burst_start_min': 2, 'burst_start_max': 84, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_video_heavy_1'},
+        'bursty_vi_2': {'burst_start_min': 2, 'burst_start_max': 49, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_video_heavy_1'},
         # Voice bursts  
-        'bursty_vo_1': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_voice_heavy_1'},
-        'bursty_vo_2': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_voice_heavy_1'},
+        'bursty_vo_1': {'burst_start_min': 2, 'burst_start_max': 84, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_voice_heavy_1'},
+        'bursty_vo_2': {'burst_start_min': 2, 'burst_start_max': 49, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_voice_heavy_1'},
     }
     
     # Combined profiles for lookup (training + test + bursty metadata)
@@ -127,7 +123,6 @@ class TrafficManager:
         'test_be_heavy_1': 'test_be', 'test_be_heavy_2': 'test_be',
         'test_video_heavy_1': 'test_video', 'test_video_heavy_2': 'test_video',
         'test_voice_heavy_1': 'test_voice', 'test_voice_heavy_2': 'test_voice',
-        'test_extreme_1': 'test_extreme', 'test_extreme_2': 'test_extreme',
         'test_idle_1': 'test_idle', 'test_idle_2': 'test_idle',
     }
     
