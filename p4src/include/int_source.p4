@@ -42,11 +42,39 @@ control process_int_source_sink (
     }
 }
 
-// Insert INT header to the packet
+// Insert INT header to the packet (with hybrid count+time sampling)
 control process_int_source (
     inout headers hdr,
-    inout local_metadata_t local_metadata) {
+    inout local_metadata_t local_metadata,
+    inout standard_metadata_t standard_metadata) {
 
+    // Sampling configuration - time-based only
+    const bit<64> TIME_THRESHOLD_US = 200000;  // Time-based: 200ms = 200,000 microseconds
+
+    // Per-queue last sample timestamp (in microseconds)
+    register<bit<64>>(8) int_last_sample_time;
+
+    // Metadata to track sampling state 
+    bit<3> queue_idx;
+    bit<64> last_time;
+    bit<64> elapsed;
+    
+    // Store action parameters for use in apply block
+    bit<5> stored_hop_metadata_len;
+    bit<8> stored_remaining_hop_cnt;
+    bit<4> stored_ins_mask0003;
+    bit<4> stored_ins_mask0407;
+
+    // Action to store parameters and mark that table matched
+    action int_source_sampled(bit<5> hop_metadata_len, bit<8> remaining_hop_cnt, bit<4> ins_mask0003, bit<4> ins_mask0407) {
+        // Store parameters for later use in apply block
+        stored_hop_metadata_len = hop_metadata_len;
+        stored_remaining_hop_cnt = remaining_hop_cnt;
+        stored_ins_mask0003 = ins_mask0003;
+        stored_ins_mask0407 = ins_mask0407;
+    }
+    
+    // Original action (kept for backwards compatibility - no sampling)
     action int_source(bit<5> hop_metadata_len, bit<8> remaining_hop_cnt, bit<4> ins_mask0003, bit<4> ins_mask0407) {
         // insert INT shim header
         hdr.intl4_shim.setValid();                              
@@ -84,24 +112,101 @@ control process_int_source (
         }
     }
 
+    // Action to actually insert INT headers (called from apply block)
+    action do_insert_int() {
+        // Insert INT shim header
+        hdr.intl4_shim.setValid();
+        hdr.intl4_shim.int_type = 1;
+        hdr.intl4_shim.npt = 0;
+        hdr.intl4_shim.len = INT_HEADER_WORD;
+        hdr.intl4_shim.udp_ip_dscp = hdr.ipv4.dscp;
+        hdr.intl4_shim.udp_ip_ecn = hdr.ipv4.ecn;
+        hdr.ipv4.ecn = hdr.ipv4.ecn | INT_ECN_BIT;
+        hdr.intl4_shim.rsvd2 = 0;
+        
+        // Insert INT header
+        hdr.int_header.setValid();
+        hdr.int_header.ver = 2;
+        hdr.int_header.d = 0;
+        hdr.int_header.e = 0;
+        hdr.int_header.m = 0;
+        hdr.int_header.rsvd = 0;
+        hdr.int_header.hop_metadata_len = stored_hop_metadata_len;
+        hdr.int_header.remaining_hop_cnt = stored_remaining_hop_cnt;
+        hdr.int_header.instruction_mask_0003 = stored_ins_mask0003;
+        hdr.int_header.instruction_mask_0407 = stored_ins_mask0407;
+        hdr.int_header.instruction_mask_0811 = 0;
+        hdr.int_header.instruction_mask_1215 = 0;
+        hdr.int_header.domain_specific_id = 0;
+        hdr.int_header.ds_instruction = 0;
+        hdr.int_header.ds_flags = 0;
+        
+        // Update lengths
+        hdr.ipv4.len = hdr.ipv4.len + INT_TOTAL_HEADER_SIZE;
+
+        if(hdr.udp.isValid()) {
+            hdr.udp.length_ = hdr.udp.length_ + INT_TOTAL_HEADER_SIZE;
+        }
+    }
+
     table tb_int_source {
         key = {
             // configure for each flow to be monitored
             // 4 fields identifying flow
             hdr.ipv4.src_ipv4_addr: lpm;
             local_metadata.l4_dst_port: ternary;
-            //hdr.ipv4.dst_ipv4_addr: ternary;
-            //local_metadata.l4_src_port: ternary;
-            //local_metadata.l4_dst_port: ternary;
         }
         actions = {
             int_source;
+            int_source_sampled;
             NoAction;
         }
         const default_action = NoAction();
     }
 
     apply {
-        tb_int_source.apply();
+        // Initialize
+        stored_hop_metadata_len = 0;
+        stored_remaining_hop_cnt = 0;
+        stored_ins_mask0003 = 0;
+        stored_ins_mask0407 = 0;
+        
+        // Apply table - if int_source_sampled is called, it stores params
+        // if int_source is called, it directly inserts INT headers (no sampling)
+        if (tb_int_source.apply().hit) {
+            // Check if we're using the sampled action (params were stored)
+            if (stored_hop_metadata_len != 0) {
+                bit<64> now = standard_metadata.ingress_global_timestamp;
+                bit<64> last_time_q;
+                bit<64> elapsed_q;
+                
+                // Each queue has its own sampling with independent timing
+                if (hdr.ipv4.dscp == 0x2E) {           // EF (Voice) -> Queue 0
+                    queue_idx = 0;
+                    int_last_sample_time.read(last_time_q, 0);
+                    elapsed_q = now - last_time_q;
+                    if (last_time_q == 0 || elapsed_q >= TIME_THRESHOLD_US) {
+                        int_last_sample_time.write(0, now);
+                        do_insert_int();
+                    }
+                } else if (hdr.ipv4.dscp == 0x18) {    // CS3 (Video) -> Queue 1
+                    queue_idx = 1;
+                    int_last_sample_time.read(last_time_q, 1);
+                    elapsed_q = now - last_time_q;
+                    if (last_time_q == 0 || elapsed_q >= TIME_THRESHOLD_US) {
+                        int_last_sample_time.write(1, now);
+                        do_insert_int();
+                    }
+                } else {                               // Best Effort -> Queue 7
+                    queue_idx = 7;
+                    int_last_sample_time.read(last_time_q, 7);
+                    elapsed_q = now - last_time_q;
+                    if (last_time_q == 0 || elapsed_q >= TIME_THRESHOLD_US) {
+                        int_last_sample_time.write(7, now);
+                        do_insert_int();
+                    }
+                }
+            }
+        }
     }
 }

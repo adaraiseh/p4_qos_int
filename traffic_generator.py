@@ -78,17 +78,12 @@ class TrafficManager:
         'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.20, 1.60)},
         
         # === Video-heavy scenarios (high video, low voice/BE) ===
-        'test_video_heavy_1': {0: (0.08, 0.15), 1: (0.80, 1.10), 7: (0.20, 0.35)},
-        'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.00, 1.30), 7: (0.25, 0.40)},
+        'test_video_heavy_1': {0: (0.08, 0.15), 1: (1.00, 1.40), 7: (0.20, 0.35)},
+        'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.20, 1.60), 7: (0.25, 0.40)},
         
         # === Voice-heavy scenarios (high voice, low video/BE) ===
-        'test_voice_heavy_1': {0: (0.60, 0.85), 1: (0.10, 0.20), 7: (0.20, 0.35)},
-        'test_voice_heavy_2': {0: (0.80, 1.10), 1: (0.15, 0.25), 7: (0.25, 0.40)},
-        
-        # === Imbalanced scenarios (one queue dominates) ===
-        'test_be_only': {0: (0.02, 0.05), 1: (0.02, 0.05), 7: (1.50, 2.00)},
-        'test_video_only': {0: (0.02, 0.05), 1: (1.20, 1.60), 7: (0.05, 0.10)},
-        'test_voice_only': {0: (0.90, 1.20), 1: (0.02, 0.05), 7: (0.05, 0.10)},
+        'test_voice_heavy_1': {0: (1.00, 1.40), 1: (0.10, 0.20), 7: (0.20, 0.35)},
+        'test_voice_heavy_2': {0: (1.20, 1.60), 1: (0.15, 0.25), 7: (0.25, 0.40)},
         
         # === Extreme congestion scenarios ===
         'test_extreme_1': {0: (0.50, 0.70), 1: (0.70, 0.95), 7: (1.20, 1.50)},
@@ -99,7 +94,23 @@ class TrafficManager:
         'test_idle_2': {0: (0.05, 0.10), 1: (0.08, 0.15), 7: (0.10, 0.20)},
     }
     
-    # Combined profiles for lookup (training + test)
+    # Bursty training profiles - step-based bursts during training
+    # Format: {burst_start_min, burst_start_max, burst_duration_min, burst_duration_max, burst_profile}
+    # Baseline is randomly selected from light/medium profiles
+    # Burst starts at random step between burst_start_min and burst_start_max
+    BURSTY_PROFILES = {
+        # BE bursts - short and long variants
+        'bursty_be_1': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_be_heavy_1'},
+        'bursty_be_2': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_be_heavy_1'},
+        # Video bursts
+        'bursty_vi_1': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_video_heavy_1'},
+        'bursty_vi_2': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_video_heavy_1'},
+        # Voice bursts  
+        'bursty_vo_1': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_voice_heavy_1'},
+        'bursty_vo_2': {'burst_start_min': 15, 'burst_start_max': 25, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_voice_heavy_1'},
+    }
+    
+    # Combined profiles for lookup (training + test + bursty metadata)
     ALL_PROFILES = {**TRAFFIC_PROFILES, **TEST_TRAFFIC_PROFILES}
     
     # Profile categories for logging
@@ -108,11 +119,14 @@ class TrafficManager:
         'light_1': 'light', 'light_2': 'light',
         'medium_1': 'medium', 'medium_2': 'medium',
         'high_1': 'high', 'high_2': 'high',
+        # Bursty profiles
+        'bursty_be_1': 'bursty', 'bursty_be_2': 'bursty',
+        'bursty_vi_1': 'bursty', 'bursty_vi_2': 'bursty',
+        'bursty_vo_1': 'bursty', 'bursty_vo_2': 'bursty',
         # Test profiles
         'test_be_heavy_1': 'test_be', 'test_be_heavy_2': 'test_be',
         'test_video_heavy_1': 'test_video', 'test_video_heavy_2': 'test_video',
         'test_voice_heavy_1': 'test_voice', 'test_voice_heavy_2': 'test_voice',
-        'test_be_only': 'test_extreme', 'test_video_only': 'test_extreme', 'test_voice_only': 'test_extreme',
         'test_extreme_1': 'test_extreme', 'test_extreme_2': 'test_extreme',
         'test_idle_1': 'test_idle', 'test_idle_2': 'test_idle',
     }
@@ -139,6 +153,10 @@ class TrafficManager:
         if os.geteuid() != 0:
             log.warning("TrafficManager: Not running as root. TaskClient may fail.")
         
+        # Use a dedicated random generator seeded with time
+        # This ensures traffic variability even when global random is seeded for reproducibility
+        self._rng = random.Random(time.time())
+        
         self.topology_file = topology_file
         
         # Discover traffic hosts (h1-h8, excluding h100+)
@@ -164,10 +182,19 @@ class TrafficManager:
         self._window_size = 60  # Rebalance weights every 60 episodes
         self._usage_counts = {name: 0 for name in self._profile_names}
         
-        # Burst state tracking
+        # Burst state tracking (time-based)
         self._burst_active = False
         self._burst_end_time = 0.0
         self._next_burst_time = 0.0
+        
+        # Step-based burst tracking (for training)
+        self._step_burst_profile = None   # Current bursty profile name (e.g., 'bursty_be_1')
+        self._step_burst_active = False
+        self._step_burst_start_step = 0   # When the burst will start
+        self._step_burst_end_step = 0     # When the burst will end
+        self._step_burst_count = 0        # Track burst duration for logging
+        self._step_burst_baseline = None  # Baseline profile used for this episode
+        self._step_burst_baseline_loads = None  # Exact baseline loads to restore after burst
     
     def _discover_traffic_hosts(self) -> List[str]:
         """Discover traffic hosts from topology (hosts with id < 100)."""
@@ -258,32 +285,69 @@ class TrafficManager:
         
         Args:
             packet_len: UDP packet length in bytes
-            category_weights: Optional category weights, e.g. {'light': 0.2, 'medium': 0.3, 'high': 0.5}
+            category_weights: Optional category weights, e.g. {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
                              If provided, selects category first then random profile within category.
-            profile_name: Optional specific profile name (e.g., 'high_1', 'medium_2').
+                             For 'bursty' category, returns a bursty profile name (caller should use check_step_burst).
+            profile_name: Optional specific profile name (e.g., 'high_1', 'medium_2', 'bursty_be_1').
                          If provided, uses this profile directly (overrides category_weights).
             
         Returns:
-            Dict with profile info for logging
+            Dict with profile info for logging. For bursty profiles, also includes 'is_bursty': True
         """
         self.stop_traffic()
         time.sleep(0.3)
         
+        is_bursty = False
+        
         if profile_name:
-            # Use specific profile by name (supports training and test profiles)
-            if profile_name not in self.ALL_PROFILES:
+            # Use specific profile by name (supports training, test, and bursty profiles)
+            if profile_name in self.BURSTY_PROFILES:
+                is_bursty = True
+                # Select random baseline from light/medium profiles
+                baseline_options = ['light_1', 'light_2', 'medium_1', 'medium_2']
+                baseline_profile = self._rng.choice(baseline_options)
+                self._step_burst_baseline = baseline_profile
+                self.current_profile_name = profile_name
+                self.current_profile_category = 'bursty'
+                profile_ranges = self.ALL_PROFILES[baseline_profile]
+                # Randomize baseline loads now, save them for restoration after burst
+                self._step_burst_baseline_loads = {
+                    qid: self._rng.uniform(*rng) for qid, rng in profile_ranges.items()
+                }
+                log.info(f"[BURSTY] Episode baseline: {baseline_profile}")
+            elif profile_name in self.ALL_PROFILES:
+                self.current_profile_name = profile_name
+                profile_ranges = self.ALL_PROFILES[profile_name]
+            else:
                 log.warning(f"Unknown profile '{profile_name}', using high_1")
                 profile_name = 'high_1'
-            self.current_profile_name = profile_name
+                self.current_profile_name = profile_name
+                profile_ranges = self.ALL_PROFILES[profile_name]
         elif category_weights:
             # Select category based on weights, then random profile in that category
-            category = random.choices(
+            category = self._rng.choices(
                 list(category_weights.keys()),
                 weights=list(category_weights.values())
             )[0]
-            profiles_in_category = [p for p in self._profile_names 
-                                    if self.PROFILE_CATEGORIES[p] == category]
-            self.current_profile_name = random.choice(profiles_in_category)
+            
+            if category == 'bursty':
+                # Select a random bursty profile
+                bursty_names = list(self.BURSTY_PROFILES.keys())
+                self.current_profile_name = self._rng.choice(bursty_names)
+                self.current_profile_category = 'bursty'
+                is_bursty = True
+                # Start with medium_1 baseline
+                profile_ranges = self.ALL_PROFILES['medium_1']
+            else:
+                # Get all profiles in this category (training profiles only)
+                profiles_in_category = [p for p in self._profile_names 
+                                        if self.PROFILE_CATEGORIES.get(p) == category]
+                if not profiles_in_category:
+                    log.warning(f"No profiles for category '{category}', using medium_1")
+                    self.current_profile_name = 'medium_1'
+                else:
+                    self.current_profile_name = self._rng.choice(profiles_in_category)
+                profile_ranges = self.ALL_PROFILES[self.current_profile_name]
         else:
             # Balanced selection with rebalancing every 60 episodes
             self._episode_count += 1
@@ -294,16 +358,20 @@ class TrafficManager:
             max_usage = max(self._usage_counts.values()) if any(self._usage_counts.values()) else 0
             weights = [max_usage + 1 - self._usage_counts[name] for name in self._profile_names]
             
-            self.current_profile_name = random.choices(self._profile_names, weights=weights, k=1)[0]
+            self.current_profile_name = self._rng.choices(self._profile_names, weights=weights, k=1)[0]
             self._usage_counts[self.current_profile_name] += 1
+            profile_ranges = self.ALL_PROFILES[self.current_profile_name]
         
-        self.current_profile_category = self.PROFILE_CATEGORIES[self.current_profile_name]
+        if not is_bursty:
+            self.current_profile_category = self.PROFILE_CATEGORIES.get(self.current_profile_name, 'unknown')
         
-        # Randomize load within profile ranges (use ALL_PROFILES for test profiles)
-        profile_ranges = self.ALL_PROFILES[self.current_profile_name]
-        self.current_load = {
-            qid: random.uniform(*rng) for qid, rng in profile_ranges.items()
-        }
+        # Set load - use saved baseline loads for bursty profiles, otherwise randomize
+        if is_bursty and self._step_burst_baseline_loads:
+            self.current_load = self._step_burst_baseline_loads.copy()
+        else:
+            self.current_load = {
+                qid: self._rng.uniform(*rng) for qid, rng in profile_ranges.items()
+            }
         
         log.info(f"Starting profile '{self.current_profile_name}' ({self.current_profile_category})")
         log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
@@ -318,6 +386,7 @@ class TrafficManager:
             'profile_name': self.current_profile_name,
             'profile_category': self.current_profile_category,
             'loads': self.current_load.copy(),
+            'is_bursty': is_bursty,
         }
     
     def check_burst(self, burst_interval: float = 60.0, min_duration: float = 10.0, 
@@ -355,11 +424,11 @@ class TrafficManager:
         # Check if burst should start
         if not self._burst_active and current_time >= self._next_burst_time:
             self._burst_active = True
-            burst_duration = random.uniform(min_duration, max_duration)
+            burst_duration = self._rng.uniform(min_duration, max_duration)
             self._burst_end_time = current_time + burst_duration
             
-            # Start burst with very high BE load
-            self.start_traffic(profile_name='test_be_only')
+            # Start burst with high BE load
+            self.start_traffic(profile_name='test_be_heavy_1')
             
             # Log burst info
             mins = int(burst_duration // 60)
@@ -368,6 +437,110 @@ class TrafficManager:
             return f"BURST STARTED - High BE traffic for {duration_str}"
         
         return None
+    
+    def check_step_burst(self, current_step: int, bursty_profile: str = None) -> Optional[str]:
+        """Check and manage step-based burst traffic for training.
+        
+        Call this regularly from the training loop with a bursty profile active.
+        Burst starts at a random step (15-25), runs for configured duration, then ends.
+        Only ONE burst per episode (no cycling).
+        
+        Args:
+            current_step: Current training step within the episode
+            bursty_profile: Name of bursty profile (e.g., 'bursty_be_1')
+            
+        Returns:
+            Status message if state changed, None otherwise
+        """
+        if bursty_profile is None:
+            return None
+            
+        cfg = self.BURSTY_PROFILES.get(bursty_profile)
+        if cfg is None:
+            return None
+        
+        # Initialize or re-initialize for new episode
+        # We detect a new episode by checking if current_step == 1 (first step after reset)
+        # OR if the profile changed (different bursty profile selected)
+        is_new_episode = (current_step == 1) or (self._step_burst_profile != bursty_profile)
+        
+        if is_new_episode:
+            self._step_burst_profile = bursty_profile
+            self._step_burst_active = False
+            self._step_burst_count = 0
+            # Schedule burst start at random step between min and max
+            self._step_burst_start_step = self._rng.randint(
+                cfg['burst_start_min'], cfg['burst_start_max']
+            )
+            # Schedule burst duration
+            burst_duration = self._rng.randint(
+                cfg['burst_duration_min'], cfg['burst_duration_max']
+            )
+            self._step_burst_end_step = self._step_burst_start_step + burst_duration
+            log.info(f"[BURST SCHEDULE] Profile={bursty_profile}: "
+                     f"burst starts at step {self._step_burst_start_step}, "
+                     f"duration={burst_duration} steps, ends at step {self._step_burst_end_step}")
+        
+        result = None
+        
+        # Check if burst should end
+        if self._step_burst_active and current_step >= self._step_burst_end_step:
+            actual_duration = self._step_burst_count
+            self._step_burst_active = False
+            self._step_burst_count = 0
+            # Return to baseline with original loads
+            baseline = self._step_burst_baseline or 'medium_1'
+            self._restore_baseline_traffic(baseline)
+            log.info(f"[BURST END] Ended after {actual_duration} steps. Returning to {baseline}.")
+            result = "BURST ENDED"
+        
+        # Check if burst should start
+        elif not self._step_burst_active and current_step >= self._step_burst_start_step and current_step < self._step_burst_end_step:
+            self._step_burst_active = True
+            self._step_burst_count = 0
+            
+            # Switch to burst profile
+            self.start_traffic(profile_name=cfg['burst_profile'])
+            remaining = self._step_burst_end_step - current_step
+            log.info(f"[BURST START] Profile={cfg['burst_profile']}, "
+                     f"duration={remaining} steps (ends at step {self._step_burst_end_step})")
+            result = f"BURST STARTED: {cfg['burst_profile']} for {remaining} steps"
+        
+        # Track burst duration
+        if self._step_burst_active:
+            self._step_burst_count += 1
+        
+        return result
+    
+    def _restore_baseline_traffic(self, baseline_profile: str):
+        """Restore baseline traffic with exact saved loads (no re-randomization).
+        
+        Used when returning from a burst to maintain the same baseline load
+        that was active at episode start.
+        """
+        self.stop_traffic()
+        time.sleep(0.3)
+        
+        # Restore exact loads saved at episode start
+        if self._step_burst_baseline_loads:
+            self.current_load = self._step_burst_baseline_loads.copy()
+        else:
+            # Fallback: randomize if no saved loads
+            profile_ranges = self.ALL_PROFILES.get(baseline_profile, self.ALL_PROFILES['medium_1'])
+            self.current_load = {
+                qid: self._rng.uniform(*rng) for qid, rng in profile_ranges.items()
+            }
+        
+        self.current_profile_name = baseline_profile
+        self.current_profile_category = self.PROFILE_CATEGORIES.get(baseline_profile, 'medium')
+        
+        log.info(f"Restoring profile '{baseline_profile}' ({self.current_profile_category})")
+        log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
+        
+        self._start_servers()
+        time.sleep(1.0)
+        self._start_clients(packet_len=1250)
+        log.info("Traffic generation started")
     
     def _start_servers(self):
         """Start iperf3 servers on receiver hosts."""

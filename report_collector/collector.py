@@ -168,11 +168,15 @@ class Collector:
     def __init__(self, influx_client, org, bucket,
                  write_async=True, flush_interval_ms=500, batch_size=1000,
                  use_device_time=False,
-                 aggregate_enabled=True,        # NEW: knob to enable/disable averaging
-                 aggregate_window_ms=500):      # NEW: 500ms -> <=20 pts/sec
+                 aggregate_enabled=True,        # knob to enable/disable averaging
+                 aggregate_window_ms=500,       # aggregation window in ms
+                 # Optional metrics (disabled for CPU efficiency, enable when needed)
+                 enable_link_latency=False,     # inter-switch link latency
+                 enable_queue_occupancy=False): # queue depth metrics
         self.influx_client = influx_client
         self.counter = 0            # packets parsed
-        self.records_exported = 0   # points written to Influx
+        self.records_exported = 0   # points written to Influx (total)
+        self.records_per_queue = {0: 0, 1: 0, 7: 0}  # per-queue counts
         self._lock = threading.Lock()
         self._last_log = time.time()
 
@@ -181,6 +185,10 @@ class Collector:
         self.bucket_ns = int(max(1, int(aggregate_window_ms)) * 1_000_000)  # ms -> ns
         # key=(measurement, sorted(tags)) -> state dict
         self._agg = {}
+        
+        # Optional metrics flags
+        self.enable_link_latency = bool(enable_link_latency)
+        self.enable_queue_occupancy = bool(enable_queue_occupancy)
 
         if write_async:
             self.write_api = influx_client.write_api(write_options=WriteOptions(
@@ -212,9 +220,12 @@ class Collector:
         now = time.time()
         with self._lock:
             if now - self._last_log >= 1.0:   # once per second
-                print(f"[INFO] Exported {self.records_exported} records in the last second")
+                q0, q1, q7 = self.records_per_queue.get(0, 0), self.records_per_queue.get(1, 0), self.records_per_queue.get(7, 0)
+                total = self.records_exported
+                print(f"[INFO] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7})")
                 sys.stdout.flush()
                 self.records_exported = 0
+                self.records_per_queue = {0: 0, 1: 0, 7: 0}
                 self._last_log = now
 
     # ---------- Drop-rate (structured return for aggregation) ----------
@@ -395,20 +406,21 @@ class Collector:
                     points,
                 )
 
-                # queue_occupancy
-                self._emit_or_aggregate(
-                    "queue_occupancy",
-                    {
-                        "flow_id": flow_id,
-                        "src_ip": flow_info.src_ip,
-                        "dst_ip": flow_info.dst_ip,
-                        "switch_id": flow_info.switch_ids[i],
-                        "queue_id": flow_info.queue_ids[i],
-                    },
-                    float(flow_info.queue_occups[i]),
-                    report_time,
-                    points,
-                )
+                # queue_occupancy (optional - disabled by default for CPU efficiency)
+                if self.enable_queue_occupancy:
+                    self._emit_or_aggregate(
+                        "queue_occupancy",
+                        {
+                            "flow_id": flow_id,
+                            "src_ip": flow_info.src_ip,
+                            "dst_ip": flow_info.dst_ip,
+                            "switch_id": flow_info.switch_ids[i],
+                            "queue_id": flow_info.queue_ids[i],
+                        },
+                        float(flow_info.queue_occups[i]),
+                        report_time,
+                        points,
+                    )
 
                 # drop-rate (structured)
                 dr = self.record_drop_rate_instant(
@@ -426,30 +438,31 @@ class Collector:
                         dr["measurement"], dr["tags"], float(dr["value"]), dr["ts_ns"], points
                     )
 
-            # Link latency (device stamps), same time domain
-            link_pairs = max(safe_hops - 1, 0)
-            for i in range(link_pairs):
-                if i + 1 < len(flow_info.egress_tstamps) and i < len(flow_info.ingress_tstamps):
-                    link_latency = abs(
-                        flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]
-                    ) / 1_000_000.0
+            # Link latency (optional - disabled by default for CPU efficiency)
+            if self.enable_link_latency:
+                link_pairs = max(safe_hops - 1, 0)
+                for i in range(link_pairs):
+                    if i + 1 < len(flow_info.egress_tstamps) and i < len(flow_info.ingress_tstamps):
+                        link_latency = abs(
+                            flow_info.egress_tstamps[i + 1] - flow_info.ingress_tstamps[i]
+                        ) / 1_000_000.0
 
-                    self._emit_or_aggregate(
-                        "link_latency",
-                        {
-                            "flow_id": flow_id,
-                            "src_ip": flow_info.src_ip,
-                            "dst_ip": flow_info.dst_ip,
-                            "queue_id": expected_queue_id,
-                            "egress_switch_id": flow_info.switch_ids[i + 1],
-                            "egress_port_id": flow_info.l1_egress_ports[i + 1],
-                            "ingress_switch_id": flow_info.switch_ids[i],
-                            "ingress_port_id": flow_info.l1_ingress_ports[i],
-                        },
-                        float(link_latency),
-                        report_time,
-                        points,
-                    )
+                        self._emit_or_aggregate(
+                            "link_latency",
+                            {
+                                "flow_id": flow_id,
+                                "src_ip": flow_info.src_ip,
+                                "dst_ip": flow_info.dst_ip,
+                                "queue_id": expected_queue_id,
+                                "egress_switch_id": flow_info.switch_ids[i + 1],
+                                "egress_port_id": flow_info.l1_egress_ports[i + 1],
+                                "ingress_switch_id": flow_info.switch_ids[i],
+                                "ingress_port_id": flow_info.l1_ingress_ports[i],
+                            },
+                            float(link_latency),
+                            report_time,
+                            points,
+                        )
 
             # Flow latency
             if len(flow_info.ingress_tstamps) >= 1 and len(flow_info.egress_tstamps) >= safe_hops:
@@ -483,6 +496,9 @@ class Collector:
                 )
                 with self._lock:
                     self.records_exported += len(points)
+                    # Increment per-queue counter
+                    if expected_queue_id in self.records_per_queue:
+                        self.records_per_queue[expected_queue_id] += len(points)
 
         finally:
             flow_info.clear_metadata()

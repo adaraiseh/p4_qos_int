@@ -29,12 +29,11 @@ def main():
 
     influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 
-    # Async writer (flush ~0.5s). If your device clocks are skewed, set use_device_time=False.
+    # Async writer (flush ~0.1s). If your device clocks are skewed, set use_device_time=False.
     c = Collector(influx_client, INFLUX_ORG, INFLUX_BUCKET,
-                  write_async=True, flush_interval_ms=500, batch_size=1000,
+                  write_async=True, flush_interval_ms=50, batch_size=1000,
                   use_device_time=False,
-                  aggregate_enabled=True,
-                  aggregate_window_ms=500)
+                  aggregate_enabled=False)  # Disabled - P4 200ms sampling provides sufficient smoothing
 
     stop = False
     def signal_handler(sig, frame):

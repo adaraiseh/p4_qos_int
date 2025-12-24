@@ -4,25 +4,27 @@
 rl_agent_4.py - Simplified DQN for per-queue QoS path optimization using P4 INT reports
 
 Key Design Principles:
-1. Single centralized DQN agent (not multi-agent) - eliminates coordination overhead
-2. Frame stacking (426 features) - stacked observations + stacked one-hot actions
-3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
-4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
-5. Focused action space (10 actions) - no-op + 3 queues × 3 alternates
-6. Prioritized Experience Replay - learn from rare important events
-7. Proper episode boundaries - clear termination conditions
-8. Tuned timing for 100% post-action data capture
-9. Queue-specific bottleneck detection and alternative metrics
+1. Single centralized DQN agent
+# 2. Frame stacking (464 features) - stacked observations + stacked one-hot actions
+# 3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
+# 4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
+# 5. Focused action space (8 actions) - no-op + 6 single + 1 multi-queue
+# 6. Prioritized Experience Replay - learn from rare important events
+# 7. Proper episode boundaries - clear termination conditions
+# 8. Tuned timing for 100% post-action data capture
+# 9. Queue-specific bottleneck detection and alternative metrics
+# 10. EMA temporal smoothing for latency trends
 
-State Composition (426 features):
-- Stacked Observations: 61 metrics * 6 frames = 366 features
-- Stacked Actions (one-hot): 10 * 6 frames = 60 features
-- Total: 426 features
+# State Composition (464 features):
+# - Stacked Observations: 50 metrics * 8 frames = 400 features
+# - Stacked Actions (one-hot): 8 * 8 frames = 64 features
+# - Total: 464 features
 
 Benefits:
 - Agent sees velocity/trends (is latency rising or falling?)
 - Agent knows full action history via one-hot encoding
 - Queue-specific metrics ensure accurate comparison between bottleneck and alternatives
+- Multi-queue action enables rapid stabilization
 - Prevents sawtooth over-correction patterns
 
 Author: Research Team
@@ -46,12 +48,6 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import SYNCHRONOUS
-
-from controller import Controller
-from traffic_generator import TrafficManager
-
 # =============================================================================
 #                              LOGGING SETUP
 # =============================================================================
@@ -65,6 +61,7 @@ class FlushingStreamHandler(logging.StreamHandler):
         super().emit(record)
         self.flush()
 
+# Configure logging BEFORE importing modules that use logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
@@ -75,23 +72,36 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
+# Now import modules that use logging
+from controller import Controller
+from traffic_generator import TrafficManager
+
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+# Ensure traffic_generator logger uses the same level
+logging.getLogger('traffic_generator').setLevel(logging.INFO)
+
 # =============================================================================
 #                           HYPERPARAMETERS
 # =============================================================================
 # Network
 HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
-RAW_STATE_DIM = 61      # Simplified: added sla_met, bn_util, alt_util; removed role, usage, steps_since
-STACK_SIZE = 6          # Keep at 6 to capture 4-step action delay
-ACTION_DIM = 10         # No-op + 3 queues * 3 alts
+RAW_STATE_DIM = 50      # 3×16 + 2: per-queue features + max_pressure + steps_since_action
+STACK_SIZE = 8          # Increased for better trend detection with action delay
+ACTION_DIM = 8          # No-op + 6 single (3 queues × 2 alts) + 1 multi
 # State composition: stacked observations + stacked one-hot actions
-# Observations: 61 metrics * 6 frames = 366
-# Actions: 10 (one-hot) * 6 frames = 60
-# Total: 366 + 60 = 426
+# Observations: 50 metrics * 8 frames = 400
+# Actions: 8 (one-hot) * 8 frames = 64
+# Total: 400 + 64 = 464
 STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
+
+# Temporal smoothing
+LAT_EMA_ALPHA = 0.3     # EMA smoothing for latency ratio
 
 # Learning
 LR = 1e-4  # Increased from 1e-5 for faster convergence
-GAMMA = 0.99  # Kept at 0.99 (correct for 4-step delay: gamma^4 = 0.96)
+GAMMA = 0.97  # Faster credit assignment for ~2s step delay
 BATCH_SIZE = 64  # Increased from 32 for more stable gradients
 MIN_REPLAY_SIZE = 500  # Start learning much sooner
 REPLAY_CAPACITY = 50_000
@@ -100,27 +110,27 @@ REPLAY_CAPACITY = 50_000
 PER_ALPHA = 0.6  # Prioritization exponent
 PER_BETA_START = 0.4  # Importance sampling start
 PER_BETA_END = 1.0
-PER_BETA_STEPS = 10_000
+PER_BETA_STEPS = 25_000  # Anneal to 1.0 by ~50% of 50K training
 
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 20_000  # Decay over 60% of training for thorough exploration
+EPS_DECAY_STEPS = 30_000  # Decay over 60% of 50K training for thorough exploration
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
 
-# Environment timing - tuned for 100% post-action data capture
+# Environment timing - tuned for faster training with acceptable data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
 # Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
-WINDOW_SECONDS = 1.5        # 0.9-second observation window (faster training)
-SAFETY_LAG_MS = 200         # 200ms safety lag for InfluxDB
-COOLDOWN_SECONDS = 0.0      # Short cooldown for faster learning
-DELAY_AFTER_ACTION = 1.8    # Wait 1.0s for post-action data (1.5+200ms+margin)
-DELAY_NO_ACTION = 1.8       # Low-pass filter: smooth observations during stable periods
+WINDOW_SECONDS = 1.0        # Observation window (reduced from 1.5)
+SAFETY_LAG_MS = 100         # 100ms safety lag for InfluxDB
+COOLDOWN_SECONDS = 0.0      # No cooldown for faster learning
+DELAY_AFTER_ACTION = 0.8    # Wait after action (reduced from 1.5s - data available after ~500ms)
+DELAY_NO_ACTION = 0.8       # Match action delay
 
 # Freshness validation - minimum data points required per metric in window
-MIN_POINTS_PER_METRIC = 2   # Require at least 2 points to detect stale data
+MIN_POINTS_PER_METRIC = 1   # Require at least 1 point (2 is too strict)
 
 # Episode
 MAX_EPISODE_STEPS = 100
@@ -149,7 +159,7 @@ REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
 # Cost depends on whether the TARGETED queue's SLA is met:
 #   - If targeting a healthy queue → high cost (risky, don't break what works)
 #   - If targeting a sick queue → low cost (encouraged to fix)
-REWARD_ACTION_COST_HEALTHY = 0.65   # Cost when targeting a queue with SLA met
+REWARD_ACTION_COST_HEALTHY = 0.5   # Cost when targeting a queue with SLA met (reduced from 0.65)
 REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA violated
 
 # Soft margin around SLA (reduces reward flip-flopping)
@@ -338,7 +348,8 @@ class DQNAgent:
         
         # Epsilon schedule
         self.eps = EPS_START
-        self.step_count = 0
+        self.step_count = 0      # Global training steps (for PER beta)
+        self.eps_step_count = 0  # Steps for epsilon decay (can be reset)
         
         # PER beta schedule
         self.beta = PER_BETA_START
@@ -347,6 +358,10 @@ class DQNAgent:
         self.losses = deque(maxlen=100)
         self.rewards = deque(maxlen=100)
         self.last_loss = None
+        
+        # Q-value tracking for logging
+        self.q_values_max = deque(maxlen=100)
+        self.q_values_mean = deque(maxlen=100)
     
     def select_action(self, state: np.ndarray, valid_mask: np.ndarray, 
                       explore: bool = True) -> int:
@@ -375,14 +390,22 @@ class DQNAgent:
             state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.online_net(state_t).squeeze(0).cpu().numpy()
             
+            # Track Q-value stats BEFORE masking (for logging)
+            valid_q = q_values[valid_mask]
+            if len(valid_q) > 0:
+                self.q_values_max.append(float(np.max(valid_q)))
+                self.q_values_mean.append(float(np.mean(valid_q)))
+            
             # Mask invalid actions
             q_values[~valid_mask] = -np.inf
             return int(np.argmax(q_values))
     
     def update_epsilon(self):
-        """Update epsilon based on step count."""
-        self.step_count += 1
-        progress = min(1.0, self.step_count / EPS_DECAY_STEPS)
+        """Update epsilon based on epsilon step count (Decoupled from global step count)."""
+        self.step_count += 1      # Always increments (Global progress)
+        self.eps_step_count += 1  # Increments but can be reset
+        
+        progress = min(1.0, self.eps_step_count / EPS_DECAY_STEPS)
         self.eps = EPS_END + (EPS_START - EPS_END) * (1 - progress)
         
         # Update PER beta
@@ -463,6 +486,7 @@ class DQNAgent:
             'target_net': self.target_net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'step_count': self.step_count,
+            'eps_step_count': self.eps_step_count,
             'eps': self.eps,
             'beta': self.beta,
             # Replay buffer state for resume continuity
@@ -481,6 +505,7 @@ class DQNAgent:
         self.target_net.load_state_dict(checkpoint['target_net'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.step_count = checkpoint.get('step_count', 0)
+        self.eps_step_count = checkpoint.get('eps_step_count', self.step_count)
         self.eps = checkpoint.get('eps', EPS_END)
         self.beta = checkpoint.get('beta', PER_BETA_END)
         
@@ -507,6 +532,8 @@ class DQNAgent:
             'avg_loss': np.mean(self.losses) if self.losses else 0.0,
             'avg_reward': np.mean(self.rewards) if self.rewards else 0.0,
             'last_loss': self.last_loss,
+            'q_max': np.mean(self.q_values_max) if self.q_values_max else 0.0,
+            'q_mean': np.mean(self.q_values_mean) if self.q_values_mean else 0.0,
         }
 
 
@@ -517,22 +544,22 @@ class QoSRoutingEnv:
     """
     Environment for QoS-aware routing optimization using P4 INT metrics.
     
-    State: 426 features (6-frame stacking to capture 4-step action delay)
+    State: 464 features (8-frame stacking to capture action delay + trends)
       Frame stacking provides velocity/trend information.
       
-      Raw observation (61 features):
-        - Per queue (20 features × 3 = 60):
-            - Basic metrics: lat_ratio, drop_norm, util_norm, sla_met (4)
+      Raw observation (50 features):
+        - Per queue (16 features × 3 = 48):
+            - Basic metrics: lat_ratio, drop_norm, util_norm, sla_met, lat_ema, lat_ema_diff (6)
             - Bottleneck: present, drop, lat, util (4)
-            - Alternatives (3 × 4 = 12):
-                - available, drop_vs_bn, lat_vs_bn, util_norm (4)
-        - Global (1): max_pressure
+            - Alternatives (2 × 3 = 6): available, drop_vs_bn, lat_vs_bn
+        - Global (2): max_pressure, steps_since_action (2)
       
-    Actions: 10
+    Actions: 8
       - 0: No-op
-      - 1-3: Queue 0 -> Alt 0, 1, 2
-      - 4-6: Queue 1 -> Alt 0, 1, 2
-      - 7-9: Queue 7 -> Alt 0, 1, 2
+      - 1-2: Queue 0 -> Alt 0, 1 (Voice)
+      - 3-4: Queue 1 -> Alt 0, 1 (Video)
+      - 5-6: Queue 7 -> Alt 0, 1 (BE)
+      - 7: Multi-queue reroute (all violating queues)
     
     Reward:
       - SLA-based with soft margin, drop penalty, action cost
@@ -540,14 +567,16 @@ class QoSRoutingEnv:
     
     # Action to (queue, alt_index) mapping
     # alt_index is 0-based index into the available alternatives list
+    # 'multi' triggers multi-queue rerouting for all violating queues
     ACTION_MAP = {
-        0: None,           # No-op
-        1: (0, 0), 2: (0, 1), 3: (0, 2),  # Voice alts
-        4: (1, 0), 5: (1, 1), 6: (1, 2),  # Video alts
-        7: (7, 0), 8: (7, 1), 9: (7, 2),  # BE alts
+        0: None,                         # No-op
+        1: (0, 0), 2: (0, 1),            # Voice alts
+        3: (1, 0), 4: (1, 1),            # Video alts
+        5: (7, 0), 6: (7, 1),            # BE alts
+        7: 'multi',                       # Multi-queue reroute
     }
     
-    MAX_ALTS = 3
+    MAX_ALTS = 2
     NUM_SWITCHES = 10  # Standard topology size (a1-4, c1-2, t1-4)
     
     def __init__(self, bucket: str, token: str, org: str, url: str, verbose: bool = False, reset_network: bool = True, production_mode: bool = False):
@@ -589,20 +618,25 @@ class QoSRoutingEnv:
         self.last_snapshot = None
         
         # Frame stacking for velocity/trend detection
-        # Stores last STACK_SIZE raw observation states (each 61-dim)
+        # Stores last STACK_SIZE raw observation states (each 50-dim)
         self.frame_stack: deque = deque(maxlen=STACK_SIZE)
         
         # Action stacking for causality tracking
-        # Stores last STACK_SIZE actions as one-hot vectors (each 10-dim)
+        # Stores last STACK_SIZE actions as one-hot vectors (each 8-dim)
         self.action_stack: deque = deque(maxlen=STACK_SIZE)
+        
+        # EMA smoothed latency ratios for temporal smoothing
+        self.lat_ema = {qid: 1.0 for qid in QIDS}
         
         # Traffic manager for dynamic profile changes (training only)
         self.traffic_manager = TrafficManager() if reset_network else None
         
         # Current traffic profile for logging
-        self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", etc.
-        self.current_traffic_category = ""  # "light", "medium", "high"
-        self.traffic_category_weights = None  # Optional: {'light': 0.2, 'medium': 0.3, 'high': 0.5}
+        self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", "bursty_be_1"
+        self.current_traffic_category = ""  # "light", "medium", "high", "bursty"
+        self.traffic_category_weights = None  # Optional: {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
+        self.fixed_traffic_profile = None    # Optional: override to use specific profile for all episodes
+        self.is_bursty_episode = False  # Track if current episode uses bursty profile
     
     def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
         """Reset episode and return initial stacked state.
@@ -638,13 +672,21 @@ class QoSRoutingEnv:
         else:
             log.info("=== WARM START: Continuing from current routing state ===")
         
-        # Start randomized traffic for new episode (training mode only)
+        # Start traffic for new episode (training mode only)
         if self.traffic_manager:
-            log.info("Starting randomized traffic profile...")
-            profile_info = self.traffic_manager.start_traffic(category_weights=self.traffic_category_weights)
+            if self.fixed_traffic_profile:
+                log.info(f"Starting FIXED traffic profile: {self.fixed_traffic_profile}")
+                profile_info = self.traffic_manager.start_traffic(profile_name=self.fixed_traffic_profile)
+            else:
+                log.info("Starting randomized traffic profile...")
+                profile_info = self.traffic_manager.start_traffic(category_weights=self.traffic_category_weights)
+            
             self.current_traffic_profile = profile_info['profile_name']
             self.current_traffic_category = profile_info['profile_category']
+            self.is_bursty_episode = profile_info.get('is_bursty', False)
             log.info(f"Traffic started: {self.current_traffic_profile} ({self.current_traffic_category})")
+            if self.is_bursty_episode:
+                log.info(f"  [BURSTY] Will cycle bursts during episode")
         
         # Cool-down period for traffic to stabilize (traffic is now running)
         cooldown = 5.0 if do_reset else 2.0  # Less cooldown for warm-start
@@ -657,6 +699,10 @@ class QoSRoutingEnv:
         self.sla_streak = 0
         self.last_action = 0
         self.last_action_time = time.monotonic()
+        self._last_action_step = 0  # For steps_since_action feature
+        
+        # Reset EMA state
+        self.lat_ema = {qid: 1.0 for qid in QIDS}
         
         # Collect initial snapshot (after reset if applicable)
         self.last_snapshot = self._collect_snapshot()
@@ -967,7 +1013,8 @@ class QoSRoutingEnv:
             tables = self.query_api.query(org=self.org, query=flux)
             for table in tables or []:
                 for record in table.records:
-                    measurement = record.get_measurement()
+                    # After group()/count(), measurement is in _measurement column, not metadata
+                    measurement = record.values.get('_measurement')
                     count = record.get_value()
                     if measurement in counts and count is not None:
                         counts[measurement] = int(count)
@@ -1041,17 +1088,19 @@ class QoSRoutingEnv:
     
     def _build_raw_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Build 61-dimensional raw observation vector with relative metrics encoding.
+        Build 50-dimensional raw observation vector with relative metrics encoding.
         (Actions are stacked separately as one-hot vectors)
         
-        Layout per queue (20 features):
-          [0-3]: Basic metrics (lat_ratio, drop_norm, util_norm, sla_met)
-          [4-7]: Bottleneck info (present, drop, lat, util)
-          [8-19]: Alternatives 3 × 4 = 12 (available, drop_vs_bn, lat_vs_bn, util_norm)
+        Layout per queue (16 features):
+          [0-5]: Basic metrics (lat_ratio, drop_norm, util_norm, sla_met, lat_ema, lat_ema_diff)
+          [6-9]: Bottleneck info (present, drop, lat, util)
+          [10-15]: Alternatives 2 × 3 = 6 (available, drop_vs_bn, lat_vs_bn)
         
-        Global (1): Max pressure
+        Global (2):
+          - Max pressure
+          - Steps since last action (normalized, helps avoid rapid oscillation)
         
-        Total: 3×20 + 1 = 61 features
+        Total: 3×16 + 2 = 50 features
         """
         state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
         
@@ -1062,18 +1111,26 @@ class QoSRoutingEnv:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             
-            # --- 1. Basic Metrics (4) ---
+            # --- 1. Basic Metrics (6) ---
             lat_ratio_raw = q['lat_p95'] / sla
             lat_ratio = min(lat_ratio_raw, LAT_RATIO_CAP)  # Cap to prevent instability
             drop_norm = min(q['drop_p95'], DROP_CAP) / DROP_CAP
             util_norm = min(q['util_p95'], UTIL_CAP) / UTIL_CAP
             sla_met = 1.0 if lat_ratio_raw <= 1.0 else 0.0  # Use raw for accurate SLA check
             
+            # Update EMA and compute smoothed features
+            prev_ema = self.lat_ema[qid]
+            self.lat_ema[qid] = LAT_EMA_ALPHA * lat_ratio + (1 - LAT_EMA_ALPHA) * prev_ema
+            lat_ema = min(self.lat_ema[qid], LAT_RATIO_CAP)  # Capped
+            lat_ema_diff = max(-LAT_DIFF_CAP, min(lat_ratio - lat_ema, LAT_DIFF_CAP))  # Deviation from EMA
+            
             state[idx] = lat_ratio
             state[idx+1] = drop_norm
             state[idx+2] = util_norm
             state[idx+3] = sla_met
-            idx += 4
+            state[idx+4] = lat_ema
+            state[idx+5] = lat_ema_diff
+            idx += 6
             
             # --- 2. Bottleneck Info (4) ---
             bn_sid = q.get('bottleneck_sid')
@@ -1094,7 +1151,7 @@ class QoSRoutingEnv:
             
             idx += 4
             
-            # --- 3. Alternatives (3 × 4 = 12) ---
+            # --- 3. Alternatives (2 × 3 = 6) ---
             alts = q.get('alternatives', [])
             
             for i in range(self.MAX_ALTS):
@@ -1111,15 +1168,11 @@ class QoSRoutingEnv:
                     # Cap lat difference to bounded range
                     lat_diff = alt_lat - bn_lat
                     state[idx+2] = max(-LAT_DIFF_CAP, min(lat_diff, LAT_DIFF_CAP))
-                    
-                    # Utilization (absolute, normalized)
-                    alt_util = min(alt.get('util', 0), UTIL_CAP) / UTIL_CAP
-                    state[idx+3] = alt_util
                 else:
                     # No alternative at this index
-                    state[idx:idx+4] = 0.0
+                    state[idx:idx+3] = 0.0
                 
-                idx += 4
+                idx += 3
             
             # Track pressure for global feature
             pressure = 0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm
@@ -1127,6 +1180,12 @@ class QoSRoutingEnv:
         
         # Global max pressure
         state[idx] = max(pressures) if pressures else 0.0
+        idx += 1
+        
+        # Steps since last action (normalized: 0=just acted, 1=10+ steps ago)
+        # Helps agent learn to wait for effects before acting again
+        steps_since = self.episode_step - getattr(self, '_last_action_step', 0)
+        state[idx] = min(steps_since / 10.0, 1.0)  # Cap at 10 steps
         
         return state
     
@@ -1141,17 +1200,17 @@ class QoSRoutingEnv:
         Build stacked state from observation stack + action stack.
         
         Returns:
-            426-dimensional state vector:
-              - [0-365]: Stacked observations (61 * 6 = 366 features)
-              - [366-425]: Stacked one-hot actions (10 * 6 = 60 features)
+            464-dimensional state vector:
+              - [0-399]: Stacked observations (50 * 8 = 400 features)
+              - [400-463]: Stacked one-hot actions (8 * 8 = 64 features)
             
-        Layout: [obs_t-5, obs_t-4, obs_t-3, obs_t-2, obs_t-1, obs_t, 
-                 act_t-5, act_t-4, act_t-3, act_t-2, act_t-1, act_t]
+        Layout: [obs_t-7, ..., obs_t-1, obs_t, 
+                 act_t-7, ..., act_t-1, act_t]
             
         This allows the agent to see:
         - Trends: If latency is rising or falling (from observation history)
         - Causality: Full action history as one-hot vectors
-        - Example: If action_stack = [[1,0,...], [0,0,0,0,1,0,...], ...]
+        - Example: If action_stack = [[1,0,...], [0,0,1,0,...], ...]
                    means: noop -> video-alt-0 -> ...
         """
         # Concatenate observations: oldest first, newest last
@@ -1160,12 +1219,13 @@ class QoSRoutingEnv:
         # Concatenate one-hot actions: oldest first, newest last
         stacked_actions = np.concatenate(list(self.action_stack), axis=0)
         
-        # Combine: [366 obs features] + [60 action features] = 426 total
+        # Combine: [400 obs features] + [64 action features] = 464 total
         return np.concatenate([stacked_obs, stacked_actions], axis=0)
     
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
         Get mask of valid actions based on available alternatives.
+        Action 7 (multi) is valid if ANY queue has valid alternatives.
         """
         mask = np.zeros(ACTION_DIM, dtype=bool)
         mask[0] = True  # No-op always valid
@@ -1173,10 +1233,15 @@ class QoSRoutingEnv:
         now = time.monotonic()
         in_cooldown = (now - self.last_action_time) < COOLDOWN_SECONDS
         
+        any_valid_for_multi = False
+        
         if not in_cooldown:
             for action, mapping in self.ACTION_MAP.items():
                 if mapping is None:  # Skip no-op
                     continue
+                if mapping == 'multi':  # Handle multi-action separately
+                    continue
+                    
                 qid, alt_idx = mapping
                 
                 # Check if this queue has enough alternatives
@@ -1185,6 +1250,21 @@ class QoSRoutingEnv:
                     alts = q.get('alternatives', [])
                     if alt_idx < len(alts):
                         mask[action] = True
+                        any_valid_for_multi = True
+            
+            # Multi-action is valid ONLY if at least one queue is VIOLATING SLA *and* has alternatives
+            # This aligns with the context validity check in step()
+            valid_for_multi = False
+            for qid in QIDS:
+                q = snapshot[qid]
+                # Check soft margin violation (consistent with step logic)
+                is_violating = (q['lat_p95'] / SLA_THRESHOLDS[qid]) > (1.0 + SLA_SOFT_MARGIN)
+                if is_violating and q.get('bottleneck_sid') is not None and len(q.get('alternatives', [])) > 0:
+                    valid_for_multi = True
+                    break
+            
+            if valid_for_multi:
+                mask[7] = True
         
         return mask
     
@@ -1262,12 +1342,57 @@ class QoSRoutingEnv:
         
         return reward, info
     
+    def _apply_multi_reroute(self, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str], int]:
+        """
+        Apply multi-queue reroute: reroutes ONLY queues violating SLA.
+        
+        Returns:
+            (success, description, reroute_count) - count of queues rerouted
+        """
+        rerouted = []
+        
+        for qid in QIDS:
+            q = snapshot[qid]
+            
+            # Only reroute if SLA is violated
+            if q['lat_p95'] <= SLA_THRESHOLDS[qid]:
+                continue
+                
+            # Need bottleneck and alternatives
+            src_ip = q.get('hot_src_ip')
+            dst_ip = q.get('hot_dst_ip')
+            bottleneck_sid = q.get('bottleneck_sid')
+            alts = q.get('alternatives', [])
+            
+            if not (src_ip and dst_ip and bottleneck_sid and alts):
+                continue
+            
+            # Use first alternative
+            alt_name = alts[0]['name']
+            
+            ok, msg = self.controller.reroute_one_demand_symmetric(
+                src_ip=src_ip, dst_ip=dst_ip, qid=qid,
+                worst_switch_id=int(bottleneck_sid), alt_switch_name=alt_name
+            )
+            
+            if ok:
+                rerouted.append(qid)
+                self.controller.track_usage(alt_name)
+                self.controller.record_queue_change(qid, self.global_step)
+                log.info(f"[MULTI] Rerouted qid={qid} to {alt_name} [bn={bottleneck_sid}]")
+        
+        if rerouted:
+            return True, f"multi:{len(rerouted)}", len(rerouted)
+        else:
+            return False, None, 0
+    
     def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str], Optional[int]]:
         """
         Apply routing action based on explicit alternative selection.
         
         Returns:
             (success, alt_name, alt_idx) - alt_name for logging, alt_idx for InfluxDB
+            For multi-action: alt_name is 'multi:N', alt_idx is count of rerouted queues
         """
         if action == 0:
             return False, None, None  # No-op
@@ -1276,9 +1401,13 @@ class QoSRoutingEnv:
         mapping = self.ACTION_MAP.get(action)
         if not mapping:
             return False, None, None
-            
-        qid, alt_idx = mapping
         
+        # Handle multi-queue action
+        if mapping == 'multi':
+            return self._apply_multi_reroute(snapshot)
+        
+        # Single queue action
+        qid, alt_idx = mapping
         q = snapshot[qid]
         src_ip = q.get('hot_src_ip')
         dst_ip = q.get('hot_dst_ip')
@@ -1317,11 +1446,11 @@ class QoSRoutingEnv:
         Execute one environment step.
         
         Args:
-            action: Action index (0-9)
+            action: Action index (0-7)
         
         Returns:
             (next_state, reward, terminated, truncated, info)
-            - next_state: 426-dim stacked state
+            - next_state: 464-dim stacked state
             - terminated: True if absorbing state (always False for this env)
             - truncated: True if horizon reached (episode_step >= MAX_EPISODE_STEPS)
         """
@@ -1329,15 +1458,24 @@ class QoSRoutingEnv:
         self.global_step += 1
         self.episode_step += 1
         
+        # Handle step-based bursts for bursty episodes
+        if self.is_bursty_episode and self.traffic_manager:
+            burst_msg = self.traffic_manager.check_step_burst(
+                self.episode_step, 
+                bursty_profile=self.current_traffic_profile
+            )
+            # Burst state changes are logged inside check_step_burst
+        
         # Get current snapshot
         current_snapshot = self.last_snapshot
         
         # Apply action
         action_applied, alt_name, alt_idx = self._apply_action(action, current_snapshot)
         
-        # Update last action tracking
-        if action != 0:
+        # Update last action tracking (only on applied actions for stability feature)
+        if action_applied:
             self.last_action_time = time.monotonic()
+            self._last_action_step = self.episode_step  # For steps_since_action feature
         self.last_action = action
         
         # Wait for network to settle
@@ -1369,9 +1507,19 @@ class QoSRoutingEnv:
         if action != 0 and action_applied:
             # Get which queue this action targets
             mapping = self.ACTION_MAP.get(action)
-            targeted_qid = mapping[0] if mapping else None
             
-            if targeted_qid is not None:
+            if mapping == 'multi':
+                # Multi-action: cost based on number of queues rerouted
+                # alt_idx contains reroute_count for multi-action
+                reroute_count = alt_idx if alt_idx else 0
+                # Use sick cost per rerouted queue (they were all violating)
+                action_cost = reroute_count * REWARD_ACTION_COST_SICK
+                targeted_qid = -1  # Sentinel for multi-action
+                info['multi_reroute_count'] = reroute_count
+            elif mapping is not None:
+                # Single-queue action: extract targeted queue ID
+                targeted_qid = mapping[0]
+                
                 # Check if targeted queue's SLA was met BEFORE the action
                 # We must look at current_snapshot (pre-action), not info/next_snapshot
                 q_pre = current_snapshot[targeted_qid]
@@ -1390,6 +1538,7 @@ class QoSRoutingEnv:
                     action_cost = REWARD_ACTION_COST_SICK
             else:
                 action_cost = REWARD_ACTION_COST_HEALTHY  # Fallback
+                targeted_qid = None
             
             # Apply cost and re-clip with tanh
             raw_reward_with_cost = info['raw_reward'] - action_cost
@@ -1444,7 +1593,20 @@ class QoSRoutingEnv:
         if action != 0:
             # Get the targeted queue from action mapping
             mapping = self.ACTION_MAP.get(action)
-            if mapping:
+            if mapping == 'multi':
+                # Multi-action: require at least one violating queue to have context
+                # Use soft margin (> 1.2) for consistency with reward/cost logic
+                action_context_valid = any(
+                    (current_snapshot[qid].get('hot_src_ip') is not None and
+                     current_snapshot[qid].get('hot_dst_ip') is not None and
+                     current_snapshot[qid].get('bottleneck_sid') is not None)
+                    for qid in QIDS
+                    if (current_snapshot[qid]['lat_p95'] / SLA_THRESHOLDS[qid]) > (1.0 + SLA_SOFT_MARGIN)
+                )
+                if not action_context_valid:
+                    log.debug(f"[Step {self.episode_step}] Multi-action had no violating queues with context")
+            elif mapping is not None:
+                # Single-queue action: extract targeted queue ID
                 targeted_qid = mapping[0]
                 # Check if the PRE-ACTION snapshot had valid routing context
                 q_pre = current_snapshot[targeted_qid]
@@ -1494,7 +1656,7 @@ class QoSRoutingEnv:
             # The returned next_state will still be built from current stacks
             log.debug(f"[Step {self.episode_step}] Skipping state stack update due to invalid data")
         
-        # Build stacked state (426-dim: 366 obs + 60 actions)
+        # Build stacked state (464-dim)
         next_state = self._build_stacked_state()
         self.last_snapshot = next_snapshot
         
@@ -1505,16 +1667,19 @@ class QoSRoutingEnv:
         return self._get_valid_actions(self.last_snapshot)
     
     def write_training_metrics(self, step: int, agent_stats: Dict, 
-                                reward: float, action: int, prev_action: int, info: Dict):
+                                reward: float, action: int, prev_action: int, info: Dict,
+                                episode: int = 0):
         """
         Write training metrics to InfluxDB for Grafana monitoring.
         
         Metrics logged:
         - step: Training step number
-        - action: Action taken (0=noop, 1-3=voice alts, 4-6=video alts, 7-9=BE alts)
+        - episode: Current episode number
+        - action: Action taken (0=noop, 1-2=voice, 3-4=video, 5-6=BE, 7=multi)
         - reward: Actual reward (tanh-clipped to [-2.5, +2.5])
         - raw_reward: Pre-clipping reward for debugging
         - eps: Epsilon (exploration rate)
+        - beta: PER importance sampling exponent
         - avg_loss: Average DQN loss over last 100 steps
         - avg_reward_100: Rolling average reward over last 100 steps
         - buffer_size: Replay buffer size
@@ -1524,15 +1689,21 @@ class QoSRoutingEnv:
         - alt_used: Which alternate switch was used (if action taken)
         - action_change: 1 if action != prev_action, else 0 (measures churn)
         - noop_action: 1 if action == 0, else 0 (measures inactivity)
-        - action_cost: Applied action cost (pressure-adaptive)
+        - action_cost: Applied action cost (queue-specific)
+        - q_max, q_mean: Q-value statistics
+        - queue_X_latency, queue_X_sla_met: Per-queue metrics
+        - multi_reroute_count: How many queues rerouted by multi-action
+        - traffic_profile, traffic_category: Current traffic (as fields, not tags)
         """
         try:
             p = (
                 Point("rl_training_v4")
                 .field("step", int(step))
+                .field("episode", int(episode))
                 .field("action", int(action))
                 .field("reward", float(reward))
                 .field("eps", float(agent_stats['eps']))
+                .field("beta", float(agent_stats.get('beta', 0.4)))
                 .field("avg_loss", float(agent_stats['avg_loss']))
                 .field("avg_reward_100", float(agent_stats['avg_reward']))
                 .field("buffer_size", int(agent_stats['buffer_size']))
@@ -1541,6 +1712,12 @@ class QoSRoutingEnv:
                 .field("sla_streak", int(info.get('sla_streak', 0)))
                 .time(datetime.utcnow())
             )
+            
+            # Q-value stats from agent
+            if 'q_max' in agent_stats:
+                p = p.field("q_max", float(agent_stats['q_max']))
+            if 'q_mean' in agent_stats:
+                p = p.field("q_mean", float(agent_stats['q_mean']))
             
             # Action churn metrics
             action_change = 1 if action != prev_action else 0
@@ -1558,15 +1735,28 @@ class QoSRoutingEnv:
             if 'pressure' in info:
                 p = p.field("pressure", float(info['pressure']))
             
+            # Multi-action tracking
+            if info.get('multi_reroute_count') is not None:
+                p = p.field("multi_reroute_count", int(info['multi_reroute_count']))
+            
+            # Per-queue latencies and SLA status
+            per_queue = info.get('per_queue', {})
+            sla_met_list = info.get('sla_met', [])
+            for qid in QIDS:
+                if qid in per_queue:
+                    q_lat = per_queue[qid].get('lat', 0.0)
+                    p = p.field(f"queue_{qid}_latency", float(q_lat))
+                    p = p.field(f"queue_{qid}_sla_met", int(qid in sla_met_list))
+            
             # Data validity metrics for monitoring
             p = p.field("data_valid", int(info.get('data_valid', False)))
             p = p.field("valid_count", int(info.get('valid_count', 0)))
             
-            # Traffic profile for this episode
+            # Traffic profile as FIELDS (not tags) to avoid cardinality issues
             if info.get('traffic_profile'):
-                p = p.tag("traffic_profile", str(info['traffic_profile']))
+                p = p.field("traffic_profile", str(info['traffic_profile']))
             if info.get('traffic_category'):
-                p = p.tag("traffic_category", str(info['traffic_category']))
+                p = p.field("traffic_category", str(info['traffic_category']))
             
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
@@ -1600,6 +1790,9 @@ class QoSRoutingEnv:
     def close(self):
         """Clean up resources."""
         try:
+            if self.traffic_manager:
+                self.traffic_manager.stop_all()
+                log.info("Traffic stopped")
             self.write_api.close()
             self.client.close()
         except Exception:
@@ -1613,6 +1806,9 @@ def train(args):
     """Main training loop."""
     global MAX_EPISODE_STEPS
     MAX_EPISODE_STEPS = args.max_episode_steps
+    
+    interrupted = False
+
     
     log.info("=" * 60)
     log.info("Starting RL Training - DQN Agent v4 (Stacked Obs + Actions)")
@@ -1655,8 +1851,8 @@ def train(args):
             # Override epsilon if specified
             if args.resume_eps is not None:
                 agent.eps = args.resume_eps
-                agent.step_count = 0  # Reset step count for fresh epsilon decay
-                log.info(f"Reset epsilon to {agent.eps} for resume training")
+                agent.eps_step_count = 0  # Reset ONLY epsilon decay steps
+                log.info(f"Reset epsilon to {agent.eps} for resume training (keeping global step count {agent.step_count})")
         else:
             log.warning(f"Checkpoint not found: {resume_path}, starting fresh")
     
@@ -1669,6 +1865,11 @@ def train(args):
             category_weights[k.strip()] = float(v.strip())
         env.traffic_category_weights = category_weights
         log.info(f"Using traffic weights: {category_weights}")
+    
+    # Parse fixed traffic profile if specified (overrides weights)
+    if args.traffic_profile:
+        env.fixed_traffic_profile = args.traffic_profile
+        log.info(f"Using FIXED traffic profile: {args.traffic_profile}")
     
     # Training state
     total_steps = 0
@@ -1704,13 +1905,13 @@ def train(args):
             # === CURRICULUM-BASED RESET STRATEGY ===
             # Early training: mostly baseline-starts (learn to optimize from clean state)
             # Late training: mostly warm-starts (learn stability/recovery)
-            # Schedule: 80% reset at start → 20% reset at end
+            # Schedule: 90% reset at start → 60% midway → 30% at end
             if args.no_warm_start:
                 do_reset = True
                 reset_prob = 1.0
             else:
                 progress = total_steps / args.steps
-                reset_prob = 0.8 - 0.6 * progress  # 0.8 → 0.2 over training
+                reset_prob = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
                 do_reset = random.random() < reset_prob
             
             state = env.reset(force_reset=do_reset)
@@ -1759,12 +1960,14 @@ def train(args):
                     # Map action to readable name
                     if action == 0:
                         action_name = "noop"
-                    elif 1 <= action <= 3:
+                    elif action in (1, 2):
                         action_name = f"v0-alt{action-1}"
-                    elif 4 <= action <= 6:
-                        action_name = f"v1-alt{action-4}"
-                    elif 7 <= action <= 9:
-                        action_name = f"be-alt{action-7}"
+                    elif action in (3, 4):
+                        action_name = f"v1-alt{action-3}"
+                    elif action in (5, 6):
+                        action_name = f"be-alt{action-5}"
+                    elif action == 7:
+                        action_name = "multi"
                     else:
                         action_name = str(action)
                     log.info(
@@ -1834,6 +2037,7 @@ def train(args):
     
     except KeyboardInterrupt:
         log.info("\nTraining interrupted by user")
+        interrupted = True
     
     finally:
         # Save final model
@@ -1845,6 +2049,9 @@ def train(args):
     log.info("\nTraining complete!")
     log.info(f"Final stats: {agent.get_stats()}")
     log.info(f"Training log saved to: {csv_path}")
+    
+    if interrupted:
+        sys.exit(130)
 
 
 def evaluate(args):
@@ -1890,12 +2097,14 @@ def evaluate(args):
             
             if action == 0:
                 action_name = "noop"
-            elif 1 <= action <= 3:
+            elif action in (1, 2):
                 action_name = f"voice-{action-1}"
-            elif 4 <= action <= 6:
-                action_name = f"video-{action-4}"
-            elif 7 <= action <= 9:
-                action_name = f"best-{action-7}"
+            elif action in (3, 4):
+                action_name = f"video-{action-3}"
+            elif action in (5, 6):
+                action_name = f"be-{action-5}"
+            elif action == 7:
+                action_name = "multi"
             else:
                 action_name = str(action)
             
@@ -1954,6 +2163,8 @@ def main():
                         help='Reset epsilon to this value when resuming (e.g., 0.10)')
     parser.add_argument('--traffic-weights', type=str, default=None,
                         help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
+    parser.add_argument('--traffic-profile', type=str, default=None,
+                        help='Use specific traffic profile for all episodes (overrides --traffic-weights)')
     
     # InfluxDB
     parser.add_argument('--influx-url', default='http://192.168.201.1:8086')
@@ -1970,10 +2181,17 @@ def main():
     
     args = parser.parse_args()
     
-    if args.mode == 'train':
-        train(args)
-    else:
-        evaluate(args)
+    try:
+        if args.mode == 'train':
+            train(args)
+        else:
+            evaluate(args)
+    except KeyboardInterrupt:
+        log.info("\nInterrupted by user, shutting down...")
+        sys.exit(130)
+    except Exception as e:
+        log.exception(f"Fatal error: {e}")
+        sys.exit(1)
 
 
 if __name__ == '__main__':

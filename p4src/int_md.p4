@@ -30,7 +30,7 @@ control MyIngress(inout headers hdr,
             }
             
             if (local_metadata.int_meta.source == true) {
-                process_int_source.apply(hdr, local_metadata);
+                process_int_source.apply(hdr, local_metadata, standard_metadata);
             } 
 
             if (local_metadata.int_meta.sink == true && hdr.int_header.isValid()) {

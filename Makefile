@@ -38,26 +38,46 @@ monitor:
 	python3 monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
 
 # run RL agent v4 (recommended) in training mode
-# Traffic weights: 50% high, 30% medium, 20% light
+# Traffic weights: 5% light, 20% medium, 30% high, 45% bursty
 train:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 30000 \
-		--traffic-weights "light:0.2,medium:0.3,high:0.5" \
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 50000 \
+		--traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50" \
 		--log-every 1 $(VERBOSE_FLAG)
 
-# quick training test (100 steps, 10-step episodes, no warm-start)
+# quick training test - runs 1 episode per training profile (light, medium, high, bursty)
+# Tests that the agent can handle all traffic types used in training
 train_test:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 100 --max-episode-steps 10 --no-warm-start --log-every 1 $(VERBOSE_FLAG)
+	@echo "=== Testing all training profiles (1 episode each) ==="
+	@for profile in bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
+		echo ""; \
+		echo "=== Testing profile: $$profile ==="; \
+		if ! sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train \
+			--steps 100 --max-episode-steps 100 --no-warm-start \
+			--traffic-profile $$profile \
+			--log-every 1 $(VERBOSE_FLAG); then \
+			echo "Training interrupted or failed."; \
+			ret=$$?; \
+			if [ $$ret -eq 130 ]; then \
+				echo "Clean interrupt."; \
+				exit 0; \
+			else \
+				exit 1; \
+			fi; \
+		fi; \
+	done
+	@echo ""
+	@echo "=== All profile tests completed ==="
 
 # resume RL agent v4 training from checkpoint (default: 50pct)
 # Usage: make resume or make resume CHECKPOINT=best
-# Traffic weights: 50% high, 30% medium, 20% light
+# Traffic weights: 5% light, 20% medium, 30% high, 45% bursty
 ifndef CHECKPOINT
 CHECKPOINT = 50pct
 endif
 resume:
 	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 \
 		--resume $(CHECKPOINT) --resume-eps 0.10 \
-		--traffic-weights "light:0.2,medium:0.3,high:0.5" \
+		--traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50" \
 		--log-every 1 $(VERBOSE_FLAG)
 
 # run RL agent v4 in evaluation mode

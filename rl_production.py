@@ -142,7 +142,7 @@ class ProductionAgent:
     def load(self, path: str):
         """Load model weights."""
         try:
-            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         except TypeError:
             checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['online_net'])
@@ -201,12 +201,13 @@ class ProductionMetricsWriter:
         action_rate = sum(1 for a in self.action_history if a != 0) / len(self.action_history) if self.action_history else 0.0
         uptime_seconds = time.time() - self.start_time
         
-        # Action name mapping
+        # Action name mapping (8 actions)
         action_names = {
             0: "noop",
-            1: "v0-alt0", 2: "v0-alt1", 3: "v0-alt2",
-            4: "v1-alt0", 5: "v1-alt1", 6: "v1-alt2",
-            7: "be-alt0", 8: "be-alt1", 9: "be-alt2",
+            1: "vo-alt0", 2: "vo-alt1",           # Voice
+            3: "vi-alt0", 4: "vi-alt1",           # Video
+            5: "be-alt0", 6: "be-alt1",           # BE
+            7: "multi",                            # Multi-queue
         }
         action_name = action_names.get(action, f"unk-{action}")
         
@@ -399,12 +400,13 @@ class ProductionRunner:
                 # Write metrics to InfluxDB
                 metrics.write_metrics(self.step, action, reward, info, q_stats)
                 
-                # Action name for logging
+                # Action name mapping (8 actions)
                 action_names = {
                     0: "noop",
-                    1: "v0-alt0", 2: "v0-alt1", 3: "v0-alt2",
-                    4: "v1-alt0", 5: "v1-alt1", 6: "v1-alt2",
-                    7: "be-alt0", 8: "be-alt1", 9: "be-alt2",
+                    1: "vo-alt0", 2: "vo-alt1",           # Voice
+                    3: "vi-alt0", 4: "vi-alt1",           # Video
+                    5: "be-alt0", 6: "be-alt1",           # BE
+                    7: "multi",                            # Multi-queue
                 }
                 action_name = action_names.get(action, str(action))
                 
