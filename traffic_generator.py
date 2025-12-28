@@ -12,12 +12,24 @@ Traffic Profiles (network bottleneck: ToR-Agg at 5 Mbps):
 │ Profile  │ Category │  Voice (Q0) │  Video (Q1) │    BE (Q7)  │ Per-Sender    │
 ├──────────┼──────────┼─────────────┼─────────────┼─────────────┼───────────────┤
 │ light_1  │ light    │ 0.05-0.10   │ 0.05-0.15   │ 0.10-0.20   │ ~0.6-1.4 Mbps │
-│ light_2  │ light    │ 0.08-0.12   │ 0.10-0.18   │ 0.15-0.25   │ ~1.0-1.7 Mbps │
+│ light_2  │ light    │ 0.08-0.12   │ 0.10-0.18   │ 0.15-0.25   │ ~1.0-1.7 Mbps │ 10%
 │ medium_1 │ medium   │ 0.12-0.20   │ 0.15-0.25   │ 0.25-0.40   │ ~1.6-2.6 Mbps │
-│ medium_2 │ medium   │ 0.15-0.25   │ 0.20-0.30   │ 0.30-0.50   │ ~2.0-3.2 Mbps │
+│ medium_2 │ medium   │ 0.15-0.25   │ 0.20-0.30   │ 0.30-0.50   │ ~2.0-3.2 Mbps │ 15%
 │ high_1   │ high     │ 0.25-0.35   │ 0.30-0.45   │ 0.50-0.80   │ ~3.2-4.8 Mbps │
-│ high_2   │ high     │ 0.30-0.45   │ 0.35-0.55   │ 0.70-1.00   │ ~4.0-6.0 Mbps │
+│ high_2   │ high     │ 0.30-0.45   │ 0.35-0.55   │ 0.70-1.00   │ ~4.0-6.0 Mbps │ 35%
 └──────────┴──────────┴─────────────┴─────────────┴─────────────┴───────────────┘
+bursty profiles: 40%
+base medium_1 then pump traffic of one the following profiles:
+    'test_be_heavy_1': {0: (0.05, 0.10), 1: (0.10, 0.20), 7: (1.25, 1.75)},
+    'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.50, 2.00)},
+    
+    # === Video-heavy scenarios (high video, low voice/BE) ===
+    'test_video_heavy_1': {0: (0.08, 0.15), 1: (1.25, 1.75), 7: (0.20, 0.35)},
+    'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.50, 2.00), 7: (0.25, 0.40)},
+    
+    # === Voice-heavy scenarios (high voice, low video/BE) ===
+    'test_voice_heavy_1': {0: (1.25, 1.75), 1: (0.10, 0.20), 7: (0.20, 0.35)},
+    'test_voice_heavy_2': {0: (1.50, 2.00), 1: (0.15, 0.25), 7: (0.25, 0.40)},
 
 Key features:
 - Round-robin profile selection for equal distribution across episodes
@@ -385,51 +397,59 @@ class TrafficManager:
         }
     
     def check_burst(self, burst_interval: float = 60.0, min_duration: float = 10.0, 
-                    max_duration: float = 300.0) -> Optional[str]:
-        """Check and manage periodic BE burst traffic.
+                    max_duration: float = 300.0, base_profile: str = 'medium_1',
+                    burst_profile: str = 'test_be_heavy_1') -> Optional[str]:
+        """Check and manage periodic burst traffic.
         
         Call this regularly from the production loop. It will:
-        - Start a burst every `burst_interval` seconds
-        - Each burst has a random duration between min and max
-        - Restart normal traffic when burst ends
+        - Start a burst, run for random duration, then wait `burst_interval` seconds
+        - Repeat indefinitely
         
         Args:
-            burst_interval: Seconds between burst starts (default 60)
-            min_duration: Minimum burst duration in seconds (default 10)
-            max_duration: Maximum burst duration in seconds (default 300 = 5 min)
+            burst_interval: Seconds to wait AFTER burst ends before starting next burst
+            min_duration: Minimum burst duration in seconds
+            max_duration: Maximum burst duration in seconds
+            base_profile: Traffic profile to use during normal operation
+            burst_profile: Traffic profile to use during bursts
             
         Returns:
             Status message if state changed, None otherwise
         """
         current_time = time.time()
         
-        # Initialize next burst time on first call
+        # Initialize: schedule first burst after burst_interval
         if self._next_burst_time == 0.0:
             self._next_burst_time = current_time + burst_interval
+            log.info(f"[BURST] Initialized - first burst in {burst_interval:.0f}s")
             return None
         
-        # Check if burst should end
-        if self._burst_active and current_time >= self._burst_end_time:
-            self._burst_active = False
-            self._next_burst_time = current_time + burst_interval
-            # Restart with base profile (test_bursty uses medium-ish base load)
-            self.start_traffic(profile_name='medium_1')
-            return "BURST ENDED - Returning to normal traffic"
+        # STATE: Burst is active - check if it should end
+        if self._burst_active:
+            if current_time >= self._burst_end_time:
+                self._burst_active = False
+                # Schedule next burst: wait burst_interval AFTER this burst ends
+                self._next_burst_time = current_time + burst_interval
+                # Restart with base profile
+                self.start_traffic(profile_name=base_profile)
+                log.info(f"[BURST] Next burst in {burst_interval:.0f}s")
+                return f"BURST ENDED - Returning to {base_profile}"
+            # Burst still running
+            return None
         
-        # Check if burst should start
-        if not self._burst_active and current_time >= self._next_burst_time:
+        # STATE: Not in burst - check if we should start one
+        if current_time >= self._next_burst_time:
             self._burst_active = True
             burst_duration = self._rng.uniform(min_duration, max_duration)
             self._burst_end_time = current_time + burst_duration
             
-            # Start burst with high BE load
-            self.start_traffic(profile_name='test_be_heavy_1')
+            # Start burst traffic
+            self.start_traffic(profile_name=burst_profile)
             
             # Log burst info
             mins = int(burst_duration // 60)
             secs = int(burst_duration % 60)
             duration_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-            return f"BURST STARTED - High BE traffic for {duration_str}"
+            return f"BURST STARTED - {burst_profile} for {duration_str}"
         
         return None
     

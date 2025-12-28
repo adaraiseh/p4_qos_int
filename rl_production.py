@@ -43,6 +43,23 @@ from rl_agent_4 import (
     STATE_DIM, ACTION_DIM, HIDDEN_DIM, QIDS, SLA_THRESHOLDS
 )
 from traffic_generator import TrafficManager
+import rl_agent_4
+
+# =============================================================================
+#                     PRODUCTION TIMING OVERRIDES
+# =============================================================================
+# Production uses doubled timing values for more stable observations.
+# These override the training values in rl_agent_4 module.
+WINDOW_SECONDS = 2.0        # 2x training (1.0s)
+SAFETY_LAG_MS = 200         # 2x training (100ms)
+DELAY_AFTER_ACTION = 1.6    # 2x training (0.8s)
+DELAY_NO_ACTION = 1.6       # 2x training (0.8s)
+
+# Apply overrides to rl_agent_4 module so QoSRoutingEnv uses production timing
+rl_agent_4.WINDOW_SECONDS = WINDOW_SECONDS
+rl_agent_4.SAFETY_LAG_MS = SAFETY_LAG_MS
+rl_agent_4.DELAY_AFTER_ACTION = DELAY_AFTER_ACTION
+rl_agent_4.DELAY_NO_ACTION = DELAY_NO_ACTION
 
 # =============================================================================
 #                              LOGGING SETUP
@@ -330,7 +347,7 @@ class ProductionRunner:
             args.influx_org, args.influx_url,
             verbose=args.verbose,
 
-            reset_network=False,  # Production: never reset network state
+            reset_network=True,  # Reset network at start for clean baseline
             production_mode=True  # Production: continuous operation
         )
         agent = ProductionAgent(STATE_DIM, ACTION_DIM, device)
@@ -355,8 +372,8 @@ class ProductionRunner:
             # Start traffic with fixed profile
             profile_info = traffic_manager.start_traffic(profile_name=args.traffic_profile)
             log.info(f"Started traffic: {profile_info['profile_name']} ({profile_info['profile_category']})")
-            log.info("Waiting 20s for traffic to stabilize...")
-            time.sleep(20.0)
+            log.info("Waiting 15s for traffic to stabilize...")
+            time.sleep(15.0)
         
         # CSV logging
         os.makedirs('data', exist_ok=True)
@@ -385,7 +402,13 @@ class ProductionRunner:
                 
                 # Check for bursty mode traffic changes
                 if traffic_manager and args.bursty_mode:
-                    burst_msg = traffic_manager.check_burst()
+                    burst_msg = traffic_manager.check_burst(
+                        burst_interval=30.0,    # Every 30 seconds
+                        min_duration=5.0,       # Minimum 5 seconds
+                        max_duration=120.0,     # Maximum 2 minutes
+                        base_profile=args.traffic_profile,
+                        burst_profile=args.burst_profile
+                    )
                     if burst_msg:
                         log.info(f"[Step {self.step}] {burst_msg}")
                 
@@ -502,7 +525,9 @@ def main():
     parser.add_argument('--traffic-profile', type=str, default='high_1',
                         help='Traffic profile name: light_1, light_2, medium_1, medium_2, high_1, high_2, test_*')
     parser.add_argument('--bursty-mode', action='store_true',
-                        help='Enable periodic BE bursts every 60s with random duration (10s-5min)')
+                        help='Enable periodic bursts every 30s with random duration (5s-2min)')
+    parser.add_argument('--burst-profile', type=str, default='bursty_be_2',
+                        help='Traffic profile to use during bursts (default: bursty_be_2)')
     
     args = parser.parse_args()
     

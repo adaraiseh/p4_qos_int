@@ -629,7 +629,8 @@ class QoSRoutingEnv:
         self.lat_ema = {qid: 1.0 for qid in QIDS}
         
         # Traffic manager for dynamic profile changes (training only)
-        self.traffic_manager = TrafficManager() if reset_network else None
+        # In production_mode, traffic is managed externally by ProductionRunner
+        self.traffic_manager = TrafficManager() if (reset_network and not production_mode) else None
         
         # Current traffic profile for logging
         self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", "bursty_be_1"

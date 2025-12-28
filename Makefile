@@ -89,23 +89,41 @@ test_best:
 	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval --steps 1500 --weights-tag best $(VERBOSE_FLAG) --log-every 1
 
 # run RL agent v4 in production mode (inference only, comprehensive metrics logging)
-# Usage: make production or make production PROFILE=high_2
+# Usage: 
+#   make production_best PROFILE=high_2           (static profile with best model)
+#   make production_final PROFILE=medium_2        (static profile with final model)  
+#   make production_best PROFILE=medium_2 BURSTY=1 BURST=bursty_be_2  (bursty mode)
+#   make production_final PROFILE=light_1 BURSTY=1 BURST=bursty_vo_1  (bursty mode)
 ifndef PROFILE
 PROFILE = high_1
 endif
-production:
+
+# Burst profile (used when BURSTY=1)
+ifndef BURST
+BURST = bursty_be_2
+endif
+
+# Bursty mode flag (optional)
+ifdef BURSTY
+BURSTY_FLAG = --bursty-mode --burst-profile $(BURST)
+else
+BURSTY_FLAG =
+endif
+
+# Production with best model
+production_best:
 	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag best \
 		--generate-traffic --traffic-profile $(PROFILE) \
-		--log-every 1 $(VERBOSE_FLAG)
+		--log-every 1 $(VERBOSE_FLAG) $(BURSTY_FLAG)
 
-# run production with final model
+# Production with final model
 production_final:
 	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final \
 		--generate-traffic --traffic-profile $(PROFILE) \
-		--log-every 1 $(VERBOSE_FLAG)
+		--log-every 1 $(VERBOSE_FLAG) $(BURSTY_FLAG)
 
-# run production with periodic BE bursts (every 60s, 10s-5min duration)
-production_bursty:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final \
-		--generate-traffic --traffic-profile medium_1 --bursty-mode \
-		--log-every 1 $(VERBOSE_FLAG)
+# Production with 75pct model
+production_75pct:
+	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag 75pct \
+		--generate-traffic --traffic-profile $(PROFILE) \
+		--log-every 1 $(VERBOSE_FLAG) $(BURSTY_FLAG)
