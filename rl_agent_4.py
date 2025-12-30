@@ -820,13 +820,16 @@ class QoSRoutingEnv:
         except Exception as e:
             log.warning(f"Failed to query metrics: {e}")
         
+        # Batch Query: Freshness (One query for all queues)
+        freshness_map = self._check_all_queues_freshness()
+        
         # Mark data_valid only if ALL 3 metrics were returned, values are sane, AND data is fresh
         for qid in QIDS:
             m = metrics_received[qid]
             metrics_present = m['lat'] and m['drop'] and m['util']
             values_sane = self._metric_sane(snapshot[qid]) if metrics_present else False
-            # Check freshness (data points in window)
-            data_fresh = self._check_data_freshness(qid)
+            # Check freshness from batch result
+            data_fresh = freshness_map.get(qid, False)
             snapshot[qid]['data_valid'] = metrics_present and values_sane and data_fresh
             snapshot[qid]['data_fresh'] = data_fresh  # For debugging
         
@@ -848,9 +851,12 @@ class QoSRoutingEnv:
         # Each queue gets its own bottleneck detection and alternative metrics
         # This ensures accurate per-queue congestion identification
         
+        # Batch Query: Hottest Demands (One query for all queues)
+        all_hot_demands = self._get_all_hottest_demands()
+        
         for qid in QIDS:
-            # Find hottest demand for this queue
-            hot = self._get_hottest_demand(qid)
+            # Find hottest demand for this queue from batch result
+            hot = all_hot_demands.get(qid)
             if not hot:
                 log.info(f"[Snapshot] Queue {qid}: No hot demand found, skipping bottleneck detection")
                 continue
@@ -989,71 +995,85 @@ class QoSRoutingEnv:
             
         return results
     
-    def _check_data_freshness(self, qid: int) -> bool:
+    def _check_all_queues_freshness(self) -> Dict[int, bool]:
         """
-        Check if we have fresh data points in the observation window.
-        Prevents treating stale/cached values as valid.
-        
-        Returns True if we have at least MIN_POINTS_PER_METRIC data points
-        for each of the key metrics (latency, drop, util) in the window.
+        Check freshness for ALL queues in a single query.
+        Returns: Dict[qid, bool]
         """
         start, stop = self._time_window()
         
+        # Group by both queue_id and _measurement
         flux = f'''
         from(bucket:"{self.bucket}")
             |> range(start:{start}, stop:{stop})
-            |> filter(fn: (r) => r.queue_id == "{qid}")
+            |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
             |> filter(fn: (r) => r._measurement == "flow_latency" or r._measurement == "q_drop_rate_100ms" or r._measurement == "tx_utilization")
-            |> group(columns:["_measurement"])
+            |> group(columns:["queue_id", "_measurement"])
             |> count()
         '''
         
-        counts = {'flow_latency': 0, 'q_drop_rate_100ms': 0, 'tx_utilization': 0}
+        # Initialize counts: qid -> measurement -> count
+        counts = {qid: {'flow_latency': 0, 'q_drop_rate_100ms': 0, 'tx_utilization': 0} for qid in QIDS}
+        freshness_map = {qid: False for qid in QIDS}
         
         try:
             tables = self.query_api.query(org=self.org, query=flux)
             for table in tables or []:
                 for record in table.records:
-                    # After group()/count(), measurement is in _measurement column, not metadata
-                    measurement = record.values.get('_measurement')
-                    count = record.get_value()
-                    if measurement in counts and count is not None:
-                        counts[measurement] = int(count)
+                    try:
+                        qid = int(record.values.get('queue_id', -1))
+                        measurement = record.values.get('_measurement')
+                        count = record.get_value()
+                        
+                        if qid in counts and measurement in counts[qid] and count is not None:
+                            counts[qid][measurement] = int(count)
+                    except (ValueError, TypeError):
+                        continue
         except Exception as e:
-            log.debug(f"Failed to check data freshness for qid={qid}: {e}")
-            return False  # On query failure, assume stale
-        
-        # All metrics must have minimum points
-        fresh = all(c >= MIN_POINTS_PER_METRIC for c in counts.values())
-        if not fresh:
-            log.debug(f"[Freshness] Queue {qid} has insufficient points: {counts}")
-        return fresh
+            log.debug(f"Failed to check batch data freshness: {e}")
+            return freshness_map  # All False
+            
+        # Check freshness per queue
+        for qid in QIDS:
+            c = counts[qid]
+            fresh = all(cnt >= MIN_POINTS_PER_METRIC for cnt in c.values())
+            freshness_map[qid] = fresh
+            if not fresh:
+                log.debug(f"[Freshness] Queue {qid} has insufficient points: {c}")
+                
+        return freshness_map
     
-    def _get_hottest_demand(self, qid: int) -> Optional[Tuple[str, str]]:
-        """Get the demand with highest latency for a queue."""
+    def _get_all_hottest_demands(self) -> Dict[int, Tuple[str, str]]:
+        """Get the demand with highest latency for ALL queues in one query."""
         start, stop = self._time_window()
         flux = f'''
         from(bucket:"{self.bucket}")
             |> range(start:{start}, stop:{stop})
-            |> filter(fn: (r) => r._measurement == "flow_latency" and r.queue_id == "{qid}")
+            |> filter(fn: (r) => r._measurement == "flow_latency")
+            |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
             |> toFloat()
-            |> group(columns:["src_ip", "dst_ip"])
+            |> group(columns:["queue_id", "src_ip", "dst_ip"])
             |> mean(column:"_value")
-            |> group()
+            |> group(columns:["queue_id"])
             |> sort(columns:["_value"], desc:true)
             |> limit(n:1)
         '''
+        results = {}
         try:
             tables = self.query_api.query(org=self.org, query=flux)
             for table in tables or []:
                 for record in table.records:
-                    src = record.values.get('src_ip')
-                    dst = record.values.get('dst_ip')
-                    if src and dst:
-                        return str(src), str(dst)
+                    try:
+                        qid = int(record.values.get('queue_id', -1))
+                        src = record.values.get('src_ip')
+                        dst = record.values.get('dst_ip')
+                        if qid in QIDS and src and dst:
+                            results[qid] = (str(src), str(dst))
+                    except (ValueError, TypeError):
+                        continue
         except Exception as e:
-            log.debug(f"Failed to get hottest demand for qid={qid}: {e}")
-        return None
+            log.debug(f"Failed to get batch hottest demands: {e}")
+        return results
     
     def _metric_sane(self, q: Dict) -> bool:
         """
