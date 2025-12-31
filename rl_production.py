@@ -39,10 +39,11 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 # Import from the main RL agent module
 from rl_agent_4 import (
-    DuelingDQN, QoSRoutingEnv,
+    DuelingDQN, QoSRoutingEnv, setup_logging,
     STATE_DIM, ACTION_DIM, HIDDEN_DIM, QIDS, SLA_THRESHOLDS
 )
 from traffic_generator import TrafficManager
+from config.schema import MAX_SWITCHES
 import rl_agent_4
 
 # =============================================================================
@@ -64,23 +65,11 @@ rl_agent_4.DELAY_NO_ACTION = DELAY_NO_ACTION
 # =============================================================================
 #                              LOGGING SETUP
 # =============================================================================
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-class FlushingStreamHandler(logging.StreamHandler):
-    def emit(self, record):
-        super().emit(record)
-        self.flush()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[FlushingStreamHandler(sys.stdout)],
-    force=True,
-)
+# =============================================================================
+#                              LOGGING SETUP
+# =============================================================================
+# Logging is configured via setup_logging imported from rl_agent_4
 log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
 
 
 # =============================================================================
@@ -340,15 +329,30 @@ class ProductionRunner:
         # Device
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         log.info(f"Using device: {device}")
-        
+
+        # Load topology if config specified
+        topology_builder = None
+        rules_dir = args.rules_dir
+        if args.config:
+            from topology.factory import create_topology
+            log.info(f"Loading topology from: {args.config}")
+            topology_builder = create_topology(args.config)
+            if rules_dir is None:
+                topo_name = topology_builder.config.topology.name.replace('-', '_')
+                rules_dir = f"rules/{topo_name}"
+            log.info(f"Topology: {topology_builder.config.topology.name}")
+            log.info(f"  Switches: {len(topology_builder.switches)}/{MAX_SWITCHES} max")
+            log.info(f"  Rules dir: {rules_dir}")
+
         # Initialize components
         env = QoSRoutingEnv(
             args.influx_bucket, args.influx_token,
             args.influx_org, args.influx_url,
             verbose=args.verbose,
-
             reset_network=True,  # Reset network at start for clean baseline
-            production_mode=True  # Production: continuous operation
+            production_mode=True,  # Production: continuous operation
+            topology_builder=topology_builder,
+            rules_dir=rules_dir
         )
         agent = ProductionAgent(STATE_DIM, ACTION_DIM, device)
         metrics = ProductionMetricsWriter(
@@ -518,7 +522,13 @@ def main():
     # Controller
     parser.add_argument('--verbose', action='store_true',
                         help='Show verbose P4 controller output')
-    
+
+    # Topology configuration
+    parser.add_argument('--config', '-c', type=str, default=None,
+                        help='Path to YAML topology configuration file')
+    parser.add_argument('--rules-dir', type=str, default=None,
+                        help='Directory containing P4 rule files')
+
     # Traffic generation
     parser.add_argument('--generate-traffic', action='store_true',
                         help='Generate traffic with a fixed profile')
@@ -530,6 +540,8 @@ def main():
                         help='Traffic profile to use during bursts (default: bursty_be_2)')
     
     args = parser.parse_args()
+    
+    setup_logging(args.verbose)
     
     runner = ProductionRunner(args)
     runner.run()

@@ -1,20 +1,59 @@
 #!/usr/bin/env python3
+"""
+Network Traffic Visualizer
+
+Real-time visualization of network traffic flows across different topology types.
+Supports Fat-Tree, Leaf-Spine, and Three-Tier topologies with automatic layout.
+"""
 import json
 import time
 import os
 import signal
 import sys
+import argparse
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.animation import FuncAnimation
 import math
+from pathlib import Path
 from matplotlib.patches import FancyArrowPatch, Rectangle
+from typing import Dict, List, Optional, Tuple
 
 # === Configuration ===
-TOPOLOGY_FILE = "topology.json"
+DEFAULT_TOPOLOGY_FILE = "topology.json"
 PATHS_FILE = "/tmp/p4_paths.json"
 REFRESH_INTERVAL_MS = 1000
+
+
+def get_topology_info(config_path: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Get topology type and switch roles from configuration.
+
+    Args:
+        config_path: Path to YAML configuration file
+
+    Returns:
+        Tuple of (topology_type, switch_roles_dict)
+        topology_type: 'fat-tree', 'leaf-spine', or 'three-tier'
+        switch_roles_dict: {switch_name: role} e.g., {'leaf1': 'leaf', 'spine1': 'spine'}
+    """
+    try:
+        from topology.factory import create_topology
+
+        builder = create_topology(config_path)
+        topo_type = builder.config.topology.type.value
+
+        # Build switch roles from builder
+        switch_roles = {}
+        for sw_name, sw_info in builder.switches.items():
+            switch_roles[sw_name] = sw_info.role
+
+        return topo_type, switch_roles
+
+    except Exception as e:
+        print(f"Warning: Could not load topology config: {e}")
+        return 'fat-tree', {}  # Default fallback
 
 # Styles - White Theme
 BG_COLOR = "#ffffff"
@@ -43,12 +82,32 @@ QUEUE_NAMES = {
 plt.rcParams['toolbar'] = 'None'
 
 class NetworkVisualizer:
-    def __init__(self, topo_file):
+    # Role normalization for visualization layers
+    EDGE_ROLES = {'leaf', 'tor', 'access'}  # Y=2
+    AGG_ROLES = {'spine', 'agg', 'distribution'}  # Y=4
+    CORE_ROLES = {'core'}  # Y=6
+
+    def __init__(self, topo_file: str, config_path: str = None):
+        """
+        Initialize the network visualizer.
+
+        Args:
+            topo_file: Path to topology.json (e.g., /tmp/topology.json)
+            config_path: Optional path to YAML topology configuration
+        """
         self.topo_file = topo_file
+        self.config_path = config_path
         self.graph = nx.Graph()
         self.pos = {}
         self.node_roles = {}
-        
+
+        # Load topology type and switch roles from config if provided
+        self.topology_type = 'fat-tree'
+        self.switch_roles_from_config = {}
+        if config_path:
+            self.topology_type, self.switch_roles_from_config = get_topology_info(config_path)
+            print(f"Visualization: Loaded topology type '{self.topology_type}' from config")
+
         # UI State
         self.visibility = {
             'phy': True,
@@ -56,19 +115,19 @@ class NetworkVisualizer:
             1: True,
             7: True
         }
-        
+
         self.load_topology()
         self.compute_layout()
-        
+
         # Plot setup
-        self.fig, self.ax = plt.subplots(figsize=(16, 12)) # Larger size
+        self.fig, self.ax = plt.subplots(figsize=(16, 12))  # Larger size
         self.fig.patch.set_facecolor(BG_COLOR)
         self.ax.set_facecolor(BG_COLOR)
-        
+
         # Button State (for hit testing)
-        self.ui_buttons = [] # List of (x, y, w, h, key)
+        self.ui_buttons = []  # List of (x, y, w, h, key)
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        
+
         # State
         self.paths_data = {}
         
@@ -84,46 +143,69 @@ class NetworkVisualizer:
                 self.visibility[key] = not self.visibility[key]
                 return # Handled
         
+    def _get_switch_role(self, switch_name: str) -> str:
+        """
+        Get the visualization role for a switch.
+
+        Uses roles from config if available, otherwise falls back to prefix-based detection.
+
+        Returns normalized role: 'edge', 'agg', 'core', or 'switch'
+        """
+        # Try to get role from config
+        if switch_name in self.switch_roles_from_config:
+            role = self.switch_roles_from_config[switch_name]
+            # Normalize role to visualization category
+            if role in self.EDGE_ROLES:
+                return 'edge'
+            elif role in self.AGG_ROLES:
+                return 'agg'
+            elif role in self.CORE_ROLES:
+                return 'core'
+            return 'switch'
+
+        # Fallback: prefix-based detection (legacy)
+        if switch_name.startswith("c") or switch_name.startswith("core"):
+            return "core"
+        elif switch_name.startswith("a") or switch_name.startswith("spine") or switch_name.startswith("dist"):
+            return "agg"
+        elif switch_name.startswith("t") or switch_name.startswith("leaf") or switch_name.startswith("access"):
+            return "edge"
+        return "switch"
+
     def load_topology(self):
         """Parse topology.json to build the graph and identify roles."""
         if not os.path.exists(self.topo_file):
             print(f"Error: {self.topo_file} not found.")
             sys.exit(1)
-            
+
         with open(self.topo_file, 'r') as f:
             data = json.load(f)
-            
+
         # Add nodes
         nodes_to_add = []
         for node in data.get("nodes", []):
             nid = node["id"]
-            
+
             # Filter INT collectors (h100+)
             if node.get("isHost"):
                 try:
                     # Assumes id format 'h<number>'
                     hid = int(nid[1:])
                     if hid >= 100:
-                        continue # Skip this node
+                        continue  # Skip this node
                 except ValueError:
-                    pass # Not a host with numeric ID, or malformed, process normally
+                    pass  # Not a host with numeric ID, or malformed, process normally
                 self.node_roles[nid] = "host"
             elif node.get("isSwitch"):
-                if nid.startswith("c"):
-                    self.node_roles[nid] = "core"
-                elif nid.startswith("a"):
-                    self.node_roles[nid] = "agg"
-                elif nid.startswith("t"):
-                    self.node_roles[nid] = "tor"
-                else:
-                    self.node_roles[nid] = "switch"
+                # Use config-based or fallback role detection
+                self.node_roles[nid] = self._get_switch_role(nid)
             else:
                 # If not host or switch, assign a default role or skip
-                self.node_roles[nid] = "unknown" # Or handle as needed
-            
+                self.node_roles[nid] = "unknown"
+
             # Only add to graph if not filtered
             nodes_to_add.append(nid)
-            self.graph.add_node(nid) # Add node first to check for links
+            self.graph.add_node(nid)
 
         # Add links
         for link in data.get("links", []):
@@ -133,74 +215,236 @@ class NetworkVisualizer:
                 self.graph.add_edge(u, v)
 
     def compute_layout(self):
-        """Compute a fixed Fat-Tree layout with better spacing."""
-        # Y-coordinates (Layers)
+        """
+        Compute automatic layout based on topology type.
+
+        Supports Fat-Tree, Leaf-Spine, and Three-Tier topologies.
+        Layout structure:
+          - Y=0: hosts
+          - Y=2: edge switches (leaf/tor/access)
+          - Y=4: aggregation switches (spine/agg/distribution)
+          - Y=6: core switches
+        """
+        # Y-coordinates (Layers) - unified for all topology types
         layer_y = {
             "host": 0,
-            "tor": 2,
-            "agg": 4,
+            "edge": 2,      # leaf, tor, access
+            "agg": 4,       # spine, agg, distribution
             "core": 6,
-            "switch": 3
+            "switch": 3,    # unknown role
+            "unknown": 1
         }
-        
-        nodes_by_role = {"host": [], "tor": [], "agg": [], "core": [], "switch": [], "unknown": []}
+
+        # Group nodes by their visualization role
+        nodes_by_role = {role: [] for role in layer_y.keys()}
         for n, r in self.node_roles.items():
-            # Only consider nodes that are actually in the graph (not filtered)
             if self.graph.has_node(n):
                 nodes_by_role[r].append(n)
+
+        # Sort nodes for consistent ordering
         for r in nodes_by_role:
-            nodes_by_role[r].sort()
-            
-        width = 24.0 # Wider
-        
-        # Cores (Top)
-        c_nodes = nodes_by_role["core"]
-        if c_nodes:
-            dx = width / (len(c_nodes) + 1)
-            for i, n in enumerate(c_nodes):
+            nodes_by_role[r].sort(key=self._node_sort_key)
+
+        width = 24.0
+
+        # Dispatch to topology-specific layout
+        if self.topology_type == 'leaf-spine':
+            self._layout_leaf_spine(nodes_by_role, layer_y, width)
+        elif self.topology_type == 'three-tier':
+            self._layout_three_tier(nodes_by_role, layer_y, width)
+        else:
+            # Default: Fat-Tree or generic hierarchical
+            self._layout_fat_tree(nodes_by_role, layer_y, width)
+
+    def _node_sort_key(self, node_name: str):
+        """Sort key for node ordering - extract numeric suffix."""
+        import re
+        match = re.search(r'(\d+)$', node_name)
+        if match:
+            return (node_name[0], int(match.group(1)))
+        return (node_name, 0)
+
+    def _layout_leaf_spine(self, nodes_by_role: dict, layer_y: dict, width: float):
+        """
+        Leaf-Spine topology layout.
+
+        Structure: Hosts -> Leaves -> Spines (evenly distributed)
+        """
+        # Spines at top (Y=4)
+        spines = nodes_by_role["agg"]
+        if spines:
+            dx = width / (len(spines) + 1)
+            for i, n in enumerate(spines):
+                self.pos[n] = ((i + 1) * dx, layer_y["agg"])
+
+        # Leaves at Y=2 (evenly distributed)
+        leaves = nodes_by_role["edge"]
+        if leaves:
+            dx = width / (len(leaves) + 1)
+            for i, n in enumerate(leaves):
+                self.pos[n] = ((i + 1) * dx, layer_y["edge"])
+
+        # Hosts below their connected leaf
+        self._layout_hosts_under_switches(nodes_by_role, layer_y)
+
+    def _layout_three_tier(self, nodes_by_role: dict, layer_y: dict, width: float):
+        """
+        Three-Tier topology layout.
+
+        Structure: Hosts -> Access -> Distribution -> Core
+        """
+        # Core at top (Y=6)
+        cores = nodes_by_role["core"]
+        if cores:
+            dx = width / (len(cores) + 1)
+            for i, n in enumerate(cores):
                 self.pos[n] = ((i + 1) * dx, layer_y["core"])
-                
-        # Pod Centers
-        pod1_center = width * 0.25
-        pod2_center = width * 0.75
-        
-        # Aggs (a1, a2 in Pod1; a3, a4 in Pod2)
-        agg_spacing = 3.0
-        for n in nodes_by_role["agg"]:
-            if n in ["a1", "a2"]:
-                offset = -agg_spacing/2 if n == "a1" else agg_spacing/2
-                self.pos[n] = (pod1_center + offset, layer_y["agg"])
-            elif n in ["a3", "a4"]:
-                offset = -agg_spacing/2 if n == "a3" else agg_spacing/2
-                self.pos[n] = (pod2_center + offset, layer_y["agg"])
-            else:
-                self.pos[n] = (width/2, layer_y["agg"])
 
-        # ToRs (t1, t2 in Pod1; t3, t4 in Pod2)
-        tor_spacing = 5.0
-        for n in nodes_by_role["tor"]:
-            if n in ["t1", "t2"]:
-                offset = -tor_spacing/2 if n == "t1" else tor_spacing/2
-                self.pos[n] = (pod1_center + offset, layer_y["tor"])
-            elif n in ["t3", "t4"]:
-                offset = -tor_spacing/2 if n == "t3" else tor_spacing/2
-                self.pos[n] = (pod2_center + offset, layer_y["tor"])
-            else:
-                 self.pos[n] = (width/2, layer_y["tor"])
+        # Distribution at Y=4
+        dist = nodes_by_role["agg"]
+        if dist:
+            dx = width / (len(dist) + 1)
+            for i, n in enumerate(dist):
+                self.pos[n] = ((i + 1) * dx, layer_y["agg"])
 
-        # Hosts
-        for sw in nodes_by_role["tor"]:
-            if sw not in self.pos: continue
+        # Access at Y=2
+        access = nodes_by_role["edge"]
+        if access:
+            dx = width / (len(access) + 1)
+            for i, n in enumerate(access):
+                self.pos[n] = ((i + 1) * dx, layer_y["edge"])
+
+        # Hosts below their connected access switch
+        self._layout_hosts_under_switches(nodes_by_role, layer_y)
+
+    def _layout_fat_tree(self, nodes_by_role: dict, layer_y: dict, width: float):
+        """
+        Fat-Tree topology layout.
+
+        Structure: Hosts -> ToR -> Aggregation -> Core (with pod grouping)
+        """
+        # Cores at top (Y=6) - evenly distributed
+        cores = nodes_by_role["core"]
+        if cores:
+            dx = width / (len(cores) + 1)
+            for i, n in enumerate(cores):
+                self.pos[n] = ((i + 1) * dx, layer_y["core"])
+
+        # For Fat-Tree, group edge and agg switches by pods
+        edge_switches = nodes_by_role["edge"]
+        agg_switches = nodes_by_role["agg"]
+
+        # Determine number of pods based on edge switches
+        num_edge = len(edge_switches)
+        num_agg = len(agg_switches)
+
+        if num_edge == 0:
+            return
+
+        # Estimate pods: k/2 ToRs per pod in k-ary fat-tree
+        # Common case: k=4 has 2 ToRs per pod, k=8 has 4 per pod
+        # Heuristic: assume pods if agg count matches edge count
+        if num_agg > 0 and num_edge > 0:
+            # Try to detect pod structure
+            pods = self._detect_pods(edge_switches, agg_switches)
+        else:
+            pods = [[s] for s in edge_switches]
+
+        num_pods = len(pods)
+        pod_width = width / num_pods
+
+        # Layout each pod
+        for pod_idx, pod_edges in enumerate(pods):
+            pod_center = (pod_idx + 0.5) * pod_width
+
+            # Position edge switches in this pod
+            edge_spacing = pod_width * 0.6 / max(1, len(pod_edges))
+            edge_start = pod_center - (len(pod_edges) - 1) * edge_spacing / 2
+            for i, n in enumerate(pod_edges):
+                self.pos[n] = (edge_start + i * edge_spacing, layer_y["edge"])
+
+        # Position agg switches - map to pods or distribute evenly
+        if num_agg > 0:
+            if num_agg == num_edge:
+                # Same structure as edge (common in fat-tree)
+                for pod_idx, pod_edges in enumerate(pods):
+                    pod_center = (pod_idx + 0.5) * pod_width
+                    # Find agg switches for this pod
+                    pod_aggs = self._find_pod_aggs(pod_edges, agg_switches)
+                    if pod_aggs:
+                        agg_spacing = pod_width * 0.5 / max(1, len(pod_aggs))
+                        agg_start = pod_center - (len(pod_aggs) - 1) * agg_spacing / 2
+                        for i, n in enumerate(pod_aggs):
+                            self.pos[n] = (agg_start + i * agg_spacing, layer_y["agg"])
+            else:
+                # Distribute agg switches evenly
+                dx = width / (num_agg + 1)
+                for i, n in enumerate(agg_switches):
+                    if n not in self.pos:
+                        self.pos[n] = ((i + 1) * dx, layer_y["agg"])
+
+        # Hosts below their connected edge switch
+        self._layout_hosts_under_switches(nodes_by_role, layer_y)
+
+    def _detect_pods(self, edge_switches: list, agg_switches: list) -> list:
+        """
+        Detect pod structure by analyzing connectivity.
+
+        Returns list of lists, where each inner list contains edge switches in a pod.
+        """
+        # Simple heuristic: group by connectivity to agg switches
+        # If edge switches share the same agg neighbors, they're in the same pod
+
+        pod_map = {}  # frozenset(agg_neighbors) -> [edge_switches]
+
+        for edge in edge_switches:
+            agg_neighbors = frozenset(
+                n for n in self.graph.neighbors(edge)
+                if n in agg_switches
+            )
+            if agg_neighbors:
+                if agg_neighbors not in pod_map:
+                    pod_map[agg_neighbors] = []
+                pod_map[agg_neighbors].append(edge)
+            else:
+                # No agg neighbors - standalone pod
+                pod_map[frozenset([edge])] = [edge]
+
+        # Convert to list of lists, sorted by first edge switch
+        pods = list(pod_map.values())
+        pods.sort(key=lambda p: self._node_sort_key(p[0]) if p else ('z', 999))
+        return pods
+
+    def _find_pod_aggs(self, pod_edges: list, agg_switches: list) -> list:
+        """Find agg switches connected to the given pod edge switches."""
+        pod_aggs = set()
+        for edge in pod_edges:
+            for neighbor in self.graph.neighbors(edge):
+                if neighbor in agg_switches:
+                    pod_aggs.add(neighbor)
+        return sorted(pod_aggs, key=self._node_sort_key)
+
+    def _layout_hosts_under_switches(self, nodes_by_role: dict, layer_y: dict):
+        """Position hosts below their connected edge switches."""
+        edge_switches = nodes_by_role["edge"]
+        host_spread = 2.0
+
+        for sw in edge_switches:
+            if sw not in self.pos:
+                continue
             sw_x, sw_y = self.pos[sw]
-            sw_hosts = sorted([n for n in self.graph.neighbors(sw) if self.node_roles.get(n) == "host"])
-            if not sw_hosts: continue
-            
-            # Spread hosts significantly
-            host_spread = 2.0
-            start_x = sw_x - (len(sw_hosts)-1) * host_spread / 2
-            
+
+            # Find hosts connected to this switch
+            sw_hosts = sorted(
+                [n for n in self.graph.neighbors(sw) if self.node_roles.get(n) == "host"],
+                key=self._node_sort_key
+            )
+            if not sw_hosts:
+                continue
+
+            # Spread hosts below the switch
+            start_x = sw_x - (len(sw_hosts) - 1) * host_spread / 2
             for i, h in enumerate(sw_hosts):
-                # Droop hosts slightly below Y=0 purely for visual separation if needed, or keep at 0
                 self.pos[h] = (start_x + i * host_spread, layer_y["host"])
 
     def update_data(self):
@@ -289,8 +533,10 @@ class NetworkVisualizer:
         
         # 2. Draw Nodes (BIG ICONS)
         role_colors = {
-            "host": "#cccccc",   "tor":  "#17becf",
-            "agg":  "#1f77b4",   "core": "#9467bd",
+            "host": "#cccccc",
+            "edge": "#17becf",    # leaf/tor/access
+            "agg": "#1f77b4",     # spine/agg/distribution
+            "core": "#9467bd",
             "switch": "gray",
             "unknown": "lightgray"
         }
@@ -434,14 +680,59 @@ class NetworkVisualizer:
         # Title (Centered Top)
         self.ax.text(12.0, 7.5, "Real-Time Network Traffic", fontsize=20, fontweight='bold', ha='center')
 
-    def main(self): # unused directly, compat
+    def main(self):  # unused directly, compat
         pass
 
+
+def get_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Real-time network traffic visualization"
+    )
+    parser.add_argument(
+        '--config', '-c',
+        type=str,
+        default=None,
+        help='Path to YAML topology configuration for dynamic layout and role detection'
+    )
+    parser.add_argument(
+        '--topology-file',
+        type=str,
+        default='/tmp/topology.json',
+        help='Path to topology.json (default: /tmp/topology.json)'
+    )
+    parser.add_argument(
+        '--paths-file',
+        type=str,
+        default=PATHS_FILE,
+        help=f'Path to paths JSON file (default: {PATHS_FILE})'
+    )
+    parser.add_argument(
+        '--refresh',
+        type=int,
+        default=REFRESH_INTERVAL_MS,
+        help=f'Refresh interval in milliseconds (default: {REFRESH_INTERVAL_MS})'
+    )
+
+    return parser.parse_args()
+
+
 def main():
-    vis = NetworkVisualizer(TOPOLOGY_FILE)
+    args = get_args()
+
+    # Update global paths file if overridden
+    global PATHS_FILE
+    PATHS_FILE = args.paths_file
+
+    vis = NetworkVisualizer(
+        topo_file=args.topology_file,
+        config_path=args.config
+    )
+
     # Fix Warning: UserWarning: frames=None... passed cache_frame_data=True
-    ani = FuncAnimation(vis.fig, vis.draw, interval=REFRESH_INTERVAL_MS, cache_frame_data=False)
+    ani = FuncAnimation(vis.fig, vis.draw, interval=args.refresh, cache_frame_data=False)
     plt.show()
+
 
 if __name__ == "__main__":
     main()

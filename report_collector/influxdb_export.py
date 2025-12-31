@@ -1,16 +1,63 @@
 #!/usr/bin/env python3
+"""
+INT Report Collector and InfluxDB Exporter.
+
+Sniffs INT reports from leaf switch interfaces and exports metrics to InfluxDB.
+Supports dynamic interface discovery from topology configuration.
+"""
+
 import sys
+import os
 import signal
+import argparse
+from pathlib import Path
+
 from scapy.all import AsyncSniffer, conf
 from influxdb_client import InfluxDBClient
 from collector import *
+
+# Add parent directory for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 INFLUX_URL = "http://192.168.201.1:8086"
 INFLUX_TOKEN = "0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w=="
 INFLUX_ORG = "research"
 INFLUX_BUCKET = "INT"
 
-BPF = "udp and dst port 1234"   # <<<< narrowed; huge CPU win
+# Default interfaces (legacy Fat-Tree topology with 4 ToR switches)
+DEFAULT_INTERFACES = ['t1-eth10', 't2-eth10', 't3-eth10', 't4-eth10']
+
+BPF = "udp and dst port 1234"
+
+
+def get_interfaces_from_config(config_path: str) -> list:
+    """
+    Get INT collector interfaces from topology configuration.
+
+    Args:
+        config_path: Path to YAML configuration file
+
+    Returns:
+        List of interface names (e.g., ['leaf1-eth10', 'leaf2-eth10'])
+    """
+    try:
+        from topology.factory import create_topology
+
+        builder = create_topology(config_path)
+        interfaces = builder.get_collector_interfaces()
+
+        if interfaces:
+            print(f"Discovered {len(interfaces)} collector interfaces from topology")
+            return interfaces
+        else:
+            print("No collector interfaces found in topology, using defaults")
+            return DEFAULT_INTERFACES
+
+    except Exception as e:
+        print(f"Error loading topology: {e}")
+        print("Falling back to default interfaces")
+        return DEFAULT_INTERFACES
+
 
 def handle_pkt(pkt, c: Collector):
     if INTREP in pkt:
@@ -18,24 +65,82 @@ def handle_pkt(pkt, c: Collector):
         if fi:
             c.export_influxdb(fi)
 
+
 def main():
-    iface = ['t1-eth10', 't2-eth10', 't3-eth10', 't4-eth10']
+    parser = argparse.ArgumentParser(
+        description="INT Report Collector and InfluxDB Exporter"
+    )
+    parser.add_argument(
+        '--config', '-c',
+        type=str,
+        default=None,
+        help='Path to YAML topology configuration for dynamic interface discovery'
+    )
+    parser.add_argument(
+        '--interfaces', '-i',
+        type=str,
+        default=None,
+        help='Comma-separated list of interfaces (overrides config)'
+    )
+    parser.add_argument(
+        '--influx-url',
+        default=INFLUX_URL,
+        help='InfluxDB URL'
+    )
+    parser.add_argument(
+        '--influx-token',
+        default=INFLUX_TOKEN,
+        help='InfluxDB token'
+    )
+    parser.add_argument(
+        '--influx-org',
+        default=INFLUX_ORG,
+        help='InfluxDB organization'
+    )
+    parser.add_argument(
+        '--influx-bucket',
+        default=INFLUX_BUCKET,
+        help='InfluxDB bucket'
+    )
+
+    args = parser.parse_args()
+
+    # Determine interfaces to sniff
+    if args.interfaces:
+        # Explicit interface list overrides everything
+        iface = [i.strip() for i in args.interfaces.split(',')]
+        print(f"Using explicit interfaces: {iface}")
+    elif args.config:
+        # Load from topology configuration
+        iface = get_interfaces_from_config(args.config)
+    else:
+        # Fall back to defaults
+        iface = DEFAULT_INTERFACES
+        print(f"Using default interfaces: {iface}")
+
     print(f"Sniffing on {iface} with BPF: {BPF}")
     sys.stdout.flush()
 
-    # Scapy performance knobs (optional, but helpful)
-    conf.use_pcap = True          # prefer libpcap
-    conf.sniff_promisc = 0        # no promiscuous unless needed
+    # Scapy performance knobs
+    conf.use_pcap = True
+    conf.sniff_promisc = 0
 
-    influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+    influx_client = InfluxDBClient(
+        url=args.influx_url,
+        token=args.influx_token,
+        org=args.influx_org
+    )
 
-    # Async writer (flush ~0.1s). If your device clocks are skewed, set use_device_time=False.
-    c = Collector(influx_client, INFLUX_ORG, INFLUX_BUCKET,
-                  write_async=True, flush_interval_ms=50, batch_size=1000,
-                  use_device_time=False,
-                  aggregate_enabled=False)  # Disabled - P4 200ms sampling provides sufficient smoothing
+    # Async writer
+    c = Collector(
+        influx_client, args.influx_org, args.influx_bucket,
+        write_async=True, flush_interval_ms=50, batch_size=1000,
+        use_device_time=False,
+        aggregate_enabled=False
+    )
 
     stop = False
+
     def signal_handler(sig, frame):
         nonlocal stop
         stop = True
@@ -45,9 +150,12 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    sniffer = AsyncSniffer(iface=iface, filter=BPF, store=False,
-                           prn=lambda x: handle_pkt(x, c))
+    sniffer = AsyncSniffer(
+        iface=iface, filter=BPF, store=False,
+        prn=lambda x: handle_pkt(x, c)
+    )
     sniffer.start()
+
     try:
         while not stop:
             signal.pause()
@@ -59,6 +167,7 @@ def main():
         except Exception:
             pass
         c.flush_buffer()
+
 
 if __name__ == '__main__':
     main()

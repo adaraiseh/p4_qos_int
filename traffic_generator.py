@@ -45,6 +45,8 @@ import time
 import random
 import subprocess
 import logging
+import argparse
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 from p4utils.utils.task_scheduler import Task, TaskClient
@@ -53,6 +55,78 @@ from p4utils.utils.task_scheduler import Task, TaskClient
 from network import _traffic_dst_port, QID_TOS, ALL_QUEUES
 
 log = logging.getLogger(__name__)
+
+
+def get_hosts_from_config(config_path: str, topology_file: str = "topology.json") -> Dict[str, str]:
+    """
+    Get host name to IP mapping from topology.json (runtime IPs) or config.
+
+    Priority:
+    1. topology.json - has actual Mininet-assigned IPs
+    2. topology builder - fallback for pre-network planning
+
+    Args:
+        config_path: Path to YAML configuration file
+        topology_file: Path to topology.json (default: topology.json)
+
+    Returns:
+        Dict mapping host names to IPs (e.g., {'h1': '10.13.1.2', 'h2': '10.13.2.2'})
+    """
+    # First, try to load from topology.json (has actual runtime IPs)
+    try:
+        import json
+        with open(topology_file, 'r') as f:
+            topo = json.load(f)
+
+        hosts_ips = {}
+        for node in topo.get('nodes', []):
+            node_id = node.get('id', '')
+            if isinstance(node_id, str) and node_id.startswith('h'):
+                try:
+                    host_num = int(node_id[1:])
+                    if host_num < 100:  # Exclude collectors (h100+)
+                        ip = node.get('ip', '')
+                        if ip:
+                            # Remove CIDR suffix if present
+                            ip = ip.split('/')[0]
+                            hosts_ips[node_id] = ip
+                except ValueError:
+                    continue
+
+        if hosts_ips:
+            log.info(f"Loaded {len(hosts_ips)} traffic hosts from {topology_file}")
+            return hosts_ips
+
+    except FileNotFoundError:
+        log.debug(f"{topology_file} not found, falling back to config")
+    except Exception as e:
+        log.warning(f"Error loading {topology_file}: {e}")
+
+    # Fallback: load from topology builder (only if config_path provided)
+    if config_path:
+        try:
+            from topology.factory import create_topology
+
+            builder = create_topology(config_path)
+            hosts_ips = builder.get_host_ips()
+
+            if hosts_ips:
+                # Filter out collector hosts (h100+)
+                traffic_hosts = {
+                    name: ip for name, ip in hosts_ips.items()
+                    if name.startswith('h') and int(name[1:]) < 100
+                }
+                log.info(f"Discovered {len(traffic_hosts)} traffic hosts from topology config")
+                return traffic_hosts
+            else:
+                log.warning("No hosts found in topology config")
+                return {}
+
+        except Exception as e:
+            log.warning(f"Error loading topology: {e}")
+            return {}
+
+    return {}
 
 
 class TrafficManager:
@@ -138,34 +212,41 @@ class TrafficManager:
         'test_idle_1': 'test_idle', 'test_idle_2': 'test_idle',
     }
     
-    # Host IP mapping (h1-h8)
-    HOSTS_IPS = [
-        "0",          # dummy index 0
-        "10.7.1.2",   # h1
-        "10.7.2.2",   # h2
-        "10.8.3.2",   # h3
-        "10.8.4.2",   # h4
-        "10.9.5.2",   # h5
-        "10.9.6.2",   # h6
-        "10.10.7.2",  # h7
-        "10.10.8.2",  # h8
-    ]
-    
-    def __init__(self, topology_file: str = "/tmp/topology.json"):
+    # Default host IP mapping (legacy Fat-Tree k=4 topology)
+    DEFAULT_HOSTS_IPS = {
+        "h1": "10.7.1.2",
+        "h2": "10.7.2.2",
+        "h3": "10.8.3.2",
+        "h4": "10.8.4.2",
+        "h5": "10.9.5.2",
+        "h6": "10.9.6.2",
+        "h7": "10.10.7.2",
+        "h8": "10.10.8.2",
+    }
+
+    def __init__(self, topology_file: str = "/tmp/topology.json", config_path: str = None):
         """Initialize TrafficManager.
-        
+
         Args:
-            topology_file: Path to topology.json for host discovery
+            topology_file: Path to topology.json for host discovery (legacy)
+            config_path: Path to YAML topology configuration for dynamic host/IP discovery
         """
         if os.geteuid() != 0:
             log.warning("TrafficManager: Not running as root. TaskClient may fail.")
-        
+
         # Use a dedicated random generator seeded with time
         # This ensures traffic variability even when global random is seeded for reproducibility
         self._rng = random.Random(time.time())
-        
+
         self.topology_file = topology_file
-        
+        self.config_path = config_path
+
+        # Load host IPs: try topology_file first (has runtime IPs), then config, then defaults
+        self.hosts_ips = get_hosts_from_config(config_path, topology_file)
+        if not self.hosts_ips:
+            log.warning("No hosts found, falling back to defaults")
+            self.hosts_ips = self.DEFAULT_HOSTS_IPS.copy()
+
         # Discover traffic hosts (h1-h8, excluding h100+)
         self.traffic_hosts = self._discover_traffic_hosts()
         log.info(f"TrafficManager: Found traffic hosts: {self.traffic_hosts}")
@@ -204,7 +285,17 @@ class TrafficManager:
         self._step_burst_baseline_loads = None  # Exact baseline loads to restore after burst
     
     def _discover_traffic_hosts(self) -> List[str]:
-        """Discover traffic hosts from topology (hosts with id < 100)."""
+        """Discover traffic hosts from hosts_ips dict or topology.json (hosts with id < 100)."""
+        # If we loaded from config, use those host names
+        if self.hosts_ips and self.hosts_ips != self.DEFAULT_HOSTS_IPS:
+            hosts = [
+                name for name in self.hosts_ips.keys()
+                if name.startswith('h') and int(name[1:]) < 100
+            ]
+            if hosts:
+                return sorted(hosts, key=lambda x: int(x[1:]))
+
+        # Fallback: discover from topology.json
         hosts = []
         try:
             with open(self.topology_file, 'r') as f:
@@ -218,8 +309,12 @@ class TrafficManager:
                     except ValueError:
                         continue
         except Exception as e:
-            log.warning(f"Failed to load topology: {e}, using default h1-h8")
-            hosts = [f'h{i}' for i in range(1, 9)]
+            log.warning(f"Failed to load topology: {e}, using hosts from hosts_ips")
+            # Use hosts from hosts_ips dict
+            hosts = [
+                name for name in self.hosts_ips.keys()
+                if name.startswith('h') and int(name[1:]) < 100
+            ]
         return sorted(hosts, key=lambda x: int(x[1:]))
     
     def _build_pods(self) -> List[List[str]]:
@@ -244,9 +339,12 @@ class TrafficManager:
         return pairs
     
     def _host_to_ip(self, hostname: str) -> str:
-        """Get IP for hostname."""
-        idx = int(hostname[1:])
-        return self.HOSTS_IPS[idx]
+        """Get IP for hostname from the hosts_ips mapping."""
+        ip = self.hosts_ips.get(hostname)
+        if ip is None:
+            log.warning(f"No IP found for host {hostname}, using placeholder")
+            return "0.0.0.0"
+        return ip
     
     def _send_task(self, hostname: str, cmd: str, delay: float = 0.0) -> bool:
         """Send a task to the host's TaskServer."""
@@ -587,22 +685,61 @@ class TrafficManager:
                 self._send_task(sender, cmd, delay=0.5)
 
 
+def get_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Dynamic traffic generation for RL training episodes"
+    )
+    parser.add_argument(
+        '--config', '-c',
+        type=str,
+        default=None,
+        help='Path to YAML topology configuration for dynamic host/IP discovery'
+    )
+    parser.add_argument(
+        '--topology-file',
+        type=str,
+        default='/tmp/topology.json',
+        help='Path to topology.json for host discovery (legacy)'
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Run a 10-second traffic test'
+    )
+    parser.add_argument(
+        '--profile',
+        type=str,
+        default=None,
+        help='Specific traffic profile to use (e.g., high_1, medium_2)'
+    )
+
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    
+
     if os.geteuid() != 0:
         print("ERROR: Must run with sudo!")
-        print("Usage: sudo python3 traffic_generator.py [test]")
+        print("Usage: sudo python3 traffic_generator.py [--config CONFIG] [--test] [--profile PROFILE]")
         sys.exit(1)
-    
-    tm = TrafficManager()
+
+    args = get_args()
+
+    tm = TrafficManager(
+        topology_file=args.topology_file,
+        config_path=args.config
+    )
+
     print(f"Hosts: {tm.traffic_hosts}")
+    print(f"Host IPs: {tm.hosts_ips}")
     print(f"Senders: {tm.senders} -> Receivers: {tm.receivers}")
     print(f"Traffic pairs: {len(tm.traffic_pairs)}")
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "test":
+
+    if args.test:
         print("\nStarting traffic test (10 seconds)...")
-        info = tm.start_traffic()
+        info = tm.start_traffic(profile_name=args.profile)
         print(f"Profile: {info['profile_name']} ({info['profile_category']})")
         time.sleep(10)
         print("\nStopping traffic...")

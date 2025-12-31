@@ -1,0 +1,59 @@
+# Fat-Tree k=2 Topology Configuration
+# Minimal fat-tree topology
+#
+# Structure:
+#   - 2 pods (k=2)
+#   - 1 ToR switch per pod (k/2 = 1) = 2 total
+#   - 1 Aggregation switch per pod (k/2 = 1) = 2 total
+#   - 1 Core switch ((k/2)^2 = 1)
+#   - 1 host per ToR (k/2 = 1) = 2 total hosts
+#   - Total: 5 switches
+
+version: "1.0"
+
+topology:
+  type: "fat-tree"
+  name: "fat-tree-k2"
+
+fat_tree:
+  k: 2
+
+switch_naming:
+  leaf_prefix: "t"
+  spine_prefix: "a"
+  core_prefix: "c"
+  host_prefix: "h"
+  collector_prefix: "h"
+  collector_id_base: 100
+
+switch_defaults:
+  p4_source: "p4src/int_md.p4"
+  priority_queues: 8
+  thrift_port_base: 9200
+
+link_bandwidths:
+  host_leaf: 10
+  leaf_spine: 5
+  spine_core: 10
+  host_access: 10
+  access_distribution: 5
+  distribution_core: 10
+
+int_collectors:
+  ratio: 4
+  ip_base: "172.16"
+  port: 10
+
+qos_queues:
+  - id: 0
+    name: "voice"
+    dscp: "0x2E"
+    sla_ms: 100
+  - id: 1
+    name: "video"
+    dscp: "0x18"
+    sla_ms: 150
+  - id: 7
+    name: "best_effort"
+    dscp: "0x00"
+    sla_ms: 200

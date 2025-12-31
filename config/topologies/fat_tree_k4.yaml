@@ -1,0 +1,60 @@
+# Fat-Tree k=4 Topology Configuration
+# Matches the original test topology structure
+#
+# Structure:
+#   - 4 pods (k=4)
+#   - 2 ToR switches per pod (k/2 = 2) = 8 total
+#   - 2 Aggregation switches per pod (k/2 = 2) = 8 total
+#   - 4 Core switches ((k/2)^2 = 4)
+#   - 2 hosts per ToR (k/2 = 2) = 16 total hosts
+#   - Total: 20 switches (at MAX_SWITCHES=20 limit)
+
+version: "1.0"
+
+topology:
+  type: "fat-tree"
+  name: "fat-tree-k4"
+
+fat_tree:
+  k: 4
+
+# Use legacy naming (t, a, c prefixes) for backward compatibility
+switch_naming:
+  leaf_prefix: "t"      # t1, t2, t3, t4 (ToR switches)
+  spine_prefix: "a"     # a1, a2, a3, a4 (Aggregation switches)
+  core_prefix: "c"      # c1, c2 (Core switches)
+  host_prefix: "h"
+  collector_prefix: "h"
+  collector_id_base: 100
+
+switch_defaults:
+  p4_source: "p4src/int_md.p4"
+  priority_queues: 8
+  thrift_port_base: 9200
+
+link_bandwidths:
+  host_leaf: 10      # Host-ToR: 10 Mbps
+  leaf_spine: 5      # ToR-Agg: 5 Mbps (bottleneck)
+  spine_core: 10     # Agg-Core: 10 Mbps
+  host_access: 10
+  access_distribution: 5
+  distribution_core: 10
+
+int_collectors:
+  ratio: 4           # One collector per 4 leaf switches (2 collectors for k=4)
+  ip_base: "172.16"
+  port: 10
+
+qos_queues:
+  - id: 0
+    name: "voice"
+    dscp: "0x2E"      # EF (Expedited Forwarding)
+    sla_ms: 100
+  - id: 1
+    name: "video"
+    dscp: "0x18"      # AF21
+    sla_ms: 150
+  - id: 7
+    name: "best_effort"
+    dscp: "0x00"
+    sla_ms: 200

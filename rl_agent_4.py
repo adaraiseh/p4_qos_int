@@ -61,26 +61,47 @@ class FlushingStreamHandler(logging.StreamHandler):
         super().emit(record)
         self.flush()
 
-# Configure logging BEFORE importing modules that use logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[FlushingStreamHandler(sys.stdout)],
-    force=True,
-)
+# Define setup_logging function to be called by main
+def setup_logging(verbose: bool = False):
+    """Configure logging with immediate flushing and appropriate level."""
+    # Determine level
+    level = logging.DEBUG if verbose else logging.INFO
+    
+    # Configure root logger
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[FlushingStreamHandler(sys.stdout)],
+        force=True,
+    )
+    
+    # Set level for this module matches root
+    log = logging.getLogger(__name__)
+    log.setLevel(level)
+    
+    # Ensure traffic_generator logger matches
+    logging.getLogger('traffic_generator').setLevel(level)
+    
+    # If verbose, set controller logger to DEBUG restricted (or handle elsewhere)
+    # The Controller class handles its own verbosity, but we can set the logger level here too
+    
 log = logging.getLogger(__name__)
+# Default to INFO until setup_logging is called
 log.setLevel(logging.INFO)
 
 # Now import modules that use logging
 from controller import Controller
 from traffic_generator import TrafficManager
+from config.schema import MAX_SWITCHES
 
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 # Ensure traffic_generator logger uses the same level
-logging.getLogger('traffic_generator').setLevel(logging.INFO)
+# Ensure traffic_generator logger uses the same level
+# logging.getLogger('traffic_generator').setLevel(logging.INFO)
+
 
 # =============================================================================
 #                           HYPERPARAMETERS
@@ -577,9 +598,14 @@ class QoSRoutingEnv:
     }
     
     MAX_ALTS = 2
-    NUM_SWITCHES = 10  # Standard topology size (a1-4, c1-2, t1-4)
-    
-    def __init__(self, bucket: str, token: str, org: str, url: str, verbose: bool = False, reset_network: bool = True, production_mode: bool = False):
+    # Use MAX_SWITCHES from config for topology-agnostic fixed-size state
+    # This allows trained models to work on any topology up to this size
+    NUM_SWITCHES = MAX_SWITCHES
+
+    def __init__(self, bucket: str, token: str, org: str, url: str,
+                 verbose: bool = False, reset_network: bool = True,
+                 production_mode: bool = False, topology_builder=None,
+                 rules_dir: str = None):
         self.bucket = bucket
         self.org = org
         self.url = url
@@ -588,9 +614,17 @@ class QoSRoutingEnv:
         self.client = InfluxDBClient(url=url, token=token, org=org, timeout=5000)
         self.query_api = self.client.query_api()
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-        
+
+        # Store topology builder for reference
+        self._topology_builder = topology_builder
+
         # Controller for routing changes
-        self.controller = Controller(verbose=verbose)
+        # Pass topology_builder for dynamic role detection if available
+        self.controller = Controller(
+            verbose=verbose,
+            topology_builder=topology_builder,
+            rules_dir=rules_dir
+        )
         
         # Reset behavior: if True, perform full network reset on each episode
         # If False (production mode), preserve network state across resets
@@ -600,10 +634,10 @@ class QoSRoutingEnv:
         # Initialize switch mapping for One-Hot encoding
         # We need a stable mapping of switch IDs to indices 0..N-1
         self.all_switch_ids = self.controller.get_all_switch_ids()
-        # Ensure we have at least NUM_SWITCHES capacity (padding if necessary)
-        # For this topology, we expect ~10 switches. 
+        # The mapping supports up to MAX_SWITCHES for topology-agnostic operation
+        # Actual switch count may be less; unused slots are ignored
         self.sid_to_idx = {sid: i for i, sid in enumerate(self.all_switch_ids)}
-        log.info(f"Initialized switch mapping: {self.sid_to_idx}")
+        log.info(f"Initialized switch mapping ({len(self.all_switch_ids)}/{self.NUM_SWITCHES} max): {self.sid_to_idx}")
         
         # Global step counter (persists across episodes)
         self.global_step = 0
@@ -876,9 +910,10 @@ class QoSRoutingEnv:
             
             # --- Step A: Path Metrics (Queue-Specific) ---
             # Query metrics filtered by this queue_id for accurate bottleneck detection
-            sw_names = [n for n in path if isinstance(n, str) and n[0] in ('t', 'a', 'c')]
-            sw_ids = [self.controller.switch_name_to_id.get(n) for n in sw_names]
-            sw_ids = [int(s) for s in sw_ids if s is not None]
+            # Filter to switches only (exclude hosts) - check against known switch names
+            sw_names = [n for n in path if n in self.controller.switch_name_to_id]
+            sw_ids = [self.controller.switch_name_to_id[n] for n in sw_names]
+            sw_ids = [int(s) for s in sw_ids]
             
             if not sw_ids:
                 continue
@@ -886,12 +921,11 @@ class QoSRoutingEnv:
             # Query path switches with queue_id filter for accurate per-queue bottleneck
             path_metrics = self._query_switch_metrics_for_queue(sw_ids, qid)
             
-            # Identify Bottleneck (SKIP ToR switches - they have no alternatives)
+            # Identify Bottleneck (SKIP edge switches - they have no alternatives)
             best_sid, best_score = None, -1.0
             for sid in sw_ids:
-                # Skip ToR switches - they're at edge and have no alt paths
-                role = self.controller._role_of_sid(sid)
-                if role == 'tor':
+                # Skip edge switches (leaf/tor/access) - they're at edge and have no alt paths
+                if self.controller._is_edge_switch(sid):
                     continue
                 
                 r = path_metrics.get(sid, {'drop': 0, 'lat': 0})
@@ -909,7 +943,7 @@ class QoSRoutingEnv:
                 snapshot[qid]['bottleneck_drop'] = bm['drop']
                 snapshot[qid]['bottleneck_lat'] = bm['lat']
                 snapshot[qid]['bottleneck_util'] = bm['util']
-                snapshot[qid]['bottleneck_role'] = self.controller._role_of_sid(best_sid)
+                snapshot[qid]['bottleneck_role'] = self.controller._normalize_role(self.controller._role_of_sid(best_sid))
                 
                 # --- Step B: Alternatives (Queue-Specific) ---
                 # Get alternatives for this bottleneck and query their queue-specific metrics
@@ -928,17 +962,46 @@ class QoSRoutingEnv:
                 # Query alternative metrics for THIS queue specifically
                 if alt_sids:
                     alt_metrics = self._query_switch_metrics_for_queue(alt_sids, qid)
-                    
-                    # Build alternatives list with queue-specific metrics
-                    final_alts = []
+
+                    # Calculate bottleneck score for relative comparison
+                    bn_drop_norm = min(bm['drop'], DROP_CAP) / DROP_CAP
+                    bn_lat_norm = min(bm['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
+                    bn_score = 0.6 * bn_drop_norm + 0.4 * bn_lat_norm
+
+                    # Score each alternative RELATIVE to bottleneck (higher = better improvement)
+                    # Alternatives with NO metrics get max score (best, prioritized)
+                    scored_alts = []
                     for name, sid in valid_alts:
-                        m = alt_metrics.get(sid, {'drop': 0, 'lat': 0, 'util': 0})
+                        m = alt_metrics.get(sid)
+                        if m is None:
+                            # No traffic on this switch = best option (max improvement assumed)
+                            rel_score = bn_score  # Highest possible relative score
+                            scored_alts.append((rel_score, name, {'drop': 0, 'lat': 0, 'util': 0}))
+                        else:
+                            # Calculate alternative's absolute score
+                            alt_drop_norm = min(m['drop'], DROP_CAP) / DROP_CAP
+                            alt_lat_norm = min(m['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
+                            alt_score = 0.6 * alt_drop_norm + 0.4 * alt_lat_norm
+                            # Relative score = improvement over bottleneck (positive = better)
+                            rel_score = bn_score - alt_score
+                            scored_alts.append((rel_score, name, m))
+
+                    # Sort by relative score DESCENDING (higher = more improvement)
+                    # Shuffle first for random tie-breaking when scores are equal
+                    random.shuffle(scored_alts)
+                    scored_alts.sort(key=lambda x: x[0], reverse=True)
+
+                    # Take best MAX_ALTS (2) alternatives
+                    final_alts = []
+                    for rel_score, name, m in scored_alts[:self.MAX_ALTS]:
                         final_alts.append({
                             'name': name,
                             'drop': m['drop'],
                             'lat': m['lat'],
                             'util': m['util'],
                         })
+
+                    log.debug(f"[Snapshot] Q{qid} scored alts: {[(round(s[0], 3), s[1]) for s in scored_alts]}, selected: {[a['name'] for a in final_alts]}")
                     snapshot[qid]['alternatives'] = final_alts
                     snapshot[qid]['alt_exists'] = bool(final_alts)
                 else:
@@ -1273,18 +1336,17 @@ class QoSRoutingEnv:
                         mask[action] = True
                         any_valid_for_multi = True
             
-            # Multi-action is valid ONLY if at least one queue is VIOLATING SLA *and* has alternatives
-            # This aligns with the context validity check in step()
-            valid_for_multi = False
+            # Multi-action is valid ONLY if 2+ queues are VIOLATING SLA *and* have alternatives
+            # This ensures multi-action is reserved for situations where multiple queues need help
+            violating_with_alts = 0
             for qid in QIDS:
                 q = snapshot[qid]
                 # Check soft margin violation (consistent with step logic)
                 is_violating = (q['lat_p95'] / SLA_THRESHOLDS[qid]) > (1.0 + SLA_SOFT_MARGIN)
                 if is_violating and q.get('bottleneck_sid') is not None and len(q.get('alternatives', [])) > 0:
-                    valid_for_multi = True
-                    break
-            
-            if valid_for_multi:
+                    violating_with_alts += 1
+
+            if violating_with_alts >= 2:
                 mask[7] = True
         
         return mask
@@ -1809,10 +1871,29 @@ def train(args):
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log.info(f"Using device: {device}")
-    
+
+    # Load topology if config specified
+    topology_builder = None
+    rules_dir = args.rules_dir
+    if args.config:
+        from topology.factory import create_topology
+        log.info(f"Loading topology from: {args.config}")
+        topology_builder = create_topology(args.config)
+        if rules_dir is None:
+            # Auto-detect rules dir from topology name
+            topo_name = topology_builder.config.topology.name.replace('-', '_')
+            rules_dir = f"rules/{topo_name}"
+        log.info(f"Topology: {topology_builder.config.topology.name}")
+        log.info(f"  Switches: {len(topology_builder.switches)}/{MAX_SWITCHES} max")
+        log.info(f"  Rules dir: {rules_dir}")
+
     # Initialize environment and agent
-    env = QoSRoutingEnv(args.influx_bucket, args.influx_token, 
-                        args.influx_org, args.influx_url)
+    env = QoSRoutingEnv(
+        args.influx_bucket, args.influx_token,
+        args.influx_org, args.influx_url,
+        topology_builder=topology_builder,
+        rules_dir=rules_dir
+    )
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
     
     # Resume from checkpoint if specified
@@ -2035,13 +2116,31 @@ def evaluate(args):
     log.info("=" * 60)
     log.info("Starting RL Evaluation - DQN Agent v4")
     log.info("=" * 60)
-    
+
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
+    # Load topology if config specified
+    topology_builder = None
+    rules_dir = args.rules_dir
+    if args.config:
+        from topology.factory import create_topology
+        log.info(f"Loading topology from: {args.config}")
+        topology_builder = create_topology(args.config)
+        if rules_dir is None:
+            topo_name = topology_builder.config.topology.name.replace('-', '_')
+            rules_dir = f"rules/{topo_name}"
+        log.info(f"Topology: {topology_builder.config.topology.name}")
+        log.info(f"  Switches: {len(topology_builder.switches)}/{MAX_SWITCHES} max")
+
     # Initialize environment and agent
-    env = QoSRoutingEnv(args.influx_bucket, args.influx_token,
-                        args.influx_org, args.influx_url, verbose=args.verbose)
+    env = QoSRoutingEnv(
+        args.influx_bucket, args.influx_token,
+        args.influx_org, args.influx_url,
+        verbose=args.verbose,
+        topology_builder=topology_builder,
+        rules_dir=rules_dir
+    )
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
     
     # Load weights
@@ -2141,7 +2240,13 @@ def main():
                         help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
     parser.add_argument('--traffic-profile', type=str, default=None,
                         help='Use specific traffic profile for all episodes (overrides --traffic-weights)')
-    
+
+    # Topology configuration (optional - uses default if not specified)
+    parser.add_argument('--config', '-c', type=str, default=None,
+                        help='Path to YAML topology configuration file')
+    parser.add_argument('--rules-dir', type=str, default=None,
+                        help='Directory containing P4 rule files (auto-detected from config if not specified)')
+
     # InfluxDB
     parser.add_argument('--influx-url', default='http://192.168.201.1:8086')
     parser.add_argument('--influx-org', default='research')
@@ -2156,6 +2261,9 @@ def main():
                         help='Force baseline resets (no warm-start episodes)')
     
     args = parser.parse_args()
+    
+    # Setup logging based on verbose flag
+    setup_logging(args.verbose)
     
     try:
         if args.mode == 'train':

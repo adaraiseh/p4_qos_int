@@ -15,4 +15,5 @@ training_files/
 data/
 sync_results*
 topology.json
+.active_topology
 int_md.json

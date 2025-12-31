@@ -1,0 +1,60 @@
+# Leaf-Spine 4x2 Topology Configuration
+# Simple two-tier topology for smaller deployments
+#
+# Structure:
+#   - 4 Leaf switches
+#   - 2 Spine switches
+#   - 2 hosts per leaf = 8 total hosts
+#   - Full mesh between leaves and spines
+#   - Total: 6 switches (well within MAX_SWITCHES=20 limit)
+
+version: "1.0"
+
+topology:
+  type: "leaf-spine"
+  name: "leaf-spine-4x2"
+
+leaf_spine:
+  num_leaves: 4
+  num_spines: 2
+  hosts_per_leaf: 2
+
+switch_naming:
+  leaf_prefix: "leaf"      # leaf1, leaf2, leaf3, leaf4
+  spine_prefix: "spine"    # spine1, spine2
+  core_prefix: "core"      # Not used in leaf-spine
+  host_prefix: "h"
+  collector_prefix: "h"
+  collector_id_base: 100
+
+switch_defaults:
+  p4_source: "p4src/int_md.p4"
+  priority_queues: 8
+  thrift_port_base: 9200
+
+link_bandwidths:
+  host_leaf: 10       # Host-Leaf: 10 Mbps
+  leaf_spine: 5       # Leaf-Spine: 5 Mbps (bottleneck)
+  spine_core: 10      # Not used
+  host_access: 10
+  access_distribution: 5
+  distribution_core: 10
+
+int_collectors:
+  ratio: 4            # One collector per 4 leaves (1 collector total)
+  ip_base: "172.16"
+  port: 10
+
+qos_queues:
+  - id: 0
+    name: "voice"
+    dscp: "0x2E"
+    sla_ms: 100
+  - id: 1
+    name: "video"
+    dscp: "0x18"
+    sla_ms: 150
+  - id: 7
+    name: "best_effort"
+    dscp: "0x00"
+    sla_ms: 200

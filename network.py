@@ -1,27 +1,40 @@
-import argparse 
-from p4utils.mininetlib.network_API import NetworkAPI
-from controller import *
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Optional
 
-default_rule = 'rules/test/'
+from p4utils.mininetlib.network_API import NetworkAPI
+
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from topology.factory import create_topology
+from topology.base import TopologyBuilder
+from config.validator import validate_config
+from config.schema import TopologyConfig
+
 
 # ----------------------------
 # Helpers for traffic creation
 # ----------------------------
 
-# Fixed mapping you asked for: qid -> ToS(DSCP)
+# Fixed mapping: qid -> ToS(DSCP)
 QID_TOS = {
-    0: 184,   # voice
-    1: 96,    # video
+    0: 184,   # voice (DSCP EF = 46 << 2)
+    1: 96,    # video (DSCP AF41 = 24 << 2)
     7: 0,     # best effort
 }
 
 ALL_QUEUES = [0, 1, 7]
+
 
 def _ensure_dict_per_queue(val, queues):
     """Allow single scalar or per-queue dict; return dict{qid: val}."""
     if isinstance(val, dict):
         return {qid: val.get(qid, list(val.values())[0]) for qid in queues}
     return {qid: val for qid in queues}
+
 
 def _traffic_dst_port(flow_id: int, qid: int, base: int = 6000) -> int:
     """
@@ -36,12 +49,10 @@ def _traffic_dst_port(flow_id: int, qid: int, base: int = 6000) -> int:
         raise ValueError("queue_id must be 0..9")
     return base + flow_id * 10 + qid
 
+
 def _probe_dst_port(flow_id: int, qid: int, base: int = 5000) -> int:
     """
-    Build dst port so that:
-      flow_id = (port // 10) % 100
-      expected_queue_id = port % 10
-    Using scheme: base + flow_id*10 + qid
+    Build dst port for probe packets.
     """
     if not (0 <= flow_id <= 99):
         raise ValueError("flow_id must be 0..99")
@@ -49,17 +60,6 @@ def _probe_dst_port(flow_id: int, qid: int, base: int = 5000) -> int:
         raise ValueError("queue_id must be 0..9")
     return base + flow_id * 10 + qid
 
-def _host_to_ip(hostname: str, hosts_ips: list[str]) -> str:
-    """
-    Map 'hN' -> hosts_ips[N]. Keeps your existing static map to avoid
-    reliance on getHostIp(), which you mentioned is not correct.
-    """
-    if not hostname.startswith('h'):
-        raise ValueError("Hostnames must look like 'h1', 'h2', ...")
-    idx = int(hostname[1:])
-    if idx < 1 or idx >= len(hosts_ips):
-        raise IndexError(f"No IP for {hostname} in hosts_ips")
-    return hosts_ips[idx]
 
 def generate_traffic(
     net: NetworkAPI,
@@ -69,6 +69,7 @@ def generate_traffic(
     queue_id: int | str = "all",
     per_queue_bw: float | int | dict = 2.0,
     per_queue_len: int | dict = 0,
+    hosts_ips: dict = None,
 ):
     """
     Schedule receiver(s) on dst and sender(s) on src according to:
@@ -77,72 +78,39 @@ def generate_traffic(
       - queue_id: int (0..9) or 'all' (== [0,1,7] per your mapping)
       - per_queue_bw: Mbps as float/int or dict{qid: Mbps}
       - per_queue_len: iperf3 -t duration seconds as int or dict{qid: seconds} (0 = continuous)
-    Creates both:
-      - iperf3 UDP streams (with --tos corresponding to queue)
-      - your send.py UDP control messages (matching port & ToS)
+      - hosts_ips: dict mapping host name to IP address
     """
+    if hosts_ips is None:
+        raise ValueError("hosts_ips must be provided")
 
     # exactly the three queues you requested when "all"
     queues = ALL_QUEUES if queue_id == "all" else [int(queue_id)]
 
     # Per-queue params normalized to dicts
-    bw_map = _ensure_dict_per_queue(per_queue_bw, queues)       # Mbps
-    len_map = _ensure_dict_per_queue(per_queue_len, queues)     # seconds
+    bw_map = _ensure_dict_per_queue(per_queue_bw, queues)
+    len_map = _ensure_dict_per_queue(per_queue_len, queues)
 
-    # Your static IP map used elsewhere in this file
-    hosts_ips = [
-        "0",                 # dummy index 0
-        "10.7.1.2",          # h1
-        "10.7.2.2",          # h2
-        "10.8.3.2",          # h3
-        "10.8.4.2",          # h4
-        "10.9.5.2",          # h5
-        "10.9.6.2",          # h6
-        "10.10.7.2",         # h7
-        "10.10.8.2",         # h8
-        "10.11.9.2",         # h9
-        "10.11.10.2",        # h10
-        "10.12.11.2",        # h11
-        "10.12.12.2",        # h12
-        "10.13.13.2",        # h13
-        "10.13.14.2",        # h14
-        "10.14.15.2",        # h15
-        "10.14.16.2"         # h16
-    ]
-
-    dst_ip = _host_to_ip(dst_host, hosts_ips)
+    dst_ip = hosts_ips.get(dst_host)
+    if not dst_ip:
+        raise ValueError(f"No IP found for host {dst_host}")
 
     # Start iperf3 servers for each selected queue/port
     for qid in queues:
-        probe_port = _probe_dst_port(flow_id, qid)
         traffic_port = _traffic_dst_port(flow_id, qid)
-        #net.addTask(dst_host, f"python3 receive.py --proto all --ports {probe_port}", 1, 0, True)
-        # net.addTask(
-        #     dst_host,
-        #     f"""python3 receive.py --proto all --ports {probe_port} >>/tmp/{dst_host}_recv_{probe_port}.log""",
-        #     1, 0, True
-        # )
-        # iperf3 server: keep it running forever, restart if it dies
-        # net.addTask(
-        #     dst_host,
-        #     f"""iperf3 -s -p {traffic_port} -i 1 --logfile /tmp/{dst_host}_iperf3_s_{traffic_port}.log""",
-        #     1, 0, True
-        # )
         net.addTask(
-        dst_host,
-        (
-            f"bash -lc '"
-            f"while true; do "
-            f"  iperf3 -s -p {traffic_port} -i 1 "
-            f"    --logfile /tmp/{dst_host}_iperf3_s_{traffic_port}.log ; "
-            f"  echo \"[RESTART][$(date +%F_%T)] iperf3 server {traffic_port} exited ($?)\" "
-            f"    >> /tmp/{dst_host}_iperf3_s_{traffic_port}.log ; "
-            f"  sleep 1 ; "
-            f"done'"
-        ),
-        1, 0, True
-    )
-
+            dst_host,
+            (
+                f"bash -lc '"
+                f"while true; do "
+                f"  iperf3 -s -p {traffic_port} -i 1 "
+                f"    --logfile /tmp/{dst_host}_iperf3_s_{traffic_port}.log ; "
+                f"  echo \"[RESTART][$(date +%F_%T)] iperf3 server {traffic_port} exited ($?)\" "
+                f"    >> /tmp/{dst_host}_iperf3_s_{traffic_port}.log ; "
+                f"  sleep 1 ; "
+                f"done'"
+            ),
+            1, 0, True
+        )
 
     # Send traffic from src -> dst for each selected queue
     for qid in queues:
@@ -150,25 +118,10 @@ def generate_traffic(
         if tos is None:
             raise ValueError(f"No ToS mapping defined for queue {qid}")
 
-        probe_port = _probe_dst_port(flow_id, qid)
         traffic_port = _traffic_dst_port(flow_id, qid)
         bw_mbps = bw_map[qid]
         length = len_map[qid]
 
-        # Your lightweight sender (control/marker packets), matches ToS and port
-        # net.addTask(
-        #     src_host,
-        #     f'python3 send.py --ip {dst_ip} --l4 udp --port {probe_port} --tos {tos} --m "flow {flow_id}, q{qid}, ToS {tos}" --c 0',
-        #     1.5, 0, True
-        # )
-        
-        # iperf3 client: run forever, auto-restart on any exit, keep logs
-        # net.addTask(
-        #     src_host,
-        #     f"""iperf3 -c {dst_ip} -p {traffic_port} -u -b {bw_mbps}M -l {length} --tos {tos} \
-        #         -i 1 -t 3600 --connect-timeout 5000 --logfile /tmp/{src_host}_iperf3_c_{traffic_port}.log""",
-        #     2.0, 0, True
-        # )
         net.addTask(
             src_host,
             (
@@ -187,163 +140,293 @@ def generate_traffic(
         )
 
 
-def config_network(p4):
-    net = NetworkAPI()
+class NetworkBuilder:
+    """
+    Builds a Mininet network from a TopologyBuilder.
 
-    # Network general options
-    net.setLogLevel('info')
-    net.disableCli()
+    Translates topology data into p4utils NetworkAPI calls.
+    """
 
-    # Network definition
-    host_nodes = 8
-    tor_nodes = 4
-    agg_nodes = 4
-    core_nodes = 2
+    def __init__(self, builder: TopologyBuilder, rules_dir: str = None):
+        """
+        Initialize the network builder.
 
-    host_tor_bw = 10
-    tor_agg_bw = 5
-    agg_core_bw = 10
+        Args:
+            builder: Built TopologyBuilder instance
+            rules_dir: Directory containing P4 rule files (default: rules/<topology_name>)
+        """
+        self.builder = builder
+        self.config = builder.config
 
-    # Hosts
-    hosts = []
-    for i in range(1, host_nodes + 1):
-        host = net.addHost(f'h{i}')
-        hosts.append(host)
+        if rules_dir is None:
+            topo_name = self.config.topology.name.replace('-', '_')
+            rules_dir = str(Path(__file__).parent / 'rules' / topo_name)
+        self.rules_dir = rules_dir
 
-    current_thrift_port = 9200
+        self.net: Optional[NetworkAPI] = None
+        self._switch_refs = {}  # name -> p4utils switch reference
+        self._host_refs = {}    # name -> p4utils host reference
 
-    # ToR (Edge) switches
-    tor_switches = []
-    for i in range(1, tor_nodes + 1):
-        tor_switch = net.addP4Switch(f't{i}', priority_queues_num=8,
-                                     max_link_bw=host_tor_bw,
-                                     thrift_port=current_thrift_port,
-                                     cli_input=default_rule + f't{i}-commands.txt')
-        tor_switches.append(tor_switch)
-        current_thrift_port += 1
+    def build(self) -> NetworkAPI:
+        """
+        Build the Mininet network.
 
-    # Aggregate switches
-    agg_switches = []
-    for i in range(1, agg_nodes + 1):
-        agg_switch = net.addP4Switch(f'a{i}', priority_queues_num=8,
-                                     max_link_bw=tor_agg_bw,
-                                     thrift_port=current_thrift_port,
-                                     cli_input=default_rule + f'a{i}-commands.txt')
-        agg_switches.append(agg_switch)
-        current_thrift_port += 1
+        Returns:
+            Configured NetworkAPI instance
+        """
+        self.net = NetworkAPI()
 
-    # Core switches
-    core_switches = []
-    for i in range(1, core_nodes + 1):
-        core_switch = net.addP4Switch(f'c{i}', priority_queues_num=8,
-                                      max_link_bw=agg_core_bw,
-                                      thrift_port=current_thrift_port,
-                                      cli_input=default_rule + f'c{i}-commands.txt')
-        core_switches.append(core_switch)
-        current_thrift_port += 1
+        # Network general options
+        self.net.setLogLevel('info')
+        self.net.disableCli()
 
-    net.setP4SourceAll(p4)
+        # 1. Create switches
+        self._create_switches()
 
-    # Connect hosts to ToR switches
-    for i in range(tor_nodes):
-        for j in range(2):  # Each ToR switch connects to 2 hosts
-            net.addLink(hosts[i * 2 + j], tor_switches[i], bw=host_tor_bw)
+        # 2. Set P4 source for all switches
+        self.net.setP4SourceAll(self.config.switch_defaults.p4_source)
 
-    # Connect ToR switches to Aggregate switches
-    for i in range(4):  # Each Pod has 2 ToR switches and 2 Agg switches
-        for tor in tor_switches[i * 2: i * 2 + 2]:
-            for agg in agg_switches[i * 2: i * 2 + 2]:
-                net.addLink(tor, agg, bw=tor_agg_bw)
+        # 3. Create hosts
+        self._create_hosts()
 
-    # Connect Aggregate switches to Core switches
-    for i in range(4):  # Each Aggregate switch connects to all Core switches
-        for agg in agg_switches[i * 2: i * 2 + 2]:
-            for core in core_switches:
-                net.addLink(agg, core, bw=agg_core_bw)
+        # 4. Create links
+        self._create_links()
 
-    # Assignment strategy
-    net.l3()
+        # 5. Set L3 addressing
+        self.net.l3()
 
-    # INT reports receiver hosts
-    host100 = net.addHost('h100')
-    host101 = net.addHost('h101')
-    net.addLink(host100, tor_switches[0], port1=10, port2=10)
-    net.setIntfIp(host100, tor_switches[0], "172.16.10.101/24")
-    net.setIntfIp(tor_switches[0], host100, "172.16.10.100/24")
-    net.setIntfMac(host100, tor_switches[0], "10:10:10:10:10:11")
-    net.setIntfMac(tor_switches[0], host100, "10:10:10:10:10:10")
+        # 6. Set up INT collectors
+        self._setup_collectors()
 
-    net.addLink(host100, tor_switches[1], port1=11, port2=10)
-    net.setIntfIp(host100, tor_switches[1], "172.16.11.101/24")
-    net.setIntfIp(tor_switches[1], host100, "172.16.11.100/24")
-    net.setIntfMac(host100, tor_switches[1], "10:10:10:10:11:11")
-    net.setIntfMac(tor_switches[1], host100, "10:10:10:10:11:10")
+        # 7. Enable schedulers on traffic hosts
+        self._enable_host_schedulers()
 
-    net.addLink(host101, tor_switches[2], port1=10, port2=10)
-    net.setIntfIp(host101, tor_switches[2], "172.16.12.101/24")
-    net.setIntfIp(tor_switches[2], host101, "172.16.12.100/24")
-    net.setIntfMac(host101, tor_switches[2], "10:10:10:10:12:11")
-    net.setIntfMac(tor_switches[2], host101, "10:10:10:10:12:10")
+        return self.net
 
-    net.addLink(host101, tor_switches[3], port1=11, port2=10)
-    net.setIntfIp(host101, tor_switches[3], "172.16.13.101/24")
-    net.setIntfIp(tor_switches[3], host101, "172.16.13.100/24")
-    net.setIntfMac(host101, tor_switches[3], "10:10:10:10:13:11")
-    net.setIntfMac(tor_switches[3], host101, "10:10:10:10:13:10")
+    def _create_switches(self) -> None:
+        """Create all P4 switches from topology."""
+        for switch_name, sw_info in self.builder.switches.items():
+            # Determine max bandwidth for this switch
+            max_bw = self._get_switch_max_bw(sw_info.role)
 
-    # -----------------
-    # Enable task schedulers on traffic hosts (h1-h8)
-    # Traffic generation is now managed dynamically by traffic_generator.py
-    # This allows per-episode randomization during RL training
-    # -----------------
-    for host in hosts:
-        net.enableScheduler(host)
+            cli_input = os.path.join(self.rules_dir, f"{switch_name}-commands.txt")
 
-    # Nodes general options
-    #net.enableCpuPortAll()
-    #net.enablePcapDumpAll()
-    #net.enableLogAll()
+            switch_ref = self.net.addP4Switch(
+                switch_name,
+                priority_queues_num=self.config.switch_defaults.priority_queues,
+                max_link_bw=max_bw,
+                thrift_port=sw_info.thrift_port,
+                cli_input=cli_input
+            )
+            self._switch_refs[switch_name] = switch_ref
 
-    return net
+    def _get_switch_max_bw(self, role: str) -> int:
+        """Get max bandwidth for a switch based on its role."""
+        bw = self.config.link_bandwidths
+
+        if role in ('leaf', 'access', 'tor'):
+            return max(bw.host_leaf, bw.host_access, bw.leaf_spine, bw.access_distribution)
+        elif role in ('spine', 'distribution', 'agg'):
+            return max(bw.leaf_spine, bw.access_distribution, bw.spine_core, bw.distribution_core)
+        elif role == 'core':
+            return max(bw.spine_core, bw.distribution_core)
+        return 10  # default
+
+    def _create_hosts(self) -> None:
+        """Create all hosts from topology."""
+        for host_name, host_info in self.builder.hosts.items():
+            host_ref = self.net.addHost(host_name)
+            self._host_refs[host_name] = host_ref
+
+    def _create_links(self) -> None:
+        """Create all links from topology."""
+        for link in self.builder.links:
+            node1 = link.node1
+            node2 = link.node2
+
+            # Get node references
+            ref1 = self._host_refs.get(node1) or self._switch_refs.get(node1)
+            ref2 = self._host_refs.get(node2) or self._switch_refs.get(node2)
+
+            if ref1 is None or ref2 is None:
+                print(f"Warning: Skipping link {node1} <-> {node2}: node not found")
+                continue
+
+            # Build kwargs for addLink
+            kwargs = {'bw': link.bw}
+            if link.port1 is not None:
+                kwargs['port1'] = link.port1
+            if link.port2 is not None:
+                kwargs['port2'] = link.port2
+
+            self.net.addLink(ref1, ref2, **kwargs)
+
+    def _setup_collectors(self) -> None:
+        """Set up INT collector hosts and interfaces."""
+        for collector_name, collector_info in self.builder.collectors.items():
+            # Create collector host
+            collector_ref = self.net.addHost(collector_name)
+            self._host_refs[collector_name] = collector_ref
+
+            # Track port numbers for multi-interface collectors
+            collector_port_num = 10
+
+            for sw_name in collector_info.connected_switches:
+                sw_ref = self._switch_refs.get(sw_name)
+                if sw_ref is None:
+                    continue
+
+                iface = collector_info.interfaces.get(sw_name, {})
+                collector_ip = iface.get('collector_ip', '0.0.0.0')
+                switch_ip = iface.get('switch_ip', '0.0.0.0')
+                collector_mac = iface.get('collector_mac', '00:00:00:00:00:00')
+                switch_mac = iface.get('switch_mac', '00:00:00:00:00:00')
+                port = iface.get('port', 10)
+
+                # Add link: collector port N <-> switch port 10 (collector port)
+                self.net.addLink(
+                    collector_ref, sw_ref,
+                    port1=collector_port_num, port2=port
+                )
+
+                # Set IP and MAC addresses
+                self.net.setIntfIp(collector_ref, sw_ref, f"{collector_ip}/24")
+                self.net.setIntfIp(sw_ref, collector_ref, f"{switch_ip}/24")
+                self.net.setIntfMac(collector_ref, sw_ref, collector_mac)
+                self.net.setIntfMac(sw_ref, collector_ref, switch_mac)
+
+                collector_port_num += 1
+
+    def _enable_host_schedulers(self) -> None:
+        """Enable task schedulers on traffic-generating hosts."""
+        traffic_hosts = self.builder.get_traffic_hosts()
+        for host_name in traffic_hosts:
+            host_ref = self._host_refs.get(host_name)
+            if host_ref:
+                self.net.enableScheduler(host_ref)
+
+    def get_hosts_ips(self) -> dict:
+        """Get host name to IP mapping for traffic generation."""
+        return self.builder.get_host_ips()
+
+
+def config_network(config_path: str, rules_dir: str = None) -> tuple[NetworkAPI, TopologyBuilder]:
+    """
+    Configure the network from a YAML configuration file.
+
+    Args:
+        config_path: Path to YAML topology configuration
+        rules_dir: Optional override for rules directory
+
+    Returns:
+        Tuple of (NetworkAPI instance, TopologyBuilder instance)
+    """
+    # Validate configuration
+    print(f"[INFO] Validating configuration: {config_path}")
+    result = validate_config(config_path)
+
+    if result.warnings:
+        for warning in result.warnings:
+            print(f"[WARNING] {warning}")
+
+    if not result.is_valid:
+        print("[ERROR] Configuration validation failed:")
+        for error in result.errors:
+            print(f"  - {error}")
+        raise ValueError("Invalid configuration")
+
+    print(f"[INFO] Configuration valid: {result.config.topology.name}")
+
+    # Build topology
+    builder = create_topology(config_path, validate=False)
+
+    # Build network
+    net_builder = NetworkBuilder(builder, rules_dir)
+    net = net_builder.build()
+
+    return net, builder
 
 
 def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--p4', help='p4 src file.',
-                        type=str, required=False, default='p4src/int_md.p4')
-                        
+    parser = argparse.ArgumentParser(
+        description="Start P4 network with configurable topology"
+    )
+    parser.add_argument(
+        '--config', '-c',
+        help='Path to YAML topology configuration file',
+        type=str,
+        required=False,
+        default='config/topologies/fat_tree_k4.yaml'
+    )
+    parser.add_argument(
+        '--rules', '-r',
+        help='Directory containing P4 rule files (default: auto from config)',
+        type=str,
+        required=False,
+        default=None
+    )
+    parser.add_argument(
+        '--p4',
+        help='Override P4 source file (default: from config)',
+        type=str,
+        required=False,
+        default=None
+    )
+
     return parser.parse_args()
 
 
 def main():
     args = get_args()
-    net = config_network(args.p4)
+
+    # Build network from configuration
+    net, builder = config_network(args.config, args.rules)
+
+    # Override P4 source if specified
+    if args.p4:
+        net.setP4SourceAll(args.p4)
+
+    # Start network
     net.startNetwork()
-    # start the P4 controller
-    controller = Controller()
+
+    # Determine rules directory
+    if args.rules:
+        rules_dir = args.rules
+    else:
+        topo_name = builder.config.topology.name.replace('-', '_')
+        rules_dir = str(Path(__file__).parent / 'rules' / topo_name)
+
+    # Start the P4 controller with topology info
+    from controller import Controller
+    controller = Controller(topology_builder=builder, rules_dir=rules_dir)
+
     print("\n\nSUMMARY:")
+    print(f"Topology: {builder.config.topology.name} ({builder.config.topology.type.value})")
+    print(f"Switches: {len(builder.switches)}")
+    print(f"Hosts: {len(builder.hosts)}")
+    print(f"INT Collectors: {len(builder.collectors)}")
     print("\nOSPF Shortest Paths:")
     controller.print_paths()
 
     # Auto-launch visualization
     import subprocess
-    import os
-    
+
     viz_script = os.path.join(os.getcwd(), "visualize_routes.py")
     if os.path.exists(viz_script):
         print(f"\n[INFO] Auto-launching visualization: {viz_script}")
-        
-        cmd = ["python3", viz_script]
-        
-        # If running as root (sudo), try to launch as the original user to avoid GUI permission issues
+
+        cmd = ["python3", viz_script, "--config", args.config]
+
+        # If running as root (sudo), try to launch as the original user
         sudo_user = os.environ.get('SUDO_USER')
         if sudo_user:
-            cmd = ["sudo", "-u", sudo_user, "python3", viz_script]
-            
+            cmd = ["sudo", "-u", sudo_user] + cmd
+
         subprocess.Popen(cmd, start_new_session=True)
 
     net.enableCli()
     net.start_net_cli()
+
 
 if __name__ == '__main__':
     main()
