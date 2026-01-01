@@ -16,4 +16,5 @@ data/
 sync_results*
 topology.json
 .active_topology
-int_md.json
+int_md.json*
+*.p4info.txt

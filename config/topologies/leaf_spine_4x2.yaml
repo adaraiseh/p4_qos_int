@@ -58,3 +58,24 @@ qos_queues:
     name: "best_effort"
     dscp: "0x00"
     sla_ms: 200
+
+# Traffic pairs: cross-leaf communication
+# Hosts: leaf1(h1,h2), leaf2(h3,h4), leaf3(h5,h6), leaf4(h7,h8)
+traffic:
+  pairs:
+    # Leaf1 senders -> other leaves
+    - {src: h1, dst: h4}
+    - {src: h1, dst: h6}
+    - {src: h1, dst: h8}
+    # Leaf2 senders -> other leaves
+    - {src: h3, dst: h2}
+    - {src: h3, dst: h6}
+    - {src: h3, dst: h8}
+    # Leaf3 senders -> other leaves
+    - {src: h5, dst: h2}
+    - {src: h5, dst: h4}
+    - {src: h5, dst: h8}
+    # Leaf4 senders -> other leaves
+    - {src: h7, dst: h2}
+    - {src: h7, dst: h4}
+    - {src: h7, dst: h6}

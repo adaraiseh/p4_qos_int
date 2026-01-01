@@ -27,6 +27,7 @@ import signal
 import logging
 import argparse
 import csv
+import glob
 from datetime import datetime
 from collections import deque
 from typing import Dict, Optional
@@ -360,11 +361,24 @@ class ProductionRunner:
             args.influx_url, args.influx_token
         )
         
-        # Load weights
-        weights_path = os.path.join(args.save_dir, f"dqn_v4_{args.weights_tag}.pth")
-        if not os.path.exists(weights_path):
-            log.error(f"Weights file not found: {weights_path}")
-            return
+        # Load weights - find latest checkpoint with datetime prefix
+        # Pattern: YYYYMMDD-HHMMSS-dqn_v4_{tag}.pth or legacy dqn_v4_{tag}.pth
+        pattern = os.path.join(args.save_dir, f"*-dqn_v4_{args.weights_tag}.pth")
+        matching_files = sorted(glob.glob(pattern), reverse=True)
+
+        if matching_files:
+            # Use the latest (most recent) checkpoint
+            weights_path = matching_files[0]
+            log.info(f"Using latest checkpoint: {os.path.basename(weights_path)}")
+        else:
+            # Fallback to legacy naming without timestamp
+            weights_path = os.path.join(args.save_dir, f"dqn_v4_{args.weights_tag}.pth")
+            if not os.path.exists(weights_path):
+                log.error(f"Weights file not found: {weights_path}")
+                log.error(f"Pattern searched: {pattern}")
+                return
+            log.info(f"Using legacy checkpoint: {os.path.basename(weights_path)}")
+
         agent.load(weights_path)
         
         # Traffic generation (optional) - fixed profile for entire run

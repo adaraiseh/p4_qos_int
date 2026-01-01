@@ -57,3 +57,9 @@ qos_queues:
     name: "best_effort"
     dscp: "0x00"
     sla_ms: 200
+
+# Traffic pairs: minimal cross-pod (only 2 hosts total)
+traffic:
+  pairs:
+    - {src: h1, dst: h2}
+    - {src: h2, dst: h1}

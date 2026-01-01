@@ -40,6 +40,15 @@ control MyIngress(inout headers hdr,
                 local_metadata.perserv_meta.ingress_port = standard_metadata.ingress_port;
                 local_metadata.perserv_meta.egress_port = standard_metadata.egress_port;
                 local_metadata.perserv_meta.deq_qdepth = standard_metadata.deq_qdepth;
+                // Derive qid from original DSCP (stored in INT shim) since standard_metadata.qid
+                // is not valid in ingress - it's only set by traffic manager between ingress/egress
+                if (hdr.intl4_shim.udp_ip_dscp == 0x2E) {        // EF → Voice (Queue 0)
+                    local_metadata.perserv_meta.qid = 0;
+                } else if (hdr.intl4_shim.udp_ip_dscp == 0x18) { // CS3 → Video (Queue 1)
+                    local_metadata.perserv_meta.qid = 1;
+                } else {                                          // Default → Best Effort (Queue 7)
+                    local_metadata.perserv_meta.qid = 7;
+                }
                 local_metadata.perserv_meta.ingress_global_timestamp = standard_metadata.ingress_global_timestamp;
                 clone_preserving_field_list(CloneType.I2E, REPORT_MIRROR_SESSION_ID, CLONE_FL_1);
             }
@@ -62,6 +71,7 @@ control MyEgress(inout headers hdr,
                 standard_metadata.ingress_port = local_metadata.perserv_meta.ingress_port;
                 standard_metadata.egress_port = local_metadata.perserv_meta.egress_port;
                 standard_metadata.deq_qdepth = local_metadata.perserv_meta.deq_qdepth;
+                standard_metadata.qid = local_metadata.perserv_meta.qid;  // Restore queue ID for INT
                 standard_metadata.ingress_global_timestamp = local_metadata.perserv_meta.ingress_global_timestamp;
             }
 

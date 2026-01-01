@@ -58,3 +58,39 @@ qos_queues:
     name: "best_effort"
     dscp: "0x00"
     sla_ms: 200
+
+# Traffic pairs: cross-leaf communication (16 hosts across 8 leaves)
+traffic:
+  pairs:
+    # Leaf1(h1,h2) senders
+    - {src: h1, dst: h4}
+    - {src: h1, dst: h8}
+    - {src: h1, dst: h12}
+    # Leaf2(h3,h4) senders
+    - {src: h3, dst: h2}
+    - {src: h3, dst: h8}
+    - {src: h3, dst: h14}
+    # Leaf3(h5,h6) senders
+    - {src: h5, dst: h2}
+    - {src: h5, dst: h10}
+    - {src: h5, dst: h16}
+    # Leaf4(h7,h8) senders
+    - {src: h7, dst: h4}
+    - {src: h7, dst: h12}
+    - {src: h7, dst: h14}
+    # Leaf5(h9,h10) senders
+    - {src: h9, dst: h2}
+    - {src: h9, dst: h6}
+    - {src: h9, dst: h16}
+    # Leaf6(h11,h12) senders
+    - {src: h11, dst: h4}
+    - {src: h11, dst: h8}
+    - {src: h11, dst: h14}
+    # Leaf7(h13,h14) senders
+    - {src: h13, dst: h6}
+    - {src: h13, dst: h10}
+    - {src: h13, dst: h16}
+    # Leaf8(h15,h16) senders
+    - {src: h15, dst: h2}
+    - {src: h15, dst: h6}
+    - {src: h15, dst: h12}

@@ -175,6 +175,8 @@ struct preserving_metadata_t {
     @field_list(CLONE_FL_1)
     bit<19> deq_qdepth;
     @field_list(CLONE_FL_1)
+    bit<8> qid;  // Queue ID - needed for correct INT queue metrics at sink
+    @field_list(CLONE_FL_1)
     bit<64> ingress_global_timestamp;
     bit<64> egress_global_timestamp;
     bit<32> lf_field_list;

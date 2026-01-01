@@ -61,3 +61,9 @@ qos_queues:
     name: "best_effort"
     dscp: "0x00"
     sla_ms: 200
+
+# Traffic: use pattern-based generation for large topology
+# 128 hosts across 8 pods (16 hosts per pod)
+traffic:
+  pattern: "cross_pod"
+  pod_size: 4

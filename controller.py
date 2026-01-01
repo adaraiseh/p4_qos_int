@@ -528,14 +528,12 @@ class Controller:
         candidates = []
         all_sids = self.get_all_switch_ids()
         
-        # Create a graph view WITHOUT the bottleneck to verify independent reachability
-        # We must copy because we'll check connectivity
-        G_view = self.net_graph.copy()
-        if worst_name in G_view:
-            G_view.remove_node(worst_name)
-        else:
+        # Create a read-only graph view WITHOUT the bottleneck to verify independent reachability
+        # Using restricted_view() is O(1) vs O(V+E) for copy() - much faster for large topologies
+        if worst_name not in self.net_graph:
             # If bottleneck not in graph, something is wrong, but proceed safely
             return []
+        G_view = nx.restricted_view(self.net_graph, nodes=[worst_name], edges=[])
 
         # Optimization: Pre-check connectivity from src/dst in the restricted graph
         if not (G_view.has_node(src_node) and G_view.has_node(dst_node)):
@@ -890,7 +888,9 @@ class Controller:
                 return False, "bottleneck node not in graph"
                 
             # Bias towards existing path edges (Sticky Routing)
-            # Default weight is 1.0. Set existing path edges to 0.01
+            # NetworkX shortest_path with weight='weight' defaults missing attributes to 1.0
+            # We set original path edges to 0.01 to strongly prefer reusing them
+            # This minimizes path changes while still allowing new routes when necessary
             for i in range(len(path_fwd_orig) - 1):
                 u, v = path_fwd_orig[i], path_fwd_orig[i+1]
                 if G_temp.has_edge(u, v):
@@ -905,7 +905,11 @@ class Controller:
                 
                 # Merge (slice p2 to avoid duplicating alt node)
                 fwd_new_path = p1 + p2[1:]
-                
+
+                # Validate no loops in merged path (p1 and p2 could share intermediate nodes)
+                if len(fwd_new_path) != len(set(fwd_new_path)):
+                    return False, "merged path contains loop"
+
             except nx.NetworkXNoPath:
                 return False, f"no physical path found via {alt_switch_name} (sticky fallback failed)"
 

@@ -42,23 +42,26 @@ control process_int_source_sink (
     }
 }
 
-// Insert INT header to the packet (with hybrid count+time sampling)
+// Insert INT header to the packet (with per-flow, per-queue time-based sampling)
 control process_int_source (
     inout headers hdr,
     inout local_metadata_t local_metadata,
     inout standard_metadata_t standard_metadata) {
 
-    // Sampling configuration - time-based only
-    const bit<64> TIME_THRESHOLD_US = 200000;  // Time-based: 200ms = 200,000 microseconds
+    // Sampling configuration - 300ms per flow per queue
+    const bit<64> TIME_THRESHOLD_US = 200000;  // 200ms = 200,000 microseconds
 
-    // Per-queue last sample timestamp (in microseconds)
-    register<bit<64>>(8) int_last_sample_time;
+    // Per-flow, per-queue sampling register
+    // Index = flow_id * 8 + queue_idx
+    // flow_id range: 10-99 (90 flows max), queue_idx: 0-7
+    // Size: 100 * 8 = 800 entries (using 1024 for safety)
+    register<bit<64>>(1024) int_flow_queue_sample_time;
 
-    // Metadata to track sampling state 
-    bit<3> queue_idx;
+    // Metadata for sampling
+    bit<32> reg_index;
     bit<64> last_time;
     bit<64> elapsed;
-    
+
     // Store action parameters for use in apply block
     bit<5> stored_hop_metadata_len;
     bit<8> stored_remaining_hop_cnt;
@@ -73,11 +76,11 @@ control process_int_source (
         stored_ins_mask0003 = ins_mask0003;
         stored_ins_mask0407 = ins_mask0407;
     }
-    
+
     // Original action (kept for backwards compatibility - no sampling)
     action int_source(bit<5> hop_metadata_len, bit<8> remaining_hop_cnt, bit<4> ins_mask0003, bit<4> ins_mask0407) {
         // insert INT shim header
-        hdr.intl4_shim.setValid();                              
+        hdr.intl4_shim.setValid();
         hdr.intl4_shim.int_type = 1;                            // int_type: Hop-by-hop type (1) , destination type (2), MX-type (3)
         hdr.intl4_shim.npt = 0;                                 // next protocol type: 0
         hdr.intl4_shim.len = INT_HEADER_WORD;                   // This is 3 from 0xC (INT_TOTAL_HEADER_SIZE >> 2)
@@ -85,7 +88,7 @@ control process_int_source (
         hdr.intl4_shim.udp_ip_ecn = hdr.ipv4.ecn;               // Store original ECN bits
         hdr.ipv4.ecn = hdr.ipv4.ecn | INT_ECN_BIT;              // Set INT bit in DSCP field
         hdr.intl4_shim.rsvd2 = 0;
-        
+
         // insert INT header
         hdr.int_header.setValid();
         hdr.int_header.ver = 2;
@@ -123,7 +126,7 @@ control process_int_source (
         hdr.intl4_shim.udp_ip_ecn = hdr.ipv4.ecn;
         hdr.ipv4.ecn = hdr.ipv4.ecn | INT_ECN_BIT;
         hdr.intl4_shim.rsvd2 = 0;
-        
+
         // Insert INT header
         hdr.int_header.setValid();
         hdr.int_header.ver = 2;
@@ -140,7 +143,7 @@ control process_int_source (
         hdr.int_header.domain_specific_id = 0;
         hdr.int_header.ds_instruction = 0;
         hdr.int_header.ds_flags = 0;
-        
+
         // Update lengths
         hdr.ipv4.len = hdr.ipv4.len + INT_TOTAL_HEADER_SIZE;
 
@@ -170,41 +173,28 @@ control process_int_source (
         stored_remaining_hop_cnt = 0;
         stored_ins_mask0003 = 0;
         stored_ins_mask0407 = 0;
-        
+
         // Apply table - if int_source_sampled is called, it stores params
         // if int_source is called, it directly inserts INT headers (no sampling)
         if (tb_int_source.apply().hit) {
             // Check if we're using the sampled action (params were stored)
             if (stored_hop_metadata_len != 0) {
                 bit<64> now = standard_metadata.ingress_global_timestamp;
-                bit<64> last_time_q;
-                bit<64> elapsed_q;
-                
-                // Each queue has its own sampling with independent timing
-                if (hdr.ipv4.dscp == 0x2E) {           // EF (Voice) -> Queue 0
-                    queue_idx = 0;
-                    int_last_sample_time.read(last_time_q, 0);
-                    elapsed_q = now - last_time_q;
-                    if (last_time_q == 0 || elapsed_q >= TIME_THRESHOLD_US) {
-                        int_last_sample_time.write(0, now);
-                        do_insert_int();
-                    }
-                } else if (hdr.ipv4.dscp == 0x18) {    // CS3 (Video) -> Queue 1
-                    queue_idx = 1;
-                    int_last_sample_time.read(last_time_q, 1);
-                    elapsed_q = now - last_time_q;
-                    if (last_time_q == 0 || elapsed_q >= TIME_THRESHOLD_US) {
-                        int_last_sample_time.write(1, now);
-                        do_insert_int();
-                    }
-                } else {                               // Best Effort -> Queue 7
-                    queue_idx = 7;
-                    int_last_sample_time.read(last_time_q, 7);
-                    elapsed_q = now - last_time_q;
-                    if (last_time_q == 0 || elapsed_q >= TIME_THRESHOLD_US) {
-                        int_last_sample_time.write(7, now);
-                        do_insert_int();
-                    }
+
+                // Use dst_port directly as register index for per-flow, per-queue sampling
+                // dst_port encoding: 6000 + flow_id * 10 + queue_id
+                // Each unique (flow_id, queue_id) combination has a unique port
+                // Use lower 10 bits to map to register index 0-1023
+                reg_index = (bit<32>)(local_metadata.l4_dst_port & 0x3FF);
+
+                // Read last sample time for this flow+queue combination
+                int_flow_queue_sample_time.read(last_time, reg_index);
+                elapsed = now - last_time;
+
+                // Sample if first packet (last_time == 0) or threshold elapsed
+                if (last_time == 0 || elapsed >= TIME_THRESHOLD_US) {
+                    int_flow_queue_sample_time.write(reg_index, now);
+                    do_insert_int();
                 }
             }
         }

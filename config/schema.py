@@ -69,6 +69,36 @@ class IntCollectorConfig(BaseModel):
     port: int = Field(default=10, ge=1, description="Port number on leaf switches for mirroring")
 
 
+class TrafficPair(BaseModel):
+    """A single traffic pair (sender -> receiver)."""
+    src: str = Field(..., description="Source host name (e.g., 'h1')")
+    dst: str = Field(..., description="Destination host name (e.g., 'h2')")
+
+
+class TrafficConfig(BaseModel):
+    """Traffic generation configuration."""
+    # Explicit pairs take precedence
+    pairs: List[TrafficPair] = Field(
+        default_factory=list,
+        description="Explicit list of (src, dst) traffic pairs"
+    )
+    # Alternative: pattern-based generation
+    pattern: Optional[str] = Field(
+        default=None,
+        description="Traffic pattern: 'cross_pod' (default), 'all_to_all', 'random_N'"
+    )
+    # Pod size for cross_pod pattern (hosts per pod)
+    pod_size: int = Field(default=2, ge=1, le=8, description="Hosts per pod for cross_pod pattern")
+
+    @model_validator(mode='after')
+    def validate_traffic_config(self) -> 'TrafficConfig':
+        """Ensure either pairs or pattern is specified."""
+        if not self.pairs and not self.pattern:
+            # Default to cross_pod pattern if nothing specified
+            self.pattern = "cross_pod"
+        return self
+
+
 class FatTreeConfig(BaseModel):
     """Fat-Tree topology configuration."""
     k: int = Field(..., ge=2, le=16, description="Fat-tree k-value (must be even)")
@@ -189,6 +219,7 @@ class TopologyConfig(BaseModel):
     switch_defaults: SwitchDefaults = Field(default_factory=SwitchDefaults)
     link_bandwidths: LinkBandwidths = Field(default_factory=LinkBandwidths)
     int_collectors: IntCollectorConfig = Field(default_factory=IntCollectorConfig)
+    traffic: TrafficConfig = Field(default_factory=TrafficConfig)
 
     # QoS configuration (fixed 3 queues)
     qos_queues: List[QueueConfig] = Field(

@@ -240,6 +240,15 @@ class TrafficManager:
 
         self.topology_file = topology_file
         self.config_path = config_path
+        self._topology_config = None
+
+        # Load topology config if available
+        if config_path:
+            try:
+                from config.loader import load_config
+                self._topology_config = load_config(config_path)
+            except Exception as e:
+                log.warning(f"Failed to load topology config: {e}")
 
         # Load host IPs: try topology_file first (has runtime IPs), then config, then defaults
         self.hosts_ips = get_hosts_from_config(config_path, topology_file)
@@ -250,13 +259,14 @@ class TrafficManager:
         # Discover traffic hosts (h1-h8, excluding h100+)
         self.traffic_hosts = self._discover_traffic_hosts()
         log.info(f"TrafficManager: Found traffic hosts: {self.traffic_hosts}")
-        
-        # Build sender/receiver pairs
-        self.pods = self._build_pods()
-        self.senders = [pod[0] for pod in self.pods]    # h1, h3, h5, h7
-        self.receivers = [pod[1] for pod in self.pods]  # h2, h4, h6, h8
-        self.traffic_pairs = self._build_traffic_pairs()
-        
+
+        # Build sender/receiver pairs from config or fallback to default logic
+        self.traffic_pairs = self._build_traffic_pairs_from_config()
+
+        # Extract unique senders and receivers from pairs
+        self.senders = list(set(p[0] for p in self.traffic_pairs))
+        self.receivers = list(set(p[1] for p in self.traffic_pairs))
+
         log.info(f"TrafficManager: {len(self.traffic_pairs)} traffic pairs configured")
         
         # Current profile state
@@ -325,18 +335,94 @@ class TrafficManager:
             if i + 1 < len(sorted_hosts):
                 pods.append([sorted_hosts[i], sorted_hosts[i+1]])
         return pods
-    
-    def _build_traffic_pairs(self) -> List[Tuple[str, str, int]]:
-        """Build (src, dst, flow_id) pairs - senders to receivers in OTHER pods."""
+
+    def _build_traffic_pairs_from_config(self) -> List[Tuple[str, str, int]]:
+        """Build traffic pairs from YAML config or fallback to cross_pod pattern."""
         pairs = []
         next_flow_id = 10
-        for i, sender in enumerate(self.senders):
-            for j, pod in enumerate(self.pods):
+
+        # Try to load explicit pairs from topology config
+        if self._topology_config and self._topology_config.traffic.pairs:
+            log.info("Loading traffic pairs from topology config")
+            for pair in self._topology_config.traffic.pairs:
+                src, dst = pair.src, pair.dst
+                # Validate hosts exist
+                if src not in self.hosts_ips:
+                    log.warning(f"Traffic pair source '{src}' not found in hosts, skipping")
+                    continue
+                if dst not in self.hosts_ips:
+                    log.warning(f"Traffic pair destination '{dst}' not found in hosts, skipping")
+                    continue
+                pairs.append((src, dst, next_flow_id))
+                next_flow_id += 1
+            if pairs:
+                return pairs
+
+        # Check for pattern-based generation
+        if self._topology_config and self._topology_config.traffic.pattern:
+            pattern = self._topology_config.traffic.pattern
+            pod_size = self._topology_config.traffic.pod_size
+            log.info(f"Generating traffic pairs with pattern: {pattern}")
+            return self._generate_pairs_by_pattern(pattern, pod_size)
+
+        # Fallback: use default cross_pod pattern
+        log.info("Using default cross_pod traffic pattern")
+        return self._build_traffic_pairs_cross_pod()
+
+    def _generate_pairs_by_pattern(self, pattern: str, pod_size: int) -> List[Tuple[str, str, int]]:
+        """Generate traffic pairs based on pattern."""
+        pairs = []
+        next_flow_id = 10
+        sorted_hosts = sorted(self.traffic_hosts, key=lambda x: int(x[1:]))
+
+        if pattern == "cross_pod":
+            return self._build_traffic_pairs_cross_pod()
+
+        elif pattern == "all_to_all":
+            # Every host sends to every other host
+            for src in sorted_hosts:
+                for dst in sorted_hosts:
+                    if src != dst:
+                        pairs.append((src, dst, next_flow_id))
+                        next_flow_id += 1
+
+        elif pattern.startswith("random_"):
+            # random_N: each host sends to N random other hosts
+            try:
+                n = int(pattern.split("_")[1])
+            except (IndexError, ValueError):
+                n = 3  # default
+            for src in sorted_hosts:
+                others = [h for h in sorted_hosts if h != src]
+                targets = self._rng.sample(others, min(n, len(others)))
+                for dst in targets:
+                    pairs.append((src, dst, next_flow_id))
+                    next_flow_id += 1
+
+        else:
+            log.warning(f"Unknown traffic pattern '{pattern}', falling back to cross_pod")
+            return self._build_traffic_pairs_cross_pod()
+
+        return pairs
+
+    def _build_traffic_pairs_cross_pod(self) -> List[Tuple[str, str, int]]:
+        """Build cross-pod traffic pairs (default pattern)."""
+        pairs = []
+        next_flow_id = 10
+        pods = self._build_pods()
+        senders = [pod[0] for pod in pods]
+
+        for i, sender in enumerate(senders):
+            for j, pod in enumerate(pods):
                 if j == i:
                     continue
                 pairs.append((sender, pod[1], next_flow_id))
                 next_flow_id += 1
         return pairs
+
+    def _build_traffic_pairs(self) -> List[Tuple[str, str, int]]:
+        """Build (src, dst, flow_id) pairs - legacy method, use _build_traffic_pairs_from_config."""
+        return self._build_traffic_pairs_cross_pod()
     
     def _host_to_ip(self, hostname: str) -> str:
         """Get IP for hostname from the hosts_ips mapping."""

@@ -38,6 +38,7 @@ import logging
 import argparse
 import csv
 import math
+import glob
 from datetime import datetime, timedelta
 from collections import deque
 from typing import Dict, List, Tuple, Optional
@@ -2060,7 +2061,8 @@ def train(args):
                 # Save checkpoints
                 if total_steps in checkpoint_steps:
                     tag = checkpoint_steps[total_steps]
-                    path = os.path.join(args.save_dir, f"dqn_v4_{tag}.pth")
+                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_{tag}.pth")
                     agent.save(path)
                     log.info(f"Checkpoint saved: {path}")
             
@@ -2088,7 +2090,8 @@ def train(args):
             # Track best model (based on rolling 100-episode average)
             if rolling_100 > best_avg_reward and len(episode_rewards) >= 50:
                 best_avg_reward = rolling_100
-                path = os.path.join(args.save_dir, "dqn_v4_best.pth")
+                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_best.pth")
                 agent.save(path)
                 log.info(f"New best model saved: rolling_avg_100={best_avg_reward:.3f}")
     
@@ -2098,7 +2101,8 @@ def train(args):
     
     finally:
         # Save final model
-        path = os.path.join(args.save_dir, "dqn_v4_final.pth")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_final.pth")
         agent.save(path)
         env.close()
         csv_file.close()
@@ -2142,13 +2146,25 @@ def evaluate(args):
         rules_dir=rules_dir
     )
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
-    
-    # Load weights
-    weights_path = os.path.join(args.save_dir, f"dqn_v4_{args.weights_tag}.pth")
-    if not os.path.exists(weights_path):
-        log.error(f"Weights file not found: {weights_path}")
-        return
-    
+
+    # Load weights - find latest checkpoint with datetime prefix
+    # Pattern: YYYYMMDD-HHMMSS-dqn_v4_{tag}.pth or legacy dqn_v4_{tag}.pth
+    pattern = os.path.join(args.save_dir, f"*-dqn_v4_{args.weights_tag}.pth")
+    matching_files = sorted(glob.glob(pattern), reverse=True)
+
+    if matching_files:
+        # Use the latest (most recent) checkpoint
+        weights_path = matching_files[0]
+        log.info(f"Using latest checkpoint: {os.path.basename(weights_path)}")
+    else:
+        # Fallback to legacy naming without timestamp
+        weights_path = os.path.join(args.save_dir, f"dqn_v4_{args.weights_tag}.pth")
+        if not os.path.exists(weights_path):
+            log.error(f"Weights file not found: {weights_path}")
+            log.error(f"Pattern searched: {pattern}")
+            return
+        log.info(f"Using legacy checkpoint: {os.path.basename(weights_path)}")
+
     agent.load(weights_path)
     agent.eps = 0.0  # No exploration during evaluation
     

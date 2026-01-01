@@ -93,7 +93,7 @@ clean: stop
 	sudo rm -rf $(PCAP_DIR) $(LOG_DIR) $(RULE_DIR)/rule*
 	sudo rm -f topology.json .active_topology
 	sudo rm -f /tmp/p4_paths.json /tmp/topology.json
-	sudo rm -f $(P4SRC_DIR)/*.p4i $(P4SRC_DIR)/*.json
+	sudo rm -f $(P4SRC_DIR)/*.p4i $(P4SRC_DIR)/*.json $(P4SRC_DIR)/*.p4info.txt
 
 # =============================================
 # INT Collector (Auto-detects topology)

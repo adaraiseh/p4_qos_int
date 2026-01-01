@@ -58,3 +58,36 @@ qos_queues:
     name: "best_effort"
     dscp: "0x00"
     sla_ms: 200
+
+# Traffic pairs: cross-pod communication
+# Hosts: Pod1(h1-h4), Pod2(h5-h8), Pod3(h9-h12), Pod4(h13-h16)
+traffic:
+  pairs:
+    # Pod1 senders -> other pods
+    - {src: h1, dst: h6}
+    - {src: h1, dst: h10}
+    - {src: h1, dst: h14}
+    - {src: h3, dst: h8}
+    - {src: h3, dst: h12}
+    - {src: h3, dst: h16}
+    # Pod2 senders -> other pods
+    - {src: h5, dst: h2}
+    - {src: h5, dst: h10}
+    - {src: h5, dst: h14}
+    - {src: h7, dst: h4}
+    - {src: h7, dst: h12}
+    - {src: h7, dst: h16}
+    # Pod3 senders -> other pods
+    - {src: h9, dst: h2}
+    - {src: h9, dst: h6}
+    - {src: h9, dst: h14}
+    - {src: h11, dst: h4}
+    - {src: h11, dst: h8}
+    - {src: h11, dst: h16}
+    # Pod4 senders -> other pods
+    - {src: h13, dst: h2}
+    - {src: h13, dst: h6}
+    - {src: h13, dst: h10}
+    - {src: h15, dst: h4}
+    - {src: h15, dst: h8}
+    - {src: h15, dst: h12}
