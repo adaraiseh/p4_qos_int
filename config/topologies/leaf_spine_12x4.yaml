@@ -1,0 +1,112 @@
+# Leaf-Spine 12x4 Topology Configuration
+# Large-scale two-tier topology
+#
+# Structure:
+#   - 12 Leaf switches
+#   - 4 Spine switches
+#   - 2 hosts per leaf = 24 total hosts
+#   - Full mesh between leaves and spines
+#   - Total: 16 switches
+
+version: "1.0"
+
+topology:
+  type: "leaf-spine"
+  name: "leaf-spine-12x4"
+
+leaf_spine:
+  num_leaves: 12
+  num_spines: 4
+  hosts_per_leaf: 2
+
+switch_naming:
+  leaf_prefix: "leaf"
+  spine_prefix: "spine"
+  core_prefix: "core"
+  host_prefix: "h"
+  collector_prefix: "h"
+  collector_id_base: 100
+
+switch_defaults:
+  p4_source: "p4src/int_md.p4"
+  priority_queues: 8
+  thrift_port_base: 9200
+
+link_bandwidths:
+  host_leaf: 10
+  leaf_spine: 5
+  spine_core: 10
+  host_access: 10
+  access_distribution: 5
+  distribution_core: 10
+
+int_collectors:
+  ratio: 6
+  ip_base: "172.16"
+  port: 10
+
+qos_queues:
+  - id: 0
+    name: "voice"
+    dscp: "0x2E"
+    sla_ms: 100
+  - id: 1
+    name: "video"
+    dscp: "0x18"
+    sla_ms: 150
+  - id: 7
+    name: "best_effort"
+    dscp: "0x00"
+    sla_ms: 200
+
+# Traffic pairs: cross-leaf communication (24 hosts across 12 leaves)
+traffic:
+  pairs:
+    # Leaf1(h1,h2) senders
+    - {src: h1, dst: h6}
+    - {src: h1, dst: h12}
+    - {src: h1, dst: h18}
+    # Leaf2(h3,h4) senders
+    - {src: h3, dst: h8}
+    - {src: h3, dst: h14}
+    - {src: h3, dst: h20}
+    # Leaf3(h5,h6) senders
+    - {src: h5, dst: h10}
+    - {src: h5, dst: h16}
+    - {src: h5, dst: h22}
+    # Leaf4(h7,h8) senders
+    - {src: h7, dst: h2}
+    - {src: h7, dst: h18}
+    - {src: h7, dst: h24}
+    # Leaf5(h9,h10) senders
+    - {src: h9, dst: h4}
+    - {src: h9, dst: h20}
+    - {src: h9, dst: h22}
+    # Leaf6(h11,h12) senders
+    - {src: h11, dst: h6}
+    - {src: h11, dst: h16}
+    - {src: h11, dst: h24}
+    # Leaf7(h13,h14) senders
+    - {src: h13, dst: h2}
+    - {src: h13, dst: h10}
+    - {src: h13, dst: h22}
+    # Leaf8(h15,h16) senders
+    - {src: h15, dst: h4}
+    - {src: h15, dst: h12}
+    - {src: h15, dst: h24}
+    # Leaf9(h17,h18) senders
+    - {src: h17, dst: h8}
+    - {src: h17, dst: h14}
+    - {src: h17, dst: h22}
+    # Leaf10(h19,h20) senders
+    - {src: h19, dst: h6}
+    - {src: h19, dst: h10}
+    - {src: h19, dst: h24}
+    # Leaf11(h21,h22) senders
+    - {src: h21, dst: h2}
+    - {src: h21, dst: h12}
+    - {src: h21, dst: h18}
+    # Leaf12(h23,h24) senders
+    - {src: h23, dst: h4}
+    - {src: h23, dst: h14}
+    - {src: h23, dst: h20}

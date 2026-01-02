@@ -32,10 +32,28 @@ else ifeq ($(topo),fat_tree_k8)
 TOPOLOGY_CONFIG = $(TOPO_DIR)/fat_tree_k8.yaml
 else ifeq ($(topo),leaf_spine_4x2)
 TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_4x2.yaml
+else ifeq ($(topo),leaf_spine_6x2)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_6x2.yaml
 else ifeq ($(topo),leaf_spine_6x3)
 TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_6x3.yaml
+else ifeq ($(topo),leaf_spine_8x2)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_8x2.yaml
+else ifeq ($(topo),leaf_spine_8x3)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_8x3.yaml
 else ifeq ($(topo),leaf_spine_8x4)
 TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_8x4.yaml
+else ifeq ($(topo),leaf_spine_10x3)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_10x3.yaml
+else ifeq ($(topo),leaf_spine_10x4)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_10x4.yaml
+else ifeq ($(topo),leaf_spine_12x3)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_12x3.yaml
+else ifeq ($(topo),leaf_spine_12x4)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_12x4.yaml
+else ifeq ($(topo),leaf_spine_14x4)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_14x4.yaml
+else ifeq ($(topo),leaf_spine_16x4)
+TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_16x4.yaml
 else ifeq ($(topo),three_tier_4)
 TOPOLOGY_CONFIG = $(TOPO_DIR)/three_tier_4.yaml
 else ifeq ($(topo),three_tier_6)
@@ -257,14 +275,30 @@ help:
 	@echo "  make clean                Clean up all files"
 	@echo ""
 	@echo "Available topologies for 'topo=':"
-	@echo "  fat_tree_k2               Fat-Tree k=2 (5 switches, 2 hosts)"
-	@echo "  fat_tree_k4               Fat-Tree k=4 (20 switches, 16 hosts) [default]"
-	@echo "  leaf_spine_4x2            Leaf-Spine 4 leaves, 2 spines (8 hosts)"
-	@echo "  leaf_spine_6x3            Leaf-Spine 6 leaves, 3 spines (12 hosts)"
-	@echo "  leaf_spine_8x4            Leaf-Spine 8 leaves, 4 spines (16 hosts)"
-	@echo "  three_tier_4              Three-Tier 4 access switches (8 hosts)"
-	@echo "  three_tier_6              Three-Tier 6 access switches (12 hosts)"
-	@echo "  three_tier_8              Three-Tier 8 access switches (16 hosts)"
+	@echo ""
+	@echo "  Fat-Tree Topologies:"
+	@echo "    fat_tree_k2             Fat-Tree k=2 (5 switches, 4 hosts)"
+	@echo "    fat_tree_k4             Fat-Tree k=4 (20 switches, 16 hosts) [default]"
+	@echo "    fat_tree_k8             Fat-Tree k=8 (80 switches, 64 hosts)"
+	@echo ""
+	@echo "  Leaf-Spine Topologies:"
+	@echo "    leaf_spine_4x2          4 leaves × 2 spines (6 sw, 8 hosts)"
+	@echo "    leaf_spine_6x2          6 leaves × 2 spines (8 sw, 12 hosts)"
+	@echo "    leaf_spine_6x3          6 leaves × 3 spines (9 sw, 12 hosts)"
+	@echo "    leaf_spine_8x2          8 leaves × 2 spines (10 sw, 16 hosts)"
+	@echo "    leaf_spine_8x3          8 leaves × 3 spines (11 sw, 16 hosts)"
+	@echo "    leaf_spine_8x4          8 leaves × 4 spines (12 sw, 16 hosts)"
+	@echo "    leaf_spine_10x3         10 leaves × 3 spines (13 sw, 20 hosts)"
+	@echo "    leaf_spine_10x4         10 leaves × 4 spines (14 sw, 20 hosts)"
+	@echo "    leaf_spine_12x3         12 leaves × 3 spines (15 sw, 24 hosts)"
+	@echo "    leaf_spine_12x4         12 leaves × 4 spines (16 sw, 24 hosts)"
+	@echo "    leaf_spine_14x4         14 leaves × 4 spines (18 sw, 28 hosts)"
+	@echo "    leaf_spine_16x4         16 leaves × 4 spines (20 sw, 32 hosts)"
+	@echo ""
+	@echo "  Three-Tier Topologies:"
+	@echo "    three_tier_4            4 access switches (8 hosts)"
+	@echo "    three_tier_6            6 access switches (12 hosts)"
+	@echo "    three_tier_8            8 access switches (16 hosts)"
 	@echo ""
 	@echo "Training/Evaluation (auto-detect running topology):"
 	@echo "  make train                Train RL agent on running network"

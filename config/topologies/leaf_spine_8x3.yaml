@@ -1,0 +1,96 @@
+# Leaf-Spine 8x3 Topology Configuration
+# Medium-scale two-tier topology
+#
+# Structure:
+#   - 8 Leaf switches
+#   - 3 Spine switches
+#   - 2 hosts per leaf = 16 total hosts
+#   - Full mesh between leaves and spines
+#   - Total: 11 switches
+
+version: "1.0"
+
+topology:
+  type: "leaf-spine"
+  name: "leaf-spine-8x3"
+
+leaf_spine:
+  num_leaves: 8
+  num_spines: 3
+  hosts_per_leaf: 2
+
+switch_naming:
+  leaf_prefix: "leaf"
+  spine_prefix: "spine"
+  core_prefix: "core"
+  host_prefix: "h"
+  collector_prefix: "h"
+  collector_id_base: 100
+
+switch_defaults:
+  p4_source: "p4src/int_md.p4"
+  priority_queues: 8
+  thrift_port_base: 9200
+
+link_bandwidths:
+  host_leaf: 10
+  leaf_spine: 5
+  spine_core: 10
+  host_access: 10
+  access_distribution: 5
+  distribution_core: 10
+
+int_collectors:
+  ratio: 4
+  ip_base: "172.16"
+  port: 10
+
+qos_queues:
+  - id: 0
+    name: "voice"
+    dscp: "0x2E"
+    sla_ms: 100
+  - id: 1
+    name: "video"
+    dscp: "0x18"
+    sla_ms: 150
+  - id: 7
+    name: "best_effort"
+    dscp: "0x00"
+    sla_ms: 200
+
+# Traffic pairs: cross-leaf communication (16 hosts across 8 leaves)
+traffic:
+  pairs:
+    # Leaf1(h1,h2) senders
+    - {src: h1, dst: h4}
+    - {src: h1, dst: h8}
+    - {src: h1, dst: h12}
+    # Leaf2(h3,h4) senders
+    - {src: h3, dst: h2}
+    - {src: h3, dst: h8}
+    - {src: h3, dst: h14}
+    # Leaf3(h5,h6) senders
+    - {src: h5, dst: h2}
+    - {src: h5, dst: h10}
+    - {src: h5, dst: h16}
+    # Leaf4(h7,h8) senders
+    - {src: h7, dst: h4}
+    - {src: h7, dst: h12}
+    - {src: h7, dst: h14}
+    # Leaf5(h9,h10) senders
+    - {src: h9, dst: h2}
+    - {src: h9, dst: h6}
+    - {src: h9, dst: h16}
+    # Leaf6(h11,h12) senders
+    - {src: h11, dst: h4}
+    - {src: h11, dst: h8}
+    - {src: h11, dst: h14}
+    # Leaf7(h13,h14) senders
+    - {src: h13, dst: h6}
+    - {src: h13, dst: h10}
+    - {src: h13, dst: h16}
+    # Leaf8(h15,h16) senders
+    - {src: h15, dst: h2}
+    - {src: h15, dst: h6}
+    - {src: h15, dst: h12}
