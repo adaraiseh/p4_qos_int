@@ -7,9 +7,10 @@ import os
 import threading
 from collections import deque
 from contextlib import redirect_stdout, redirect_stderr
+from functools import lru_cache
 from pathlib import Path
 from ipaddress import ip_network
-from typing import Optional, Dict, List, Set
+from typing import Optional, Dict, List, Set, Tuple
 
 import networkx as nx
 import warnings
@@ -553,7 +554,20 @@ class Controller:
         This supports both local stitching (c1 -> c2) and global rerouting (c1 -> a2 -> c3 -> a4).
         """
         with self._lock:
-            return self._find_all_alternates_unlocked(worst_switch_id, path)
+            # Use cached version with hashable arguments (CPU optimization)
+            return list(self._cached_find_all_alternates(worst_switch_id, tuple(path)))
+
+    @lru_cache(maxsize=256)
+    def _cached_find_all_alternates(self, worst_switch_id: int, path_tuple: Tuple[str, ...]) -> Tuple[str, ...]:
+        """
+        Cached version of find_all_alternates.
+        Returns tuple for hashability. Cache invalidated by _invalidate_alternates_cache().
+        """
+        return tuple(self._find_all_alternates_unlocked(worst_switch_id, list(path_tuple)))
+
+    def _invalidate_alternates_cache(self):
+        """Clear the alternates cache after topology changes or reroutes."""
+        self._cached_find_all_alternates.cache_clear()
 
     def _find_all_alternates_unlocked(self, worst_switch_id: int, path: list[str]) -> list[str]:
         """Internal implementation without locking."""
@@ -571,12 +585,6 @@ class Controller:
         src_node = path[0]
         dst_node = path[-1]
 
-        # Candidates are all switches EXCEPT:
-        # 1. The bottleneck (worst) switch itself
-        # 2. Edge switches (generally we don't route through other edge switches as transit)
-        candidates = []
-        all_sids = self.get_all_switch_ids()
-        
         # Create a read-only graph view WITHOUT the bottleneck to verify independent reachability
         # Using restricted_view() is O(1) vs O(V+E) for copy() - much faster for large topologies
         if worst_name not in self.net_graph:
@@ -588,19 +596,33 @@ class Controller:
         if not (G_view.has_node(src_node) and G_view.has_node(dst_node)):
             return []
 
-        # Verify if src can reach dst at all without the bottleneck
-        if not nx.has_path(G_view, src_node, dst_node):
+        # CPU Optimization: Use connected components for batch reachability check
+        # Instead of calling has_path() for each candidate, compute component membership once
+        try:
+            # Get the connected component containing src_node
+            src_component = nx.node_connected_component(G_view, src_node)
+        except nx.NetworkXError:
+            return []
+
+        # If dst is not in same component as src, no valid path exists at all
+        if dst_node not in src_component:
             return []
 
         worst_role = self._normalize_role(self._role_of_sid(worst_switch_id))
 
+        # Candidates are all switches EXCEPT:
+        # 1. The bottleneck (worst) switch itself
+        # 2. Edge switches (generally we don't route through other edge switches as transit)
+        candidates = []
+        all_sids = self.get_all_switch_ids()
+
         for sid in all_sids:
             if sid == int(worst_switch_id):
                 continue
-            
+
             if self._is_edge_switch(sid):
                 continue
-            
+
             # Enforce Matching Role: Candidate must have same role as bottleneck
             cand_role = self._normalize_role(self._role_of_sid(sid))
             if cand_role != worst_role:
@@ -610,11 +632,10 @@ class Controller:
             if not cand_name or cand_name not in G_view:
                 continue
 
-            # Check 1: Reachability from Source -> Candidate (without bottleneck)
-            if nx.has_path(G_view, src_node, cand_name):
-                # Check 2: Reachability from Candidate -> Destination (without bottleneck)
-                if nx.has_path(G_view, cand_name, dst_node):
-                    candidates.append(cand_name)
+            # CPU Optimization: Check component membership instead of has_path()
+            # If candidate is in same component as src (and dst), it's reachable both ways
+            if cand_name in src_component:
+                candidates.append(cand_name)
 
         return sorted(candidates)
 
@@ -1147,6 +1168,9 @@ class Controller:
             self.change_history_by_qid[int(qid)] = deque(maxlen=self.MAX_HISTORY_DEPTH)
         self.change_history_by_qid[int(qid)].append(rec)
         self.dump_paths_json()
+
+        # Invalidate alternates cache since path changed (CPU optimization cache management)
+        self._invalidate_alternates_cache()
 
         return True, "ok"
 

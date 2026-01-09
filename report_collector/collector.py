@@ -83,6 +83,14 @@ EGRESS_TSTAMP_BIT =       0b00000100
 L2_PORT_IDS_BIT =         0b00000010
 EGRESS_PORT_TX_UTIL_BIT = 0b00000001
 
+# Pre-compiled struct formats for faster INT metadata parsing (CPU optimization)
+# Using Struct objects avoids format string compilation on each unpack call
+STRUCT_UINT32 = struct.Struct('>I')      # 4-byte unsigned int (big-endian)
+STRUCT_UINT16_PAIR = struct.Struct('>HH')  # Two 2-byte unsigned ints
+STRUCT_UINT64 = struct.Struct('>Q')      # 8-byte unsigned int
+STRUCT_BYTE = struct.Struct('>B')        # 1-byte unsigned int
+STRUCT_UINT32_PAIR = struct.Struct('>II')  # Two 4-byte unsigned ints
+
 
 class FlowInfo:
     """Flow metadata container with __slots__ for reduced memory/CPU overhead."""
@@ -426,13 +434,12 @@ class Collector:
             # --- OPTIMIZATION PATH: Direct String Construction ---
             # If aggregation is disabled (default in production), avoid tuple creation overhead
             if not self.aggregate_enabled:
-                # Pre-format static parts of tags
+                # CPU Optimization: Pre-format static tag prefix that's common across all measurements
                 # Tag Keys sorted: dst_ip, egress_port, flow_id, queue_id, src_ip, switch_id
                 # Note: InfluxDB requires tags sorted by key.
-                # switch_latency tags: dst_ip, flow_id, queue_id, src_ip, switch_id
-                # tx_util tags:        dst_ip, egress_port, flow_id, queue_id, src_ip, switch_id
-                # queue_occup tags:    dst_ip, flow_id, queue_id, src_ip, switch_id
-                
+                # Common prefix for most measurements: dst_ip, flow_id (then queue_id, src_ip, switch_id vary)
+                base_tags = f"dst_ip={dst_ip},flow_id={flow_id}"
+
                 # Cache local vars for loop speed
                 sw_ids = flow_info.switch_ids
                 q_ids = flow_info.queue_ids
@@ -441,32 +448,36 @@ class Collector:
                 tx_utils = flow_info.egress_tx_utils
                 q_occups = flow_info.queue_occups
                 q_drops = flow_info.queue_drops
-                
+
                 enable_occupancy = self.enable_queue_occupancy
-                
+
                 for i in range(safe_hops):
                     switch_id = sw_ids[i]
                     queue_id = q_ids[i]
                     egress_port = eg_ports[i]
-                    
+
+                    # Pre-build per-hop tag suffix (CPU optimization - computed once per hop)
+                    hop_tags_no_port = f"queue_id={queue_id},src_ip={src_ip},switch_id={switch_id}"
+                    hop_tags_with_port = f"egress_port={egress_port},{hop_tags_no_port}"
+
                     # 1. switch_latency
                     # measurement=switch_latency,dst_ip=...,flow_id=...,queue_id=...,src_ip=...,switch_id=... value=... ts
                     points.append(
-                        f"switch_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={queue_id},src_ip={src_ip},switch_id={switch_id} value={hop_lats[i] / 1000.0} {report_time}"
+                        f"switch_latency,{base_tags},{hop_tags_no_port} value={hop_lats[i] / 1000.0} {report_time}"
                     )
 
                     # 2. tx_utilization
                     # measurement=tx_utilization,dst_ip=...,egress_port=...,flow_id=...,queue_id=...,src_ip=...,switch_id=... value=... ts
                     points.append(
-                        f"tx_utilization,dst_ip={dst_ip},egress_port={egress_port},flow_id={flow_id},queue_id={queue_id},src_ip={src_ip},switch_id={switch_id} value={tx_utils[i]} {report_time}"
+                        f"tx_utilization,{base_tags},{hop_tags_with_port} value={tx_utils[i]} {report_time}"
                     )
 
                     # 3. queue_occupancy (Optional)
                     if enable_occupancy:
                         points.append(
-                            f"queue_occupancy,dst_ip={dst_ip},flow_id={flow_id},queue_id={queue_id},src_ip={src_ip},switch_id={switch_id} value={q_occups[i]} {report_time}"
+                            f"queue_occupancy,{base_tags},{hop_tags_no_port} value={q_occups[i]} {report_time}"
                         )
-                        
+
                     # 4. drop_rate (Special logic)
                     # We still need calculations from record_drop_rate_instant, but we can avoid
                     # the dict return if we inline the logic or parse the result fast.
@@ -475,11 +486,11 @@ class Collector:
                         flow_id, src_ip, dst_ip, switch_id, egress_port, queue_id,
                         q_drops[i], report_time
                     )
-                    
+
                     if dr is not None:
                         # measurement=q_drop_rate_100ms,dst_ip=...,egress_port=...,flow_id=...,queue_id=...,src_ip=...,switch_id=... value=... ts
                         points.append(
-                           f"q_drop_rate_100ms,dst_ip={dst_ip},egress_port={egress_port},flow_id={flow_id},queue_id={queue_id},src_ip={src_ip},switch_id={switch_id} value={dr['value']} {dr['ts_ns']}"
+                           f"q_drop_rate_100ms,{base_tags},{hop_tags_with_port} value={dr['value']} {dr['ts_ns']}"
                         )
 
             else:
@@ -643,44 +654,45 @@ class Collector:
         l2_egress_ports = flow_info.l2_egress_ports
         egress_tx_utils = flow_info.egress_tx_utils
 
+        # Use pre-compiled struct objects for faster parsing (CPU optimization)
         for i in range(hop_count):
             offset = i * hop_meta_len_bytes
 
             if has_switch_id:
-                switch_ids.append(struct.unpack_from('>I', int_metadata, offset)[0])
+                switch_ids.append(STRUCT_UINT32.unpack_from(int_metadata, offset)[0])
                 offset += 4
             if has_l1_ports:
-                in_port, eg_port = struct.unpack_from('>HH', int_metadata, offset)
+                in_port, eg_port = STRUCT_UINT16_PAIR.unpack_from(int_metadata, offset)
                 l1_ingress_ports.append(in_port)
                 l1_egress_ports.append(eg_port)
                 offset += 4
             if has_hop_latency:
-                hop_latencies.append(struct.unpack_from('>I', int_metadata, offset)[0])
+                hop_latencies.append(STRUCT_UINT32.unpack_from(int_metadata, offset)[0])
                 offset += 4
             if has_queue:
                 # queue_id: 1 byte, queue_occup: 3 bytes (24-bit), queue_drops: 4 bytes
-                q_id = struct.unpack_from('>B', int_metadata, offset)[0]
+                q_id = STRUCT_BYTE.unpack_from(int_metadata, offset)[0]
                 queue_ids.append(q_id)
                 offset += 1
                 # 3-byte value: unpack as 4 bytes with leading zero
-                q_occ = struct.unpack_from('>I', b'\x00' + int_metadata[offset:offset + 3], 0)[0]
+                q_occ = STRUCT_UINT32.unpack_from(b'\x00' + int_metadata[offset:offset + 3], 0)[0]
                 queue_occups.append(q_occ)
                 offset += 3
-                queue_drops.append(struct.unpack_from('>I', int_metadata, offset)[0])
+                queue_drops.append(STRUCT_UINT32.unpack_from(int_metadata, offset)[0])
                 offset += 4
             if has_ingress_ts:
-                ingress_tstamps.append(struct.unpack_from('>Q', int_metadata, offset)[0] * 1000)
+                ingress_tstamps.append(STRUCT_UINT64.unpack_from(int_metadata, offset)[0] * 1000)
                 offset += 8
             if has_egress_ts:
-                egress_tstamps.append(struct.unpack_from('>Q', int_metadata, offset)[0] * 1000)
+                egress_tstamps.append(STRUCT_UINT64.unpack_from(int_metadata, offset)[0] * 1000)
                 offset += 8
             if has_l2_ports:
-                l2_in, l2_eg = struct.unpack_from('>II', int_metadata, offset)
+                l2_in, l2_eg = STRUCT_UINT32_PAIR.unpack_from(int_metadata, offset)
                 l2_ingress_ports.append(l2_in)
                 l2_egress_ports.append(l2_eg)
                 offset += 8
             if has_tx_util:
-                tx_util = struct.unpack_from('>I', int_metadata, offset)[0]
+                tx_util = STRUCT_UINT32.unpack_from(int_metadata, offset)[0]
                 egress_tx_utils.append(round(tx_util / 10**4, 2))
 
     def parser_int_pkt(self, pkt):
