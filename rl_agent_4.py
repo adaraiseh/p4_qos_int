@@ -5,20 +5,20 @@ rl_agent_4.py - Simplified DQN for per-queue QoS path optimization using P4 INT 
 
 Key Design Principles:
 1. Single centralized DQN agent
-# 2. Frame stacking (464 features) - stacked observations + stacked one-hot actions
-# 3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
-# 4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
-# 5. Focused action space (8 actions) - no-op + 6 single + 1 multi-queue
-# 6. Prioritized Experience Replay - learn from rare important events
-# 7. Proper episode boundaries - clear termination conditions
-# 8. Tuned timing for 100% post-action data capture
-# 9. Queue-specific bottleneck detection and alternative metrics
-# 10. EMA temporal smoothing for latency trends
+2. Frame stacking (960 features) - stacked observations + stacked one-hot actions
+3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
+4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
+5. Focused action space (8 actions) - no-op + 6 single + 1 multi-queue
+6. Prioritized Experience Replay - learn from rare important events
+7. Proper episode boundaries - clear termination conditions
+8. Tuned timing for 100% post-action data capture
+9. Queue-specific bottleneck detection and alternative metrics
+10. EMA temporal smoothing for latency trends
 
-# State Composition (464 features):
-# - Stacked Observations: 50 metrics * 8 frames = 400 features
-# - Stacked Actions (one-hot): 8 * 8 frames = 64 features
-# - Total: 464 features
+State Composition (960 features):
+- Stacked Observations: 52 metrics * 16 frames = 832 features
+- Stacked Actions (one-hot): 8 actions * 16 frames = 128 features
+- Total: 960 features
 
 Benefits:
 - Agent sees velocity/trends (is latency rising or falling?)
@@ -98,10 +98,6 @@ from config.schema import MAX_SWITCHES
 
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
-
-# Ensure traffic_generator logger uses the same level
-# Ensure traffic_generator logger uses the same level
-# logging.getLogger('traffic_generator').setLevel(logging.INFO)
 
 
 # =============================================================================
@@ -192,6 +188,47 @@ REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA viola
 
 # Soft margin around SLA (reduces reward flip-flopping)
 SLA_SOFT_MARGIN = 0.1  # REDUCED from 0.2 to 0.1 (10%) - tighter margin provides stronger training signal
+SLA_MARGIN_LOW = 1.0 - SLA_SOFT_MARGIN   # 0.9 - below this is clearly meeting SLA
+SLA_MARGIN_HIGH = 1.0 + SLA_SOFT_MARGIN  # 1.1 - above this is clearly violating SLA
+
+# =============================================================================
+#                          HELPER FUNCTIONS
+# =============================================================================
+def action_to_name(action: int) -> str:
+    """Convert action index to human-readable name."""
+    ACTION_NAMES = {
+        0: "noop",
+        1: "v0-alt0", 2: "v0-alt1",
+        3: "v1-alt0", 4: "v1-alt1",
+        5: "be-alt0", 6: "be-alt1",
+        7: "multi"
+    }
+    return ACTION_NAMES.get(action, str(action))
+
+
+def resolve_checkpoint_path(save_dir: str, tag: str) -> Optional[str]:
+    """Find latest checkpoint matching tag, with fallback to legacy naming."""
+    pattern = os.path.join(save_dir, f"*-dqn_v4_{tag}.pth")
+    matching = sorted(glob.glob(pattern), reverse=True)
+    if matching:
+        return matching[0]
+    legacy = os.path.join(save_dir, f"dqn_v4_{tag}.pth")
+    return legacy if os.path.exists(legacy) else None
+
+
+def load_topology(args):
+    """Load topology from config, return (builder, rules_dir)."""
+    if not args.config:
+        return None, args.rules_dir
+    from topology.factory import create_topology
+    builder = create_topology(args.config)
+    rules_dir = args.rules_dir
+    if rules_dir is None:
+        topo_name = builder.config.topology.name.replace('-', '_')
+        rules_dir = f"rules/{topo_name}"
+    log.info(f"Topology: {builder.config.topology.name} ({len(builder.switches)}/{MAX_SWITCHES} max)")
+    return builder, rules_dir
+
 
 # =============================================================================
 #                        PRIORITIZED REPLAY BUFFER
@@ -974,18 +1011,9 @@ class QoSRoutingEnv:
         # Debug assertion to catch dimension mismatches early
         assert len(raw_state) == RAW_STATE_DIM, f"State dim mismatch: {len(raw_state)} != {RAW_STATE_DIM}"
         
-        # Initialize frame stack with replicated first observation
-        # This provides a clean slate for each episode
-        self.frame_stack.clear()
-        for _ in range(STACK_SIZE):
-            self.frame_stack.append(raw_state.copy())
-        
-        # Initialize action stack with no-ops
-        noop_onehot = self._action_to_onehot(0)
-        self.action_stack.clear()
-        for _ in range(STACK_SIZE):
-            self.action_stack.append(noop_onehot.copy())
-        
+        # Initialize frame and action stacks for clean slate
+        self._init_stacks(raw_state)
+
         return self._build_stacked_state()
 
     def clear_stacks(self):
@@ -1003,20 +1031,10 @@ class QoSRoutingEnv:
         """
         log.info("[STACK CLEAR] Clearing frame and action stacks for model reload")
 
-        # Collect fresh snapshot
+        # Collect fresh snapshot and reinitialize stacks
         snapshot = self._collect_snapshot()
         raw_state = self._build_raw_state(snapshot)
-
-        # Clear and reinitialize frame stack with current observation
-        self.frame_stack.clear()
-        for _ in range(STACK_SIZE):
-            self.frame_stack.append(raw_state.copy())
-
-        # Clear and reinitialize action stack with no-ops
-        noop_onehot = self._action_to_onehot(0)
-        self.action_stack.clear()
-        for _ in range(STACK_SIZE):
-            self.action_stack.append(noop_onehot.copy())
+        self._init_stacks(raw_state)
 
         log.info("[STACK CLEAR] Stacks cleared - frame and action history reset")
 
@@ -1575,7 +1593,22 @@ class QoSRoutingEnv:
         onehot = np.zeros(ACTION_DIM, dtype=np.float32)
         onehot[action] = 1.0
         return onehot
-    
+
+    def _init_stacks(self, raw_state: np.ndarray):
+        """Initialize frame and action stacks with given state."""
+        self.frame_stack.clear()
+        for _ in range(STACK_SIZE):
+            self.frame_stack.append(raw_state.copy())
+        noop_onehot = self._action_to_onehot(0)
+        self.action_stack.clear()
+        for _ in range(STACK_SIZE):
+            self.action_stack.append(noop_onehot.copy())
+
+    def _is_sla_violated(self, qid: int, snapshot: Dict) -> bool:
+        """Check if queue is violating SLA (above margin)."""
+        ratio = snapshot[qid]['lat_p95'] / SLA_THRESHOLDS[qid]
+        return ratio > SLA_MARGIN_HIGH
+
     def _build_stacked_state(self) -> np.ndarray:
         """
         Build stacked state with exponential decay weighting.
@@ -1652,8 +1685,7 @@ class QoSRoutingEnv:
             for qid in QIDS:
                 q = snapshot[qid]
                 # Check soft margin violation (consistent with step logic)
-                is_violating = (q['lat_p95'] / SLA_THRESHOLDS[qid]) > (1.0 + SLA_SOFT_MARGIN)
-                if is_violating and q.get('bottleneck_sid') is not None and len(q.get('alternatives', [])) > 0:
+                if self._is_sla_violated(qid, snapshot) and q.get('bottleneck_sid') is not None and len(q.get('alternatives', [])) > 0:
                     violating_with_alts += 1
 
             if violating_with_alts >= 2:
@@ -1684,28 +1716,25 @@ class QoSRoutingEnv:
             sla = SLA_THRESHOLDS[qid]
             lat = q['lat_p95']
             
-            # Calculate ratio with soft margin
-            # SLA_SOFT_MARGIN=0.2 means 80-120% of SLA is "neutral zone"
+            # Calculate ratio with soft margin (0.9-1.1 is neutral zone)
             ratio = lat / sla
-            margin_low = 1.0 - SLA_SOFT_MARGIN   # 0.8
-            margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.2
-            
-            if ratio <= margin_low:
+
+            if ratio <= SLA_MARGIN_LOW:
                 # Clearly under SLA: positive reward
                 # Use sqrt for diminishing returns (don't over-reward very low latency)
-                headroom = margin_low - ratio  # How much below margin
-                component = REWARD_SLA_MET_SCALE * np.sqrt(headroom / margin_low)
+                headroom = SLA_MARGIN_LOW - ratio  # How much below margin
+                component = REWARD_SLA_MET_SCALE * np.sqrt(headroom / SLA_MARGIN_LOW)
                 info['sla_met'].append(qid)
-            elif ratio <= margin_high:
+            elif ratio <= SLA_MARGIN_HIGH:
                 # Within margin: small neutral reward (avoid flip-flopping)
                 # Linear interpolation from +0.1 to -0.1
-                t = (ratio - margin_low) / (margin_high - margin_low)  # 0 to 1
+                t = (ratio - SLA_MARGIN_LOW) / (SLA_MARGIN_HIGH - SLA_MARGIN_LOW)  # 0 to 1
                 component = 0.1 * (1.0 - 2.0 * t)  # +0.1 to -0.1
                 info['sla_met'].append(qid)  # Still counts as met
             else:
                 # Above margin: penalty
                 # Use tanh to compress extreme violations smoothly
-                excess = ratio - margin_high  # How much above margin
+                excess = ratio - SLA_MARGIN_HIGH  # How much above margin
                 # tanh(x) saturates at ~1 for x>2, so max penalty ~1.5
                 component = -REWARD_SLA_VIOLATED_SCALE * np.tanh(excess)
                 info['sla_violated'].append(qid)
@@ -1923,13 +1952,12 @@ class QoSRoutingEnv:
                 # Conservative: high cost if latency stable/improving (don't disturb)
                 ratio_pre = q_pre['lat_p95'] / sla_pre
                 lat_ema_diff = q_pre.get('lat_ema_diff', 0.0)  # Normalized latency change
-                margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.1 now (was 1.2)
 
                 # Decision logic:
                 # 1. If SLA violated (ratio > margin_high) → low cost (must fix)
                 # 2. If SLA met but trending bad (ema_diff > 0.05) → low cost (preventive)
                 # 3. If SLA met and stable/improving → high cost (don't disturb)
-                if ratio_pre > margin_high:
+                if ratio_pre > SLA_MARGIN_HIGH:
                     # Violated: must fix
                     action_cost = REWARD_ACTION_COST_SICK
                 elif lat_ema_diff > 0.05:  # Latency increasing > 5% of normalized range
@@ -1997,13 +2025,12 @@ class QoSRoutingEnv:
             mapping = self.ACTION_MAP.get(action)
             if mapping == 'multi':
                 # Multi-action: require at least one violating queue to have context
-                # Use soft margin (> 1.2) for consistency with reward/cost logic
                 action_context_valid = any(
                     (current_snapshot[qid].get('hot_src_ip') is not None and
                      current_snapshot[qid].get('hot_dst_ip') is not None and
                      current_snapshot[qid].get('bottleneck_sid') is not None)
                     for qid in QIDS
-                    if (current_snapshot[qid]['lat_p95'] / SLA_THRESHOLDS[qid]) > (1.0 + SLA_SOFT_MARGIN)
+                    if self._is_sla_violated(qid, current_snapshot)
                 )
                 if not action_context_valid:
                     log.debug(f"[Step {self.episode_step}] Multi-action had no violating queues with context")
@@ -2203,18 +2230,8 @@ def train(args):
     log.info(f"Using device: {device}")
 
     # Load topology if config specified
-    topology_builder = None
-    rules_dir = args.rules_dir
-    if args.config:
-        from topology.factory import create_topology
-        log.info(f"Loading topology from: {args.config}")
-        topology_builder = create_topology(args.config)
-        if rules_dir is None:
-            # Auto-detect rules dir from topology name
-            topo_name = topology_builder.config.topology.name.replace('-', '_')
-            rules_dir = f"rules/{topo_name}"
-        log.info(f"Topology: {topology_builder.config.topology.name}")
-        log.info(f"  Switches: {len(topology_builder.switches)}/{MAX_SWITCHES} max")
+    topology_builder, rules_dir = load_topology(args)
+    if rules_dir:
         log.info(f"  Rules dir: {rules_dir}")
 
     # Initialize environment and agent
@@ -2240,22 +2257,8 @@ def train(args):
 
     # Resume from checkpoint if specified
     if args.resume:
-        resume_path = args.resume
-        if not resume_path.endswith('.pth'):
-            # Try glob pattern for timestamped checkpoints first
-            # Pattern: YYYYMMDD-HHMMSS-dqn_v4_{tag}.pth
-            pattern = os.path.join(args.save_dir, f"*-dqn_v4_{args.resume}.pth")
-            matching_files = sorted(glob.glob(pattern), reverse=True)
-
-            if matching_files:
-                # Use the latest (most recent) checkpoint
-                resume_path = matching_files[0]
-                log.info(f"Found {len(matching_files)} matching checkpoints, using latest: {os.path.basename(resume_path)}")
-            else:
-                # Fallback to legacy naming without timestamp
-                resume_path = os.path.join(args.save_dir, f"dqn_v4_{args.resume}.pth")
-
-        if os.path.exists(resume_path):
+        resume_path = args.resume if args.resume.endswith('.pth') else resolve_checkpoint_path(args.save_dir, args.resume)
+        if resume_path and os.path.exists(resume_path):
             agent.load(resume_path)
             log.info(f"Resumed training from {resume_path}")
 
@@ -2396,22 +2399,9 @@ def train(args):
                 
                 if total_steps % args.log_every == 0:
                     loss_str = f"{stats['last_loss']:.4f}" if stats['last_loss'] is not None else "N/A"
-                    # Map action to readable name
-                    if action == 0:
-                        action_name = "noop"
-                    elif action in (1, 2):
-                        action_name = f"v0-alt{action-1}"
-                    elif action in (3, 4):
-                        action_name = f"v1-alt{action-3}"
-                    elif action in (5, 6):
-                        action_name = f"be-alt{action-5}"
-                    elif action == 7:
-                        action_name = "multi"
-                    else:
-                        action_name = str(action)
                     log.info(
                         f"[Step {total_steps}] "
-                        f"action={action_name:8s} "
+                        f"action={action_to_name(action):8s} "
                         f"reward={reward:+.2f} "
                         f"eps={stats['eps']:.3f} "
                         f"buffer={stats['buffer_size']:5d} "
@@ -2513,17 +2503,7 @@ def evaluate(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Load topology if config specified
-    topology_builder = None
-    rules_dir = args.rules_dir
-    if args.config:
-        from topology.factory import create_topology
-        log.info(f"Loading topology from: {args.config}")
-        topology_builder = create_topology(args.config)
-        if rules_dir is None:
-            topo_name = topology_builder.config.topology.name.replace('-', '_')
-            rules_dir = f"rules/{topo_name}"
-        log.info(f"Topology: {topology_builder.config.topology.name}")
-        log.info(f"  Switches: {len(topology_builder.switches)}/{MAX_SWITCHES} max")
+    topology_builder, rules_dir = load_topology(args)
 
     # Initialize environment and agent
     env = QoSRoutingEnv(
@@ -2536,24 +2516,12 @@ def evaluate(args):
     )
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
 
-    # Load weights - find latest checkpoint with datetime prefix
-    # Pattern: YYYYMMDD-HHMMSS-dqn_v4_{tag}.pth or legacy dqn_v4_{tag}.pth
-    pattern = os.path.join(args.save_dir, f"*-dqn_v4_{args.weights_tag}.pth")
-    matching_files = sorted(glob.glob(pattern), reverse=True)
-
-    if matching_files:
-        # Use the latest (most recent) checkpoint
-        weights_path = matching_files[0]
-        log.info(f"Using latest checkpoint: {os.path.basename(weights_path)}")
-    else:
-        # Fallback to legacy naming without timestamp
-        weights_path = os.path.join(args.save_dir, f"dqn_v4_{args.weights_tag}.pth")
-        if not os.path.exists(weights_path):
-            log.error(f"Weights file not found: {weights_path}")
-            log.error(f"Pattern searched: {pattern}")
-            return
-        log.info(f"Using legacy checkpoint: {os.path.basename(weights_path)}")
-
+    # Load weights - find latest checkpoint with datetime prefix or fallback to legacy
+    weights_path = resolve_checkpoint_path(args.save_dir, args.weights_tag)
+    if not weights_path:
+        log.error(f"Weights file not found for tag: {args.weights_tag}")
+        return
+    log.info(f"Using checkpoint: {os.path.basename(weights_path)}")
     agent.load(weights_path)
     agent.eps = 0.0  # No exploration during evaluation
     
@@ -2575,23 +2543,10 @@ def evaluate(args):
             sla_met_total += len(info['sla_met'])
             sla_checks += len(QIDS)
             
-            if action == 0:
-                action_name = "noop"
-            elif action in (1, 2):
-                action_name = f"voice-{action-1}"
-            elif action in (3, 4):
-                action_name = f"video-{action-3}"
-            elif action in (5, 6):
-                action_name = f"be-{action-5}"
-            elif action == 7:
-                action_name = "multi"
-            else:
-                action_name = str(action)
-            
             if step % args.log_every == 0:
                 log.info(
                     f"[Eval Step {step}] "
-                    f"action={action_name:6s} "
+                    f"action={action_to_name(action):6s} "
                     f"reward={reward:+.2f} "
                     f"sla_met={len(info['sla_met'])}/3"
                 )

@@ -1,107 +1,62 @@
+# =============================================
+# P4 QoS INT - Dynamic Multi-Topology Makefile
+# =============================================
+
+# Directory configuration
 PCAP_DIR   = pcap
 LOG_DIR    = log
 P4SRC_DIR  = p4src
+TOPO_DIR   = config/topologies
 
-ifndef P4SRC_FILE
-P4SRC_FILE = p4src/int_md.p4
-endif
+# Default values
+P4SRC_FILE ?= p4src/int_md.p4
+topo       ?= fat_tree_k4
+profile    ?= high_1
+CHECKPOINT ?= 50pct
+BURST      ?= bursty_be_2
 
 # =============================================
-# Topology Selection
+# Dynamic Topology Mapping
 # =============================================
-# Use: make run topo=fat_tree_k4
-# Available topologies:
-#   fat_tree_k2, fat_tree_k4
-#   leaf_spine_4x2, leaf_spine_6x3, leaf_spine_8x4
-#   three_tier_4, three_tier_6, three_tier_8
-
-# Topology name to config file mapping
-TOPO_DIR = config/topologies
-
-# Default topology if none specified
-ifndef topo
-topo = fat_tree_k4
-endif
-
-# Map short names to config files
-ifeq ($(topo),fat_tree_k2)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/fat_tree_k2.yaml
-else ifeq ($(topo),fat_tree_k4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/fat_tree_k4.yaml
-else ifeq ($(topo),fat_tree_k8)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/fat_tree_k8.yaml
-else ifeq ($(topo),leaf_spine_4x2)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_4x2.yaml
-else ifeq ($(topo),leaf_spine_6x2)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_6x2.yaml
-else ifeq ($(topo),leaf_spine_6x3)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_6x3.yaml
-else ifeq ($(topo),leaf_spine_8x2)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_8x2.yaml
-else ifeq ($(topo),leaf_spine_8x3)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_8x3.yaml
-else ifeq ($(topo),leaf_spine_8x4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_8x4.yaml
-else ifeq ($(topo),leaf_spine_10x3)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_10x3.yaml
-else ifeq ($(topo),leaf_spine_10x4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_10x4.yaml
-else ifeq ($(topo),leaf_spine_12x3)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_12x3.yaml
-else ifeq ($(topo),leaf_spine_12x4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_12x4.yaml
-else ifeq ($(topo),leaf_spine_14x4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_14x4.yaml
-else ifeq ($(topo),leaf_spine_16x4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/leaf_spine_16x4.yaml
-else ifeq ($(topo),three_tier_4)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/three_tier_4.yaml
-else ifeq ($(topo),three_tier_6)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/three_tier_6.yaml
-else ifeq ($(topo),three_tier_8)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/three_tier_8.yaml
-else ifeq ($(topo),three_tier)
-TOPOLOGY_CONFIG = $(TOPO_DIR)/three_tier.yaml
-else
-# Allow direct path specification
-TOPOLOGY_CONFIG = $(topo)
-endif
+# Supports both short names (fat_tree_k4) and direct paths
+TOPOLOGY_CONFIG = $(if $(wildcard $(topo)),$(topo),$(TOPO_DIR)/$(topo).yaml)
 
 # Auto-detect running topology from .active_topology file
-# This file is created by 'make run' and contains the config path
-DETECT_TOPOLOGY = $(shell cat .active_topology 2>/dev/null || echo "config/topologies/fat_tree_k4.yaml")
+DETECT_TOPOLOGY = $(shell cat .active_topology 2>/dev/null || echo "$(TOPO_DIR)/fat_tree_k4.yaml")
 
-# Controller verbose output (default: suppressed)
-ifdef VERBOSE
-VERBOSE_FLAG = --verbose
-else
-VERBOSE_FLAG =
-endif
+# =============================================
+# Flag Handling
+# =============================================
+VERBOSE_FLAG := $(if $(VERBOSE),--verbose,)
+BURSTY_FLAG  := $(if $(BURSTY),--bursty-mode --burst-profile $(BURST),)
 
-# by default: start training
+# =============================================
+# Common Command Variables
+# =============================================
+PYTHON      := python3
+SUDO_PYTHON := sudo PYTHONUNBUFFERED=1 python3 -u
+RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(VERBOSE_FLAG)
+
+# Default target
 all: train
 
 # =============================================
 # Topology Configuration and Validation
 # =============================================
 
-# Validate YAML topology configuration
 validate:
-	python3 -m config.validator $(TOPOLOGY_CONFIG)
+	$(PYTHON) -m config.validator $(TOPOLOGY_CONFIG)
 
-# Generate P4 rules from topology configuration
 rules: validate
-	python3 -m p4_rules.generator --config $(TOPOLOGY_CONFIG)
+	$(PYTHON) -m p4_rules.generator --config $(TOPOLOGY_CONFIG)
 
 # =============================================
 # Network Operations
 # =============================================
 
-# Start network with topology configuration (generates rules first)
-# Usage: make run topo=fat_tree_k4
 run: rules
 	@echo "$(TOPOLOGY_CONFIG)" > .active_topology
-	sudo python3 network.py --config $(TOPOLOGY_CONFIG) --p4 ${P4SRC_FILE}
+	sudo $(PYTHON) network.py --config $(TOPOLOGY_CONFIG) --p4 $(P4SRC_FILE)
 
 stop:
 	sudo mn -c
@@ -114,52 +69,37 @@ clean: stop
 	sudo rm -f $(P4SRC_DIR)/*.p4i $(P4SRC_DIR)/*.json $(P4SRC_DIR)/*.p4info.txt
 
 # =============================================
-# INT Collector (Auto-detects topology)
+# INT Collector & Monitoring
 # =============================================
 
-# Run INT collector - auto-detects running topology
 collect:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo python3 report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY)
+	sudo $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY)
 
 monitor:
-	python3 monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
-
-# =============================================
-# Visualization (Auto-detects topology)
-# =============================================
+	$(PYTHON) monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
 
 visualize:
-	python3 visualize_routes.py --config $(DETECT_TOPOLOGY)
+	$(PYTHON) visualize_routes.py --config $(DETECT_TOPOLOGY)
 
 # =============================================
-# RL Training (Auto-detects topology)
+# RL Training
 # =============================================
 
-# Single topology training (default)
-# Steps: 40K (matches EPS_DECAY_STEPS)
-# Traffic weights: 10% light, 10% medium, 45% high, 35% bursty (rebalanced for more stationary training)
-# Note: With 100ms INT sampling (reduced from 300ms) for better data quality
 train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 50000 \
-		--config $(DETECT_TOPOLOGY) \
-		--traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35" \
-		--log-every 1 $(VERBOSE_FLAG)
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 50000 \
+		$(RL_COMMON) --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
 
-# Quick training test - runs 1 episode per training profile
-# Auto-detects the running network topology
 train_test:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "=== Testing all training profiles (1 episode each) ==="
 	@for profile in bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
 		echo ""; \
 		echo "=== Testing profile: $$profile ==="; \
-		if ! sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train \
-			--config $(DETECT_TOPOLOGY) \
+		if ! $(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
 			--steps 100 --max-episode-steps 100 --no-warm-start \
-			--traffic-profile $$profile \
-			--log-every 1 $(VERBOSE_FLAG); then \
+			--traffic-profile $$profile; then \
 			echo "Training interrupted or failed."; \
 			ret=$$?; \
 			if [ $$ret -eq 130 ]; then \
@@ -173,95 +113,52 @@ train_test:
 	@echo ""
 	@echo "=== All profile tests completed ==="
 
-# Resume RL agent v4 training from checkpoint
-ifndef CHECKPOINT
-CHECKPOINT = 50pct
-endif
 resume:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 \
-		--config $(DETECT_TOPOLOGY) \
-		--resume $(CHECKPOINT) --resume-eps 0.10 \
-		--traffic-weights "light:0.05,medium:0.05,high:0.35,bursty:0.55" \
-		--log-every 1 $(VERBOSE_FLAG)
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 10000 \
+		$(RL_COMMON) --resume $(CHECKPOINT) --resume-eps 0.10 \
+		--traffic-weights "light:0.05,medium:0.05,high:0.35,bursty:0.55"
 
 # =============================================
-# RL Evaluation (Auto-detects topology)
+# RL Evaluation
 # =============================================
+
+TEST_COMMON = PYTHONUNBUFFERED=1 $(PYTHON) -u rl_agent_4.py --mode eval $(RL_COMMON) --steps 1500
 
 test:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval \
-		--config $(DETECT_TOPOLOGY) \
-		--steps 1500 --weights-tag final $(VERBOSE_FLAG) --log-every 1
+	$(TEST_COMMON) --weights-tag final
 
 test_best:
-	PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode eval \
-		--config $(DETECT_TOPOLOGY) \
-		--steps 1500 --weights-tag best $(VERBOSE_FLAG) --log-every 1
+	$(TEST_COMMON) --weights-tag best
 
 # =============================================
 # Traffic Testing
 # =============================================
 
-# Test a specific traffic profile
-# Usage: make test_traffic profile=high_1
-# Available profiles: light_1, light_2, medium_1, medium_2, high_1, high_2,
-#                     bursty_vo_1, bursty_vo_2, bursty_vi_1, bursty_vi_2,
-#                     bursty_be_1, bursty_be_2
-ifndef profile
-profile = medium_1
-endif
-
 test_traffic:
 	@echo "Testing traffic profile: $(profile)"
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train \
-		--config $(DETECT_TOPOLOGY) \
+	$(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
 		--steps 200 --max-episode-steps 200 --no-warm-start \
-		--traffic-profile $(profile) \
-		--log-every 1 $(VERBOSE_FLAG)
+		--traffic-profile $(profile)
 
 # =============================================
-# Production Mode (Auto-detects topology)
+# Production Mode
 # =============================================
 
-# Usage:
-#   make production profile=high_2           (with best model)
-#   make production profile=medium_2 BURSTY=1 BURST=bursty_be_2
-ifndef profile
-profile = high_1
-endif
+PROD_COMMON = $(SUDO_PYTHON) rl_production.py $(RL_COMMON) \
+	--generate-traffic --traffic-profile $(profile) $(BURSTY_FLAG)
 
-ifndef BURST
-BURST = bursty_be_2
-endif
-
-ifdef BURSTY
-BURSTY_FLAG = --bursty-mode --burst-profile $(BURST)
-else
-BURSTY_FLAG =
-endif
-
-# Production with best model (default)
 production:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag best \
-		--config $(DETECT_TOPOLOGY) \
-		--generate-traffic --traffic-profile $(profile) \
-		--log-every 1 $(VERBOSE_FLAG) $(BURSTY_FLAG)
+	$(PROD_COMMON) --weights-tag best
 
 production_best: production
 
 production_final:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag final \
-		--config $(DETECT_TOPOLOGY) \
-		--generate-traffic --traffic-profile $(profile) \
-		--log-every 1 $(VERBOSE_FLAG) $(BURSTY_FLAG)
+	$(PROD_COMMON) --weights-tag final
 
 production_75pct:
-	sudo PYTHONUNBUFFERED=1 python3 -u rl_production.py --weights-tag 75pct \
-		--config $(DETECT_TOPOLOGY) \
-		--generate-traffic --traffic-profile $(profile) \
-		--log-every 1 $(VERBOSE_FLAG) $(BURSTY_FLAG)
+	$(PROD_COMMON) --weights-tag 75pct
 
 # =============================================
 # Help
@@ -276,30 +173,10 @@ help:
 	@echo "  make clean                Clean up all files"
 	@echo ""
 	@echo "Available topologies for 'topo=':"
-	@echo ""
-	@echo "  Fat-Tree Topologies:"
-	@echo "    fat_tree_k2             Fat-Tree k=2 (5 switches, 4 hosts)"
-	@echo "    fat_tree_k4             Fat-Tree k=4 (20 switches, 16 hosts) [default]"
-	@echo "    fat_tree_k8             Fat-Tree k=8 (80 switches, 64 hosts)"
-	@echo ""
-	@echo "  Leaf-Spine Topologies:"
-	@echo "    leaf_spine_4x2          4 leaves × 2 spines (6 sw, 8 hosts)"
-	@echo "    leaf_spine_6x2          6 leaves × 2 spines (8 sw, 12 hosts)"
-	@echo "    leaf_spine_6x3          6 leaves × 3 spines (9 sw, 12 hosts)"
-	@echo "    leaf_spine_8x2          8 leaves × 2 spines (10 sw, 16 hosts)"
-	@echo "    leaf_spine_8x3          8 leaves × 3 spines (11 sw, 16 hosts)"
-	@echo "    leaf_spine_8x4          8 leaves × 4 spines (12 sw, 16 hosts)"
-	@echo "    leaf_spine_10x3         10 leaves × 3 spines (13 sw, 20 hosts)"
-	@echo "    leaf_spine_10x4         10 leaves × 4 spines (14 sw, 20 hosts)"
-	@echo "    leaf_spine_12x3         12 leaves × 3 spines (15 sw, 24 hosts)"
-	@echo "    leaf_spine_12x4         12 leaves × 4 spines (16 sw, 24 hosts)"
-	@echo "    leaf_spine_14x4         14 leaves × 4 spines (18 sw, 28 hosts)"
-	@echo "    leaf_spine_16x4         16 leaves × 4 spines (20 sw, 32 hosts)"
-	@echo ""
-	@echo "  Three-Tier Topologies:"
-	@echo "    three_tier_4            4 access switches (8 hosts)"
-	@echo "    three_tier_6            6 access switches (12 hosts)"
-	@echo "    three_tier_8            8 access switches (16 hosts)"
+	@echo "  Fat-Tree:    fat_tree_k2, fat_tree_k4 [default], fat_tree_k8"
+	@echo "  Leaf-Spine:  leaf_spine_{4,6,8,10,12,14,16}x{2,3,4}"
+	@echo "               (e.g., leaf_spine_6x3 = 6 leaves x 3 spines)"
+	@echo "  Three-Tier:  three_tier_4, three_tier_6, three_tier_8"
 	@echo ""
 	@echo "Training/Evaluation (auto-detect running topology):"
 	@echo "  make train                Train RL agent on running network"
@@ -310,9 +187,8 @@ help:
 	@echo ""
 	@echo "Traffic Testing (auto-detect running topology):"
 	@echo "  make test_traffic profile=<name>   Test specific traffic profile"
-	@echo "  Profiles: light_1, light_2, medium_1, medium_2, high_1, high_2,"
-	@echo "            bursty_vo_1, bursty_vo_2, bursty_vi_1, bursty_vi_2,"
-	@echo "            bursty_be_1, bursty_be_2"
+	@echo "  Profiles: light_{1,2}, medium_{1,2}, high_{1,2},"
+	@echo "            bursty_{vo,vi,be}_{1,2}"
 	@echo ""
 	@echo "Production Mode (auto-detect running topology):"
 	@echo "  make production profile=<name>              Run with best model"
@@ -329,3 +205,7 @@ help:
 	@echo "  make train                           # auto-detects running topology"
 	@echo "  make test_traffic profile=high_2     # test specific traffic profile"
 	@echo "  make production profile=bursty_be_1  # production with traffic profile"
+
+.PHONY: all validate rules run stop clean collect monitor visualize \
+        train train_test resume test test_best test_traffic \
+        production production_best production_final production_75pct help
