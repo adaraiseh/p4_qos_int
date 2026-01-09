@@ -19,9 +19,9 @@ from collector import *
 # Add parent directory for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-INFLUX_URL = "http://192.168.201.1:8086"
-INFLUX_TOKEN = "0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w=="
-INFLUX_ORG = "research"
+INFLUX_URL = "http://192.168.56.1:8086"
+INFLUX_TOKEN = "4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw=="
+INFLUX_ORG = "Research"
 INFLUX_BUCKET = "INT"
 
 # Default interfaces (legacy Fat-Tree topology with 4 ToR switches)

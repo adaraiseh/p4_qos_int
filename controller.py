@@ -4,6 +4,8 @@ import re
 import json
 import glob
 import os
+import threading
+from collections import deque
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from ipaddress import ip_network
@@ -26,6 +28,9 @@ class Controller:
     # Role normalization: core switches
     CORE_ROLES = {'core'}
 
+    # Change history depth limit to prevent unbounded memory growth
+    MAX_HISTORY_DEPTH = 10  # Max changes per queue to store for rollback
+
     def __init__(self, verbose: bool = False, topology_builder=None, rules_dir: str = None):
         """
         Initialize the controller.
@@ -37,6 +42,9 @@ class Controller:
             rules_dir: Directory containing P4 rules files (default: rules/test)
         """
         self.verbose = verbose
+        # Thread safety: RLock allows same thread to acquire multiple times (for nested calls)
+        self._lock = threading.RLock()
+
         self.topo = load_topo("topology.json")
         self.controllers = {}
         self.forwarding_entries = {}
@@ -79,13 +87,15 @@ class Controller:
             hip = self.topo.get_host_ip(hname).split('/')[0]
             self.ip_to_host[hip] = hname
 
-        # Per-queue change history stacks
+        # Per-queue change history stacks - bounded to prevent memory growth
+        # Each queue gets its own deque with max depth
         self.change_history_by_qid = {}
 
         # Usage tracking for alternatives
         self.switch_usage = {}
         self.queue_changes = {0: 0, 1: 0, 7: 0}
         self.queue_last_change_step = {0: 0, 1: 0, 7: 0}
+        self.loop_detection_events = 0
 
         # Per-queue path tracking
         self.paths_per_queue = {0: {}, 1: {}, 7: {}}
@@ -95,6 +105,34 @@ class Controller:
         self.compute_forwarding_entries()
         self.program_switches()
         self.dump_paths_json()
+
+    def cleanup(self) -> None:
+        """
+        Clean up controller resources.
+
+        Closes Thrift connections to all P4 switches.
+        Critical for multi-topology training to prevent connection leaks.
+        """
+        with self._lock:
+            for sw_name, controller in self.controllers.items():
+                try:
+                    # SimpleSwitchThriftAPI uses Thrift client internally
+                    # Close the transport if available
+                    if hasattr(controller, 'client') and hasattr(controller.client, '_iprot'):
+                        if hasattr(controller.client._iprot.trans, 'close'):
+                            controller.client._iprot.trans.close()
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[WARNING] Error closing connection to {sw_name}: {e}")
+
+    def __enter__(self):
+        """Context manager support for automatic cleanup."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager cleanup."""
+        self.cleanup()
+        return False
 
     def _normalize_role(self, role: str) -> str:
         """
@@ -241,6 +279,11 @@ class Controller:
                         self.forwarding_entries[sw_name]['lpm'][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
 
     def program_switches(self):
+        with self._lock:
+            self._program_switches_unlocked()
+
+    def _program_switches_unlocked(self):
+        """Internal implementation without locking (for use within locked contexts)."""
         for sw_name, tables in self.forwarding_entries.items():
             controller = self.controllers[sw_name]
             for next_hop_ip, next_hop_mac in tables['switching'].items():
@@ -271,22 +314,23 @@ class Controller:
 
     def clear_all_tables(self):
         """Clear all P4 tables on all switches and reset internal state."""
-        for sw_name, controller in self.controllers.items():
-            try:
-                self._call(controller.table_clear, "l3_forward.ipv4_lpm")
-                self._call(controller.table_clear, "port_forward.switching_table")
-                self._call(controller.table_clear, "port_forward.mac_rewriting_table")
-            except Exception as e:
-                print(f"[WARN] Failed to clear tables on {sw_name}: {e}")
+        with self._lock:
+            for sw_name, controller in self.controllers.items():
+                try:
+                    self._call(controller.table_clear, "l3_forward.ipv4_lpm")
+                    self._call(controller.table_clear, "port_forward.switching_table")
+                    self._call(controller.table_clear, "port_forward.mac_rewriting_table")
+                except Exception as e:
+                    print(f"[WARN] Failed to clear tables on {sw_name}: {e}")
 
-        self.forwarding_entries.clear()
-        self.change_history_by_qid.clear()
-        self.switch_usage.clear()
-        self.queue_changes = {0: 0, 1: 0, 7: 0}
-        self.queue_last_change_step = {0: 0, 1: 0, 7: 0}
+            self.forwarding_entries.clear()
+            self.change_history_by_qid.clear()
+            self.switch_usage.clear()
+            self.queue_changes = {0: 0, 1: 0, 7: 0}
+            self.queue_last_change_step = {0: 0, 1: 0, 7: 0}
 
-        for qid in self.paths_per_queue:
-            self.paths_per_queue[qid].clear()
+            for qid in self.paths_per_queue:
+                self.paths_per_queue[qid].clear()
 
     # -----------------------
     # Table/aux helpers
@@ -508,6 +552,11 @@ class Controller:
         from source to destination in a graph view EXCLUDING the bottleneck.
         This supports both local stitching (c1 -> c2) and global rerouting (c1 -> a2 -> c3 -> a4).
         """
+        with self._lock:
+            return self._find_all_alternates_unlocked(worst_switch_id, path)
+
+    def _find_all_alternates_unlocked(self, worst_switch_id: int, path: list[str]) -> list[str]:
+        """Internal implementation without locking."""
         worst_name = self.switch_id_to_name.get(int(worst_switch_id))
         if not worst_name:
             return []
@@ -802,15 +851,14 @@ class Controller:
 
     def revert_last_change(self) -> bool:
         latest_q = None
-        latest_idx = -1
         for q, stack in self.change_history_by_qid.items():
             if stack:
                 if latest_q is None or id(stack[-1]) > id(self.change_history_by_qid[latest_q][-1]):
                     latest_q = q
-                    latest_idx = len(stack) - 1
         if latest_q is None:
             return False
-        change = self.change_history_by_qid[latest_q].pop(latest_idx)
+        # Pop from deque (always pops last item)
+        change = self.change_history_by_qid[latest_q].pop()
         return self._revert_change_object(change)
 
     # -----------------------
@@ -831,18 +879,79 @@ class Controller:
     def _neighbor_iface_ip(self, neighbor: str, myself: str) -> str:
         return self.topo.node_to_node_interface_ip(neighbor, myself).split('/')[0]
 
+    def _detect_routing_loop(self, path: list[str]) -> tuple[bool, str]:
+        """
+        Detect if a path contains a routing loop (directed cycle).
+
+        A routing loop exists if the directed edge sequence contains a cycle,
+        meaning packets could circulate indefinitely. Node revisits are OK
+        if edges differ (e.g., a1→c1 then a3→c1 - same node, different ingress).
+
+        The key insight: A routing loop exists if and only if the same directed
+        edge appears twice in the path. A path like [c1, a3, c1] is NOT a loop
+        because the edges are c1→a3 and a3→c1 (different). But [a1, c1, a1]
+        contains edges a1→c1 and c1→a1, which together form a cycle.
+
+        However, we need to distinguish between:
+        - [a1, c1, a1]: edges (a1,c1) and (c1,a1) - this IS a loop (2-cycle)
+        - [c1, a3, c1, a7]: edges (c1,a3), (a3,c1), (c1,a7) - NOT a loop
+          (just passing through c1 twice)
+
+        Args:
+            path: List of node names forming the path
+
+        Returns:
+            (has_loop: bool, diagnostic_msg: str)
+        """
+        if not path or len(path) < 2:
+            return False, ""
+
+        # Fast path: If no node appears twice, impossible to have a cycle
+        if len(path) == len(set(path)):
+            return False, ""
+
+        # Check for two types of loops:
+        # 1. Self-loops: node connects to itself
+        # 2. Duplicate edges: same directed edge appears twice
+        edges_seen = {}  # edge -> first occurrence position
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+
+            # Check for self-loop
+            if u == v:
+                return True, f"Loop detected: {u} -> {u} (self-loop)"
+
+            # Check for duplicate edge
+            edge = (u, v)
+            if edge in edges_seen:
+                # Same directed edge appears twice - this is a loop!
+                first_pos = edges_seen[edge]
+                loop_path = path[first_pos:i+2]
+                return True, f"Loop detected: {' -> '.join(loop_path)} (duplicate edge)"
+            edges_seen[edge] = i
+
+        return False, ""
+
     def reroute_one_demand_symmetric(self, src_ip: str, dst_ip: str, qid: int,
                                  worst_switch_id: int, alt_switch_name: str):
         """
         Install per-demand (/32) overlays for (src_ip,dst_ip) within DSCP of 'qid'
         along the entire new path where 'worst' is replaced by 'alt'.
-        
+
+        Thread-safe wrapper that acquires lock before calling internal implementation.
+
         Strategy: A Hybrid Rerouting Approach
         1. Try simple local swap (stitching) first to preserve max path structure.
         2. If invalid, fall back to "Sticky Routing": shortest path calculation
            on a graph where original path edges are hyper-preferred (weight=0.01).
         3. Enforce strict symmetry for the return path.
         """
+        with self._lock:
+            return self._reroute_one_demand_symmetric_unlocked(src_ip, dst_ip, qid, worst_switch_id, alt_switch_name)
+
+    def _reroute_one_demand_symmetric_unlocked(self, src_ip: str, dst_ip: str, qid: int,
+                                 worst_switch_id: int, alt_switch_name: str):
+        """Internal implementation without locking."""
         dscp = self._dscp_for_qid(qid)
         worst_name = self.switch_id_to_name.get(int(worst_switch_id))
         if not worst_name:
@@ -906,10 +1015,25 @@ class Controller:
                 # Merge (slice p2 to avoid duplicating alt node)
                 fwd_new_path = p1 + p2[1:]
 
-                # Validate no loops in merged path (p1 and p2 could share intermediate nodes)
-                if len(fwd_new_path) != len(set(fwd_new_path)):
-                    return False, "merged path contains loop"
+                # Validate no routing loops in merged path
+                has_loop, loop_msg = self._detect_routing_loop(fwd_new_path)
+                if has_loop:
+                    self.loop_detection_events += 1
+                    if self.verbose:
+                        print("=" * 60)
+                        print("ROUTING LOOP DETECTED")
+                        print("=" * 60)
+                        print(f"Source: {src_host}, Destination: {dst_host}")
+                        print(f"Bottleneck: {worst_name}, Alternative: {alt_switch_name}")
+                        print(f"\nP1 (src → alt): {' -> '.join(p1)}")
+                        print(f"P2 (alt → dst): {' -> '.join(p2)}")
+                        print(f"Merged path:    {' -> '.join(fwd_new_path)}")
+                        print(f"\n{loop_msg}")
+                        print("=" * 60)
+                    return False, f"merged path contains routing loop: {loop_msg}"
 
+                if self.verbose:
+                    print(f"Sticky fallback path found: {' -> '.join(fwd_new_path)}")
             except nx.NetworkXNoPath:
                 return False, f"no physical path found via {alt_switch_name} (sticky fallback failed)"
 
@@ -987,20 +1111,41 @@ class Controller:
              if not fwd_changes and not rev_changes:
                 return False, "failed to install overlays"
 
-        # Update Path Maps
-        self.path_map[(src_host, dst_host)] = fwd_new_path
-        self.path_map[(dst_host, src_host)] = rev_new_path
-        
-        self.paths_per_queue[int(qid)][(src_host, dst_host)] = fwd_new_path
-        self.paths_per_queue[int(qid)][(dst_host, src_host)] = rev_new_path
+        # Update Path Maps (atomic transaction with rollback on failure)
+        # Save old values for potential rollback
+        old_path_map_fwd = self.path_map.get((src_host, dst_host))
+        old_path_map_rev = self.path_map.get((dst_host, src_host))
+        old_queue_path_fwd = self.paths_per_queue[int(qid)].get((src_host, dst_host))
+        old_queue_path_rev = self.paths_per_queue[int(qid)].get((dst_host, src_host))
 
-        # Record History for Revert
+        try:
+            # Apply all updates atomically
+            self.path_map[(src_host, dst_host)] = fwd_new_path
+            self.path_map[(dst_host, src_host)] = rev_new_path
+            self.paths_per_queue[int(qid)][(src_host, dst_host)] = fwd_new_path
+            self.paths_per_queue[int(qid)][(dst_host, src_host)] = rev_new_path
+        except Exception as e:
+            # Rollback on any exception
+            if old_path_map_fwd is not None:
+                self.path_map[(src_host, dst_host)] = old_path_map_fwd
+            if old_path_map_rev is not None:
+                self.path_map[(dst_host, src_host)] = old_path_map_rev
+            if old_queue_path_fwd is not None:
+                self.paths_per_queue[int(qid)][(src_host, dst_host)] = old_queue_path_fwd
+            if old_queue_path_rev is not None:
+                self.paths_per_queue[int(qid)][(dst_host, src_host)] = old_queue_path_rev
+            return False, f"Path update failed: {e}"
+
+        # Record History for Revert (bounded deque to prevent memory growth)
         rec = {
             "qid": int(qid),
             "fwd": {"old_path": path_fwd_orig, "new_path": fwd_new_path, "overlays": fwd_changes or []},
             "rev": {"old_path": path_rev_orig, "new_path": rev_new_path, "overlays": rev_changes or []},
         }
-        self.change_history_by_qid.setdefault(int(qid), []).append(rec)
+        # Initialize deque with maxlen if not exists, then append
+        if int(qid) not in self.change_history_by_qid:
+            self.change_history_by_qid[int(qid)] = deque(maxlen=self.MAX_HISTORY_DEPTH)
+        self.change_history_by_qid[int(qid)].append(rec)
         self.dump_paths_json()
 
         return True, "ok"

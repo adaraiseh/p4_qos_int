@@ -309,6 +309,28 @@ class NetworkBuilder:
         """Get host name to IP mapping for traffic generation."""
         return self.builder.get_host_ips()
 
+    def cleanup(self) -> None:
+        """
+        Clean up network resources.
+
+        Stops the Mininet network and releases associated resources.
+        Critical for multi-topology training to prevent resource leaks.
+        """
+        if self.net is not None:
+            try:
+                self.net.stopNetwork()
+            except Exception as e:
+                print(f"[WARNING] Error stopping network: {e}")
+
+    def __enter__(self):
+        """Context manager support for automatic cleanup."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager cleanup."""
+        self.cleanup()
+        return False
+
 
 def config_network(config_path: str, rules_dir: str = None) -> tuple[NetworkAPI, TopologyBuilder]:
     """

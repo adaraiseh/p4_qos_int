@@ -34,7 +34,7 @@ switch_defaults:
 
 link_bandwidths:
   host_leaf: 10      # Host-ToR: 10 Mbps
-  leaf_spine: 5      # ToR-Agg: 5 Mbps (bottleneck)
+  leaf_spine: 10      # ToR-Agg: 10 Mbps
   spine_core: 10     # Agg-Core: 10 Mbps
   host_access: 10
   access_distribution: 5
@@ -70,6 +70,7 @@ traffic:
     - {src: h3, dst: h8}
     - {src: h3, dst: h12}
     - {src: h3, dst: h16}
+
     # Pod2 senders -> other pods
     - {src: h5, dst: h2}
     - {src: h5, dst: h10}
@@ -77,6 +78,7 @@ traffic:
     - {src: h7, dst: h4}
     - {src: h7, dst: h12}
     - {src: h7, dst: h16}
+
     # Pod3 senders -> other pods
     - {src: h9, dst: h2}
     - {src: h9, dst: h6}
@@ -84,6 +86,7 @@ traffic:
     - {src: h11, dst: h4}
     - {src: h11, dst: h8}
     - {src: h11, dst: h16}
+
     # Pod4 senders -> other pods
     - {src: h13, dst: h2}
     - {src: h13, dst: h6}

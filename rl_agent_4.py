@@ -109,14 +109,14 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 # =============================================================================
 # Network
 HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
-RAW_STATE_DIM = 50      # 3×16 + 2: per-queue features + max_pressure + steps_since_action
+RAW_STATE_DIM = 52      # INCREASED from 50 to 52: 3×16 + 2 + 2 (added topology encoding: is_fat_tree, is_leaf_spine)
 STACK_SIZE = 16         # Extended for burst detection (~32s history at ~2s/step)
-STACK_DECAY = 0.95      # Exponential decay: older frames weighted less (oldest ~46% of newest)
+STACK_DECAY = 0.85      # SHARPENED from 0.95 to 0.85 - reduces weight of stale data (oldest ~8% vs 46%)
 ACTION_DIM = 8          # No-op + 6 single (3 queues × 2 alts) + 1 multi
 # State composition: stacked observations + stacked one-hot actions
-# Observations: 50 metrics * 16 frames = 800
+# Observations: 52 metrics * 16 frames = 832
 # Actions: 8 (one-hot) * 16 frames = 128
-# Total: 800 + 128 = 928
+# Total: 832 + 128 = 960
 STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
 
 # Temporal smoothing
@@ -138,7 +138,7 @@ PER_BETA_STEPS = 25_000  # Anneal to 1.0 by ~50% of 50K training
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 30_000  # Decay over 60% of 50K training for thorough exploration
+EPS_DECAY_STEPS = 40_000  # Decay over 80% of 50K training for thorough exploration
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
@@ -149,12 +149,13 @@ EWC_FISHER_SAMPLES = 200  # Samples for Fisher matrix estimation
 
 # Environment timing - tuned for faster training with acceptable data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
-# Formula: DELAY_AFTER_ACTION >= WINDOW + SAFETY_LAG/1000 + first_change + margin
-WINDOW_SECONDS = 1.0        # Observation window (reduced from 1.5)
-SAFETY_LAG_MS = 100         # 100ms safety lag for InfluxDB
+# Formula: DELAY_AFTER_ACTION >= WINDOW + first_change + INT_sample_period
+# With 100ms INT sampling: 1.0s window ensures ~10 samples captured
+WINDOW_SECONDS = 1.0        # Observation window
+SAFETY_LAG_MS = 0           # REMOVED: No safety lag (user constraint: minimize delay)
 COOLDOWN_SECONDS = 0.0      # No cooldown for faster learning
-DELAY_AFTER_ACTION = 0.8    # Wait after action (reduced from 1.5s - data available after ~500ms)
-DELAY_NO_ACTION = 0.8       # Match action delay
+DELAY_AFTER_ACTION = 1.0    # INCREASED from 0.8s to 1.0s (user max, ensures action effects visible)
+DELAY_NO_ACTION = 1.0       # Match action delay
 
 # Freshness validation - minimum data points required per metric in window
 MIN_POINTS_PER_METRIC = 1   # Require at least 1 point (2 is too strict)
@@ -177,9 +178,9 @@ UTIL_CAP = 100.0  # percentage
 LAT_RATIO_CAP = 3.0  # Cap latency ratio at 3x SLA (prevents instability)
 LAT_DIFF_CAP = 2.0   # Cap lat difference features to [-2, +2]
 
-# Reward weights - TUNED to prevent tanh saturation
-REWARD_SLA_MET_SCALE = 0.5         # Reduced from 1.0
-REWARD_SLA_VIOLATED_SCALE = 0.1     # Reduced from 0.8
+# Reward weights - TUNED to prevent tanh saturation and balance incentives
+REWARD_SLA_MET_SCALE = 0.5         # Positive reward for meeting SLA
+REWARD_SLA_VIOLATED_SCALE = 0.35    # INCREASED from 0.1 to 0.35 - violations must be penalized adequately
 REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
 
 # Queue-specific action cost (replaces pressure-based approach)
@@ -190,7 +191,7 @@ REWARD_ACTION_COST_HEALTHY = 0.5   # Cost when targeting a queue with SLA met (r
 REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA violated
 
 # Soft margin around SLA (reduces reward flip-flopping)
-SLA_SOFT_MARGIN = 0.2  # 20% buffer zone - ignore measurement jitter
+SLA_SOFT_MARGIN = 0.1  # REDUCED from 0.2 to 0.1 (10%) - tighter margin provides stronger training signal
 
 # =============================================================================
 #                        PRIORITIZED REPLAY BUFFER
@@ -830,18 +831,20 @@ class QoSRoutingEnv:
     def __init__(self, bucket: str, token: str, org: str, url: str,
                  verbose: bool = False, reset_network: bool = True,
                  production_mode: bool = False, topology_builder=None,
-                 rules_dir: str = None):
+                 rules_dir: str = None, config_path: str = None):
         self.bucket = bucket
         self.org = org
         self.url = url
-        
+
         # InfluxDB client
-        self.client = InfluxDBClient(url=url, token=token, org=org, timeout=5000)
+        # PHASE 2.4: Reduced timeout from 5000ms to 2000ms for faster failure detection
+        self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
         self.query_api = self.client.query_api()
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
 
         # Store topology builder for reference
         self._topology_builder = topology_builder
+        self._config_path = config_path
 
         # Controller for routing changes
         # Pass topology_builder for dynamic role detection if available
@@ -889,7 +892,7 @@ class QoSRoutingEnv:
         
         # Traffic manager for dynamic profile changes (training only)
         # In production_mode, traffic is managed externally by ProductionRunner
-        self.traffic_manager = TrafficManager() if (reset_network and not production_mode) else None
+        self.traffic_manager = TrafficManager(config_path=self._config_path) if (reset_network and not production_mode) else None
         
         # Current traffic profile for logging
         self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", "bursty_be_1"
@@ -984,7 +987,67 @@ class QoSRoutingEnv:
             self.action_stack.append(noop_onehot.copy())
         
         return self._build_stacked_state()
-    
+
+    def clear_stacks(self):
+        """Clear frame and action stacks without full environment reset.
+
+        PHASE 2.3: Used when detecting model reload in production to prevent
+        stale historical frames/actions from contaminating new model's state.
+
+        This method:
+        1. Collects fresh snapshot from current network state
+        2. Rebuilds frame_stack with current observation replicated
+        3. Resets action_stack to no-ops
+
+        Call this when you detect a new model has been loaded in production.
+        """
+        log.info("[STACK CLEAR] Clearing frame and action stacks for model reload")
+
+        # Collect fresh snapshot
+        snapshot = self._collect_snapshot()
+        raw_state = self._build_raw_state(snapshot)
+
+        # Clear and reinitialize frame stack with current observation
+        self.frame_stack.clear()
+        for _ in range(STACK_SIZE):
+            self.frame_stack.append(raw_state.copy())
+
+        # Clear and reinitialize action stack with no-ops
+        noop_onehot = self._action_to_onehot(0)
+        self.action_stack.clear()
+        for _ in range(STACK_SIZE):
+            self.action_stack.append(noop_onehot.copy())
+
+        log.info("[STACK CLEAR] Stacks cleared - frame and action history reset")
+
+    def _influx_query_with_retry(self, flux: str, max_retries: int = 3) -> Optional[list]:
+        """Execute InfluxDB query with exponential backoff retry.
+
+        PHASE 2.4: Add retry logic with exponential backoff to handle transient failures.
+        With 2s timeout, retries at 100ms, 200ms, 400ms give fast recovery.
+
+        Args:
+            flux: Flux query string
+            max_retries: Maximum number of retry attempts (default: 3)
+
+        Returns:
+            Query result tables, or None if all retries failed
+        """
+        backoff_delays = [0.1, 0.2, 0.4]  # 100ms, 200ms, 400ms
+
+        for attempt in range(max_retries):
+            try:
+                return self.query_api.query(org=self.org, query=flux)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = backoff_delays[attempt]
+                    log.warning(f"Query failed (attempt {attempt + 1}/{max_retries}), "
+                              f"retrying in {delay*1000:.0f}ms: {e}")
+                    time.sleep(delay)
+                else:
+                    log.error(f"Query failed after {max_retries} attempts: {e}")
+                    return None
+
     def _time_window(self) -> Tuple[str, str]:
         """Get time window for queries."""
         stop_dt = datetime.utcnow() - timedelta(milliseconds=SAFETY_LAG_MS)
@@ -1054,10 +1117,11 @@ class QoSRoutingEnv:
         
         # Track which metrics were received per queue
         metrics_received = {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS}
-        
-        try:
-            tables = self.query_api.query(org=self.org, query=flux)
-            for table in tables or []:
+
+        # PHASE 2.4: Use retry wrapper for query
+        tables = self._influx_query_with_retry(flux)
+        if tables is not None:
+            for table in tables:
                 for record in table.records:
                     try:
                         qid = int(record.values.get('queue_id', -1))
@@ -1076,8 +1140,6 @@ class QoSRoutingEnv:
                                 metrics_received[qid]['util'] = True
                     except (ValueError, TypeError):
                         continue
-        except Exception as e:
-            log.warning(f"Failed to query metrics: {e}")
         
         # Batch Query: Freshness (One query for all queues)
         freshness_map = self._check_all_queues_freshness()
@@ -1266,11 +1328,12 @@ class QoSRoutingEnv:
             |> group(columns:["switch_id"])
             |> pivot(rowKey:["switch_id"], columnKey:["_measurement"], valueColumn:"_value")
         '''
-        
+
         results = {}
-        try:
-            tables = self.query_api.query(org=self.org, query=flux)
-            for table in tables or []:
+        # PHASE 2.4: Use retry wrapper for query
+        tables = self._influx_query_with_retry(flux)
+        if tables is not None:
+            for table in tables:
                 for record in table.records:
                     sid = int(record.values.get('switch_id', 0) or 0)
                     results[sid] = {
@@ -1278,9 +1341,7 @@ class QoSRoutingEnv:
                         'lat': float(record.values.get('switch_latency', 0) or 0),
                         'util': float(record.values.get('tx_utilization', 0) or 0),
                     }
-        except Exception as e:
-            log.debug(f"Failed to query switch metrics for queue {qid}: {e}")
-            
+
         return results
     
     def _check_all_queues_freshness(self) -> Dict[int, bool]:
@@ -1303,24 +1364,22 @@ class QoSRoutingEnv:
         # Initialize counts: qid -> measurement -> count
         counts = {qid: {'flow_latency': 0, 'q_drop_rate_100ms': 0, 'tx_utilization': 0} for qid in QIDS}
         freshness_map = {qid: False for qid in QIDS}
-        
-        try:
-            tables = self.query_api.query(org=self.org, query=flux)
-            for table in tables or []:
+
+        # PHASE 2.4: Use retry wrapper for query
+        tables = self._influx_query_with_retry(flux)
+        if tables is not None:
+            for table in tables:
                 for record in table.records:
                     try:
                         qid = int(record.values.get('queue_id', -1))
                         measurement = record.values.get('_measurement')
                         count = record.get_value()
-                        
+
                         if qid in counts and measurement in counts[qid] and count is not None:
                             counts[qid][measurement] = int(count)
                     except (ValueError, TypeError):
                         continue
-        except Exception as e:
-            log.debug(f"Failed to check batch data freshness: {e}")
-            return freshness_map  # All False
-            
+
         # Check freshness per queue
         for qid in QIDS:
             c = counts[qid]
@@ -1347,9 +1406,10 @@ class QoSRoutingEnv:
             |> limit(n:1)
         '''
         results = {}
-        try:
-            tables = self.query_api.query(org=self.org, query=flux)
-            for table in tables or []:
+        # PHASE 2.4: Use retry wrapper for query
+        tables = self._influx_query_with_retry(flux)
+        if tables is not None:
+            for table in tables:
                 for record in table.records:
                     try:
                         qid = int(record.values.get('queue_id', -1))
@@ -1359,8 +1419,6 @@ class QoSRoutingEnv:
                             results[qid] = (str(src), str(dst))
                     except (ValueError, TypeError):
                         continue
-        except Exception as e:
-            log.debug(f"Failed to get batch hottest demands: {e}")
         return results
     
     def _metric_sane(self, q: Dict) -> bool:
@@ -1397,19 +1455,21 @@ class QoSRoutingEnv:
     
     def _build_raw_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Build 50-dimensional raw observation vector with relative metrics encoding.
+        Build 52-dimensional raw observation vector with relative metrics encoding.
         (Actions are stacked separately as one-hot vectors)
-        
+
         Layout per queue (16 features):
           [0-5]: Basic metrics (lat_ratio, drop_norm, util_norm, sla_met, lat_ema, lat_ema_diff)
           [6-9]: Bottleneck info (present, drop, lat, util)
           [10-15]: Alternatives 2 × 3 = 6 (available, drop_vs_bn, lat_vs_bn)
-        
-        Global (2):
+
+        Global (4):
           - Max pressure
           - Steps since last action (normalized, helps avoid rapid oscillation)
-        
-        Total: 3×16 + 2 = 50 features
+          - is_fat_tree (1.0 or 0.0)
+          - is_leaf_spine (1.0 or 0.0)
+
+        Total: 3×16 + 4 = 52 features
         """
         state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
         
@@ -1495,7 +1555,19 @@ class QoSRoutingEnv:
         # Helps agent learn to wait for effects before acting again
         steps_since = self.episode_step - getattr(self, '_last_action_step', 0)
         state[idx] = min(steps_since / 10.0, 1.0)  # Cap at 10 steps
-        
+        idx += 1
+
+        # Topology Encoding (2 features): Explicit topology type indicators
+        # This helps agent distinguish between fat-tree vs leaf-spine architectures
+        # which have different path characteristics and bottleneck patterns
+        if self._topology_builder is not None:
+            topo_type = self._topology_builder.config.topology.type.value.lower()
+            state[idx] = 1.0 if 'fat' in topo_type else 0.0  # is_fat_tree
+            state[idx+1] = 1.0 if 'leaf' in topo_type or 'spine' in topo_type else 0.0  # is_leaf_spine
+        else:
+            state[idx] = 0.0
+            state[idx+1] = 0.0
+
         return state
     
     def _action_to_onehot(self, action: int) -> np.ndarray:
@@ -1841,22 +1913,31 @@ class QoSRoutingEnv:
                 # Single-queue action: extract targeted queue ID
                 targeted_qid = mapping[0]
                 
-                # Check if targeted queue's SLA was met BEFORE the action
+                # Check targeted queue's health using TREND-BASED logic
                 # We must look at current_snapshot (pre-action), not info/next_snapshot
                 q_pre = current_snapshot[targeted_qid]
                 sla_pre = SLA_THRESHOLDS[targeted_qid]
-                
-                # Determine health using the same logic as _compute_reward margin
-                # If pre-action latency was within "safe zone" (ratio <= 1.2), it was "Healthy"
+
+                # Use latency trend (ema_diff) to determine if intervention is needed
+                # Proactive: low cost if latency trending upward (preventive action encouraged)
+                # Conservative: high cost if latency stable/improving (don't disturb)
                 ratio_pre = q_pre['lat_p95'] / sla_pre
-                margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.2
-                
-                if ratio_pre <= margin_high:
-                    # Targeting a healthy queue → high cost (risky)
-                    action_cost = REWARD_ACTION_COST_HEALTHY
-                else:
-                    # Targeting a sick queue → low cost (encouraged)
+                lat_ema_diff = q_pre.get('lat_ema_diff', 0.0)  # Normalized latency change
+                margin_high = 1.0 + SLA_SOFT_MARGIN  # 1.1 now (was 1.2)
+
+                # Decision logic:
+                # 1. If SLA violated (ratio > margin_high) → low cost (must fix)
+                # 2. If SLA met but trending bad (ema_diff > 0.05) → low cost (preventive)
+                # 3. If SLA met and stable/improving → high cost (don't disturb)
+                if ratio_pre > margin_high:
+                    # Violated: must fix
                     action_cost = REWARD_ACTION_COST_SICK
+                elif lat_ema_diff > 0.05:  # Latency increasing > 5% of normalized range
+                    # Trending bad: preventive action encouraged
+                    action_cost = REWARD_ACTION_COST_SICK
+                else:
+                    # Stable or improving: high cost to avoid unnecessary changes
+                    action_cost = REWARD_ACTION_COST_HEALTHY
             else:
                 action_cost = REWARD_ACTION_COST_HEALTHY  # Fallback
                 targeted_qid = None
@@ -1938,16 +2019,17 @@ class QoSRoutingEnv:
                     action_context_valid = False
                     log.debug(f"[Step {self.episode_step}] Action {action} targeted queue {targeted_qid} lacked routing context")
         
-        # Determine validity based on action type (key off action != 0, not action_applied)
+        # Determine validity based on action type
+        # RELAXED: Allow 2/3 valid queues for all actions (not just noop)
+        # This reduces excessive data filtering in early training while maintaining quality
         if action == 0:
-            # Noop: relaxed - at least 2/3 queues valid
+            # Noop: at least 2/3 queues valid
             data_valid = valid_count >= 2
         else:
             # Non-zero action attempted:
-            # Strict: all 3 queues valid + action context + action must have succeeded
-            # Failed actions (attempted but controller rejected) should NOT be stored
-            # as they create confusing transitions ("I tried X but nothing changed")
-            data_valid = (valid_count == len(QIDS)) and action_context_valid and action_applied
+            # Relaxed from "all 3 queues" to "at least 2 queues" to reduce sampling bias
+            # Still require action context and successful application
+            data_valid = (valid_count >= 2) and action_context_valid and action_applied
         
         info['data_valid'] = data_valid
         info['valid_count'] = valid_count
@@ -2140,7 +2222,8 @@ def train(args):
         args.influx_bucket, args.influx_token,
         args.influx_org, args.influx_url,
         topology_builder=topology_builder,
-        rules_dir=rules_dir
+        rules_dir=rules_dir,
+        config_path=args.config
     )
     agent = DQNAgent(
         STATE_DIM, ACTION_DIM, device,
@@ -2448,7 +2531,8 @@ def evaluate(args):
         args.influx_org, args.influx_url,
         verbose=args.verbose,
         topology_builder=topology_builder,
-        rules_dir=rules_dir
+        rules_dir=rules_dir,
+        config_path=args.config
     )
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
 
@@ -2589,11 +2673,11 @@ def main():
                         help='Directory containing P4 rule files (auto-detected from config if not specified)')
 
     # InfluxDB
-    parser.add_argument('--influx-url', default='http://192.168.201.1:8086')
-    parser.add_argument('--influx-org', default='research')
+    parser.add_argument('--influx-url', default='http://192.168.56.1:8086')
+    parser.add_argument('--influx-org', default='Research')
     parser.add_argument('--influx-bucket', default='INT')
     parser.add_argument('--influx-token', 
-                        default='0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w==')
+                        default='4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==')
     
     # Controller output verbosity
     parser.add_argument('--verbose', action='store_true',

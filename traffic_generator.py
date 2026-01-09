@@ -268,6 +268,16 @@ class TrafficManager:
         self.receivers = list(set(p[1] for p in self.traffic_pairs))
 
         log.info(f"TrafficManager: {len(self.traffic_pairs)} traffic pairs configured")
+
+        # Validate flow_id range
+        max_flow_id = max(p[2] for p in self.traffic_pairs) if self.traffic_pairs else 0
+        if max_flow_id > 99:
+            raise ValueError(
+                f"Maximum flow_id {max_flow_id} exceeds limit of 99 (has {len(self.traffic_pairs)} pairs). "
+                f"Config path: {self.config_path}. "
+                f"Check traffic pair configuration or increase flow_id limit in network.py"
+            )
+        log.info(f"Flow ID range: 10-{max_flow_id}")
         
         # Current profile state
         self.current_load: Dict[int, float] = {}
@@ -501,9 +511,12 @@ class TrafficManager:
                 self.current_profile_name = profile_name
                 self.current_profile_category = 'bursty'
                 profile_ranges = self.ALL_PROFILES[baseline_profile]
-                # Randomize baseline loads now, save them for restoration after burst
+                # Randomize baseline loads now with correlation, save them for restoration after burst
+                # Use correlated randomization (same as main traffic start)
+                midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
+                scale = self._rng.uniform(0.85, 1.15)  # ±15% variation
                 self._step_burst_baseline_loads = {
-                    qid: self._rng.uniform(*rng) for qid, rng in profile_ranges.items()
+                    qid: midpoints[qid] * scale for qid in profile_ranges.keys()
                 }
                 log.info(f"[BURSTY] Episode baseline: {baseline_profile}")
             elif profile_name in self.ALL_PROFILES:
@@ -527,8 +540,18 @@ class TrafficManager:
                 self.current_profile_name = self._rng.choice(bursty_names)
                 self.current_profile_category = 'bursty'
                 is_bursty = True
-                # Start with medium_1 baseline
-                profile_ranges = self.ALL_PROFILES['medium_1']
+                # Select random baseline from light/medium profiles
+                baseline_options = ['light_1', 'light_2', 'medium_1', 'medium_2']
+                baseline_profile = self._rng.choice(baseline_options)
+                self._step_burst_baseline = baseline_profile
+                profile_ranges = self.ALL_PROFILES[baseline_profile]
+                # Randomize baseline loads now with correlation, save them for restoration after burst
+                midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
+                scale = self._rng.uniform(0.85, 1.15)  # ±15% variation
+                self._step_burst_baseline_loads = {
+                    qid: midpoints[qid] * scale for qid in profile_ranges.keys()
+                }
+                log.info(f"[BURSTY] Episode baseline: {baseline_profile}")
             else:
                 # Get all profiles in this category (training profiles only)
                 profiles_in_category = [p for p in self._profile_names 
@@ -557,11 +580,25 @@ class TrafficManager:
             self.current_profile_category = self.PROFILE_CATEGORIES.get(self.current_profile_name, 'unknown')
         
         # Set load - use saved baseline loads for bursty profiles, otherwise randomize
+        # PHASE 1.3: Use correlated randomization to reduce variance
+        # Instead of independent per-queue randomization (40% total load variance),
+        # use a single scale factor applied to all queues (maintains queue ratios)
         if is_bursty and self._step_burst_baseline_loads:
             self.current_load = self._step_burst_baseline_loads.copy()
         else:
+            # Compute midpoint for each queue
+            midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
+            # Compute range for scaling (average of per-queue ranges)
+            avg_min = sum(rng[0] for rng in profile_ranges.values()) / len(profile_ranges)
+            avg_max = sum(rng[1] for rng in profile_ranges.values()) / len(profile_ranges)
+            avg_mid = (avg_min + avg_max) / 2.0
+
+            # Pick a single scale factor for the entire profile
+            # This maintains relative queue ratios while allowing load variation
+            scale = self._rng.uniform(0.85, 1.15)  # ±15% variation (was ±20-40% per queue)
+
             self.current_load = {
-                qid: self._rng.uniform(*rng) for qid, rng in profile_ranges.items()
+                qid: midpoints[qid] * scale for qid in profile_ranges.keys()
             }
         
         log.info(f"Starting profile '{self.current_profile_name}' ({self.current_profile_category})")
@@ -713,9 +750,16 @@ class TrafficManager:
     
     def _restore_baseline_traffic(self, baseline_profile: str):
         """Restore baseline traffic with exact saved loads (no re-randomization).
-        
+
         Used when returning from a burst to maintain the same baseline load
         that was active at episode start.
+
+        PHASE 3.1 TODO: Current implementation uses hard reset (stop+start traffic)
+        which creates discontinuous traffic change. Future improvement: implement
+        gradual ramp-down over 5-10 steps by updating iperf3 bandwidth without restart.
+        This requires either:
+        1. Using iperf3 TCP control connection to update bandwidth
+        2. Or adding burst_active flag to state (requires retraining)
         """
         self.stop_traffic()
         time.sleep(0.3)
@@ -724,10 +768,12 @@ class TrafficManager:
         if self._step_burst_baseline_loads:
             self.current_load = self._step_burst_baseline_loads.copy()
         else:
-            # Fallback: randomize if no saved loads
+            # Fallback: randomize if no saved loads (use correlated randomization)
             profile_ranges = self.ALL_PROFILES.get(baseline_profile, self.ALL_PROFILES['medium_1'])
+            midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
+            scale = self._rng.uniform(0.85, 1.15)  # ±15% variation
             self.current_load = {
-                qid: self._rng.uniform(*rng) for qid, rng in profile_ranges.items()
+                qid: midpoints[qid] * scale for qid in profile_ranges.keys()
             }
         
         self.current_profile_name = baseline_profile

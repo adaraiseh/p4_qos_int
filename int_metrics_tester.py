@@ -135,9 +135,9 @@ class INTMetricsTester:
     }
 
     def __init__(self, config_path: str,
-                 influx_url: str = "http://192.168.201.1:8086",
-                 influx_token: str = "0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w==",
-                 influx_org: str = "research",
+                 influx_url: str = "http://192.168.56.1:8086",
+                 influx_token: str = "4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==",
+                 influx_org: str = "Research",
                  influx_bucket: str = "INT",
                  topology_file: str = "/tmp/topology.json",
                  window_seconds: float = WINDOW_SECONDS):
@@ -832,19 +832,19 @@ def get_args():
     parser.add_argument(
         '--influx-url',
         type=str,
-        default='http://192.168.201.1:8086',
+        default='http://192.168.56.1:8086',
         help='InfluxDB URL'
     )
     parser.add_argument(
         '--influx-token',
         type=str,
-        default="0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w==",
+        default="4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==",
         help='InfluxDB token (or set INFLUX_TOKEN env var)'
     )
     parser.add_argument(
         '--influx-org',
         type=str,
-        default='research',
+        default='Research',
         help='InfluxDB organization'
     )
     parser.add_argument(

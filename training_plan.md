@@ -22,7 +22,7 @@ For training on a single topology (e.g., `fat_tree_k4`), use the default paramet
 |-----------|-------|-----------|
 | Steps | 40,000-50,000 | Sufficient for convergence on single topology |
 | Learning Rate | `1e-4` (default) | Optimal for stable training |
-| Epsilon | `1.0 → 0.05` | Linear decay over 30K steps |
+| Epsilon | `1.0 → 0.05` | Linear decay over 40K steps |
 | Batch Size | 64 | Stable gradient estimates |
 | Replay Buffer | 50,000 | Default capacity |
 
@@ -34,11 +34,11 @@ python3 rl_agent_4.py --mode train \
     --config config/topologies/fat_tree_k4.yaml \
     --steps 50000
 
-# With traffic mix (recommended)
+# With traffic mix (recommended, rebalanced for more stationary training)
 python3 rl_agent_4.py --mode train \
     --config config/topologies/fat_tree_k4.yaml \
     --steps 50000 \
-    --traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50"
+    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
 ```
 
 ### Alternative: Leaf-Spine Topology
@@ -47,7 +47,7 @@ python3 rl_agent_4.py --mode train \
 python3 rl_agent_4.py --mode train \
     --config config/topologies/leaf_spine_16x4.yaml \
     --steps 50000 \
-    --traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50"
+    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
 ```
 
 ### Expected Training Time
@@ -78,7 +78,7 @@ python3 rl_agent_4.py --mode train \
     --steps 40000 \
     --multi-buffer \
     --compute-ewc \
-    --traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50"
+    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
 ```
 
 **Parameters:**
@@ -101,7 +101,7 @@ python3 rl_agent_4.py --mode train \
 ```bash
 python3 rl_agent_4.py --mode train \
     --config config/topologies/leaf_spine_16x4.yaml \
-    --steps 35000 \
+    --steps 40000 \
     --resume best \
     --resume-eps 0.30 \
     --lr 5e-5 \
@@ -109,13 +109,13 @@ python3 rl_agent_4.py --mode train \
     --ewc-file training_files/*-ewc.pth \
     --ewc-lambda 5000 \
     --balanced-sampling \
-    --traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50"
+    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
 ```
 
 **Parameters:**
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Steps | 35,000 | Shorter, transfers learned concepts |
+| Steps | 40,000 | Matches epsilon decay schedule |
 | `--resume best` | Yes | Continue from Phase 1 best model |
 | `--resume-eps 0.30` | Yes | Reset epsilon for new topology exploration |
 | `--lr 5e-5` | Yes | Lower LR prevents overwriting Phase 1 knowledge |
@@ -153,15 +153,15 @@ python3 rl_agent_4.py --mode train \
 | Phase | Topology | Steps | Epsilon | LR | EWC | Balanced |
 |-------|----------|-------|---------|-----|-----|----------|
 | 1 | fat-tree k=4 | 40,000 | 1.0→0.05 | 1e-4 | compute | No |
-| 2 | leaf-spine 16x4 | 35,000 | 0.30→0.05 | 5e-5 | load (λ=5000) | Yes |
+| 2 | leaf-spine 16x4 | 40,000 | 0.30→0.05 | 5e-5 | load (λ=5000) | Yes |
 | 3a | fat-tree k=4 | 5,000 | 0.10→0.05 | 5e-5 | - | Yes |
 | 3b | leaf-spine 16x4 | 5,000 | 0.10→0.05 | 5e-5 | - | Yes |
 
 ### Expected Total Training Time
-- Phase 1: ~22 hours
-- Phase 2: ~19 hours
+- Phase 1: ~22 hours (40K steps)
+- Phase 2: ~22 hours (40K steps)
 - Phase 3: ~6 hours (optional)
-- **Total: ~41-47 hours**
+- **Total: ~44-50 hours**
 
 ---
 
@@ -184,7 +184,7 @@ REPLAY_CAPACITY = 50,000 # Replay buffer size
 # Exploration
 EPS_START = 1.0          # Initial epsilon
 EPS_END = 0.05           # Final epsilon
-EPS_DECAY_STEPS = 30,000 # Steps to decay epsilon
+EPS_DECAY_STEPS = 40,000 # Steps to decay epsilon
 
 # Prioritized Experience Replay
 PER_ALPHA = 0.6          # Prioritization exponent
@@ -287,7 +287,7 @@ python3 rl_agent_4.py --mode eval \
 ### Traffic
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--traffic-weights` | str | None | Traffic mix (e.g., "light:0.05,medium:0.1,high:0.35,bursty:0.50") |
+| `--traffic-weights` | str | None | Traffic mix (e.g., "light:0.05,medium:0.05,high:0.35,bursty:0.55") |
 
 ---
 

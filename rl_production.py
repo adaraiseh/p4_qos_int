@@ -50,12 +50,13 @@ import rl_agent_4
 # =============================================================================
 #                     PRODUCTION TIMING OVERRIDES
 # =============================================================================
-# Production uses doubled timing values for more stable observations.
-# These override the training values in rl_agent_4 module.
-WINDOW_SECONDS = 2.0        # 2x training (1.0s)
-SAFETY_LAG_MS = 200         # 2x training (100ms)
-DELAY_AFTER_ACTION = 1.6    # 2x training (0.8s)
-DELAY_NO_ACTION = 1.6       # 2x training (0.8s)
+# PHASE 2.1: Align production timing with training to avoid distribution shift
+# Previously used 2x training timing which caused train-test mismatch
+# Now: production timing matches training exactly
+WINDOW_SECONDS = 1.0        # Match training (was 2.0s)
+SAFETY_LAG_MS = 0           # Match training (was 200ms, now 0ms)
+DELAY_AFTER_ACTION = 1.0    # Match training (was 1.6s, now 1.0s)
+DELAY_NO_ACTION = 1.0       # Match training (was 1.6s, now 1.0s)
 
 # Apply overrides to rl_agent_4 module so QoSRoutingEnv uses production timing
 rl_agent_4.WINDOW_SECONDS = WINDOW_SECONDS
@@ -85,13 +86,17 @@ class ProductionAgent:
     def __init__(self, state_dim: int, action_dim: int, device: torch.device):
         self.device = device
         self.action_dim = action_dim
-        
+
         # Network (inference only)
         self.network = DuelingDQN(state_dim, action_dim, HIDDEN_DIM).to(device)
         self.network.eval()
-        
+
         # Q-value tracking for metrics
         self.last_stats = None
+
+        # PHASE 2.3: Track model checkpoint for reload detection
+        self.checkpoint_path = None
+        self.checkpoint_mtime = None
     
     def select_action(self, state: np.ndarray, valid_mask: np.ndarray) -> int:
         """
@@ -147,13 +152,33 @@ class ProductionAgent:
         return self.last_stats
     
     def load(self, path: str):
-        """Load model weights."""
+        """Load model weights and track checkpoint for reload detection."""
         try:
             checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         except TypeError:
             checkpoint = torch.load(path, map_location=self.device)
         self.network.load_state_dict(checkpoint['online_net'])
+
+        # PHASE 2.3: Track checkpoint for reload detection
+        self.checkpoint_path = path
+        self.checkpoint_mtime = os.path.getmtime(path) if os.path.exists(path) else None
+
         log.info(f"Model loaded from {path}")
+
+    def check_model_reload(self) -> bool:
+        """Check if model checkpoint has been updated (for hot-reload detection).
+
+        Returns:
+            True if checkpoint has changed, False otherwise
+        """
+        if self.checkpoint_path is None or self.checkpoint_mtime is None:
+            return False
+
+        if not os.path.exists(self.checkpoint_path):
+            return False
+
+        current_mtime = os.path.getmtime(self.checkpoint_path)
+        return current_mtime > self.checkpoint_mtime
 
 
 # =============================================================================
@@ -167,20 +192,26 @@ class ProductionMetricsWriter:
     def __init__(self, bucket: str, org: str, url: str, token: str):
         self.bucket = bucket
         self.org = org
-        self.client = InfluxDBClient(url=url, token=token, org=org, timeout=5000)
+        # PHASE 2.4: Reduced timeout from 5000ms to 2000ms for faster failure detection
+        self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
-        
+
         # Rolling statistics
         self.rewards = deque(maxlen=100)
         self.sla_met_history = deque(maxlen=100)
         self.action_history = deque(maxlen=100)
-        
+
         # Cumulative tracking
         self.cumulative_reward = 0.0
         self.total_sla_checks = 0
         self.total_sla_met = 0
         self.total_steps = 0
         self.start_time = time.time()
+
+        # PHASE 2.2: Circuit breaker for write failures
+        self.consecutive_write_failures = 0
+        self.max_consecutive_failures = 3
+        self.circuit_open = False
     
     def write_metrics(self, step: int, action: int, reward: float, 
                       info: Dict, q_stats: Dict):
@@ -268,10 +299,28 @@ class ProductionMetricsWriter:
                 if qid in per_queue:
                     p = p.field(f"queue_{qid}_latency", float(per_queue[qid].get('lat', 0)))
             
+            # PHASE 2.2: Circuit breaker pattern for write failures
+            if self.circuit_open:
+                log.warning("Circuit breaker OPEN - skipping metric write")
+                return
+
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
-            
+
+            # Success - reset failure counter
+            if self.consecutive_write_failures > 0:
+                log.info(f"Metric write recovered after {self.consecutive_write_failures} failures")
+                self.consecutive_write_failures = 0
+
         except Exception as e:
-            log.warning(f"Failed to write production metrics: {e}")
+            self.consecutive_write_failures += 1
+            log.error(f"Failed to write production metrics (failure {self.consecutive_write_failures}/{self.max_consecutive_failures}): {e}")
+
+            # Open circuit breaker if max failures reached
+            if self.consecutive_write_failures >= self.max_consecutive_failures:
+                self.circuit_open = True
+                log.critical(f"CIRCUIT BREAKER OPEN: {self.max_consecutive_failures} consecutive metric write failures. "
+                           f"Production metrics disabled to prevent cascading failures. "
+                           f"Check InfluxDB connectivity and restart production script to recover.")
     
     def get_summary(self) -> Dict:
         """Get summary statistics."""
@@ -429,7 +478,15 @@ class ProductionRunner:
                     )
                     if burst_msg:
                         log.info(f"[Step {self.step}] {burst_msg}")
-                
+
+                # PHASE 2.3: Check for model reload (hot-reload support)
+                # If checkpoint file is updated, reload model and clear stacks
+                if agent.check_model_reload():
+                    log.warning(f"[Step {self.step}] Model checkpoint updated, reloading...")
+                    agent.load(agent.checkpoint_path)
+                    env.clear_stacks()
+                    log.info(f"[Step {self.step}] Model reloaded and stacks cleared")
+
                 # Get valid actions and select action (no exploration)
                 valid_mask = env.get_valid_actions()
                 action = agent.select_action(state, valid_mask)
@@ -527,11 +584,11 @@ def main():
                         help='Console log frequency')
     
     # InfluxDB
-    parser.add_argument('--influx-url', default='http://192.168.201.1:8086')
-    parser.add_argument('--influx-org', default='research')
+    parser.add_argument('--influx-url', default='http://192.168.56.1:8086')
+    parser.add_argument('--influx-org', default='Research')
     parser.add_argument('--influx-bucket', default='INT')
     parser.add_argument('--influx-token',
-                        default='0fO0ojKAANp-7aEehJHRDWEKE-cSNoIEHY2aK8dd1KI0VWpmO1GAsMJhRh_B1U8bXDIaozHMDVv1yEkCPm230w==')
+                        default='4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==')
     
     # Controller
     parser.add_argument('--verbose', action='store_true',

@@ -136,14 +136,15 @@ visualize:
 # RL Training (Auto-detects topology)
 # =============================================
 
-# Run RL agent v4 in training mode
-# Auto-detects the running network topology
-# Traffic weights: 5% light, 10% medium, 35% high, 50% bursty
+# Single topology training (default)
+# Steps: 40K (matches EPS_DECAY_STEPS)
+# Traffic weights: 10% light, 10% medium, 45% high, 35% bursty (rebalanced for more stationary training)
+# Note: With 100ms INT sampling (reduced from 300ms) for better data quality
 train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 50000 \
 		--config $(DETECT_TOPOLOGY) \
-		--traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50" \
+		--traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35" \
 		--log-every 1 $(VERBOSE_FLAG)
 
 # Quick training test - runs 1 episode per training profile
@@ -180,7 +181,7 @@ resume:
 	sudo PYTHONUNBUFFERED=1 python3 -u rl_agent_4.py --mode train --steps 10000 \
 		--config $(DETECT_TOPOLOGY) \
 		--resume $(CHECKPOINT) --resume-eps 0.10 \
-		--traffic-weights "light:0.05,medium:0.1,high:0.35,bursty:0.50" \
+		--traffic-weights "light:0.05,medium:0.05,high:0.35,bursty:0.55" \
 		--log-every 1 $(VERBOSE_FLAG)
 
 # =============================================

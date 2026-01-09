@@ -48,8 +48,9 @@ control process_int_source (
     inout local_metadata_t local_metadata,
     inout standard_metadata_t standard_metadata) {
 
-    // Sampling configuration - 300ms per flow per queue
-    const bit<64> TIME_THRESHOLD_US = 200000;  // 200ms = 200,000 microseconds
+    // Sampling configuration - REDUCED from 300ms to 100ms for better RL data quality
+    // User constraint: max 100ms for CPU utilization control
+    const bit<64> TIME_THRESHOLD_US = 100000;  // 100ms = 100,000 microseconds (was 300,000)
 
     // Per-flow, per-queue sampling register
     // Index = flow_id * 8 + queue_idx
