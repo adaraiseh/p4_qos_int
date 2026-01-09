@@ -153,7 +153,7 @@ class TrafficManager:
         'medium_2': {0: (0.37, 0.51), 1: (0.46, 0.66), 7: (0.71, 0.97)},
         # High traffic (~20% increase)
         'high_1': {0: (0.44, 0.64), 1: (0.55, 0.78), 7: (0.88, 1.18)},
-        'high_2': {0: (0.55, 0.78), 1: (0.68, 0.98), 7: (1.07, 1.46)},
+        'high_2': {0: (0.52, 0.74), 1: (0.65, 0.93), 7: (1.02, 1.39)},
     }
     
     # TEST profiles for production - NOT used in training
