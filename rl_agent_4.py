@@ -110,12 +110,12 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 # Network
 HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
 RAW_STATE_DIM = 50      # 3×16 + 2: per-queue features + max_pressure + steps_since_action
-STACK_SIZE = 8          # Increased for better trend detection with action delay
+STACK_SIZE = 16         # Extended for burst detection (~12.8s history)
 ACTION_DIM = 8          # No-op + 6 single (3 queues × 2 alts) + 1 multi
 # State composition: stacked observations + stacked one-hot actions
-# Observations: 50 metrics * 8 frames = 400
-# Actions: 8 (one-hot) * 8 frames = 64
-# Total: 400 + 64 = 464
+# Observations: 50 metrics * 16 frames = 800
+# Actions: 8 (one-hot) * 16 frames = 128
+# Total: 800 + 128 = 928
 STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
 
 # Temporal smoothing
@@ -141,6 +141,10 @@ EPS_DECAY_STEPS = 30_000  # Decay over 60% of 50K training for thorough explorat
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target
+
+# EWC (Elastic Weight Consolidation) - prevents catastrophic forgetting
+EWC_LAMBDA = 5000.0       # Regularization strength (tune: 1000-10000)
+EWC_FISHER_SAMPLES = 200  # Samples for Fisher matrix estimation
 
 # Environment timing - tuned for faster training with acceptable data capture
 # Based on sync test results: first_change ~0.28s, query RTT ~0.3s
@@ -304,6 +308,108 @@ class PrioritizedReplayBuffer:
         return self.tree.n_entries
 
 
+class MultiTopologyReplayBuffer:
+    """
+    Manages separate replay buffers per topology with balanced sampling.
+    Each topology gets its own PrioritizedReplayBuffer.
+    """
+
+    def __init__(self, capacity_per_topology: int, alpha: float = 0.6):
+        self.capacity_per_topology = capacity_per_topology
+        self.alpha = alpha
+        self.buffers: Dict[str, PrioritizedReplayBuffer] = {}
+        self.current_topology = None
+        # Track max_priority across all buffers for consistent new experience priority
+        self.max_priority = 1.0
+
+    def set_topology(self, topology_name: str):
+        """Set current topology for push operations."""
+        self.current_topology = topology_name
+        if topology_name not in self.buffers:
+            self.buffers[topology_name] = PrioritizedReplayBuffer(
+                self.capacity_per_topology, self.alpha
+            )
+            log.info(f"Created replay buffer for topology: {topology_name}")
+
+    def push(self, state, action, reward, next_state, terminated):
+        """Add experience to current topology's buffer."""
+        if self.current_topology is None:
+            raise ValueError("Must call set_topology() before push()")
+        self.buffers[self.current_topology].push(state, action, reward, next_state, terminated)
+
+    def sample(self, batch_size: int, beta: float = 0.4, balance: bool = True):
+        """
+        Sample from buffers with optional balancing across topologies.
+
+        If balance=True, samples equally from each topology buffer.
+        If balance=False, samples only from current topology buffer.
+        """
+        if not self.buffers:
+            raise ValueError("No buffers available")
+
+        if not balance or len(self.buffers) == 1:
+            # Sample from current topology only
+            return self.buffers[self.current_topology].sample(batch_size, beta)
+
+        # Balanced sampling: equal samples from each topology
+        n_topos = len(self.buffers)
+        samples_per_topo = batch_size // n_topos
+        remainder = batch_size % n_topos
+
+        all_states, all_actions, all_rewards = [], [], []
+        all_next_states, all_terminateds = [], []
+        all_indices, all_weights = [], []
+
+        for i, (topo_name, buffer) in enumerate(self.buffers.items()):
+            if len(buffer) < samples_per_topo:
+                # Not enough samples in this buffer, skip
+                continue
+
+            n_samples = samples_per_topo + (1 if i < remainder else 0)
+            (states, actions, rewards, next_states, terminateds,
+             indices, weights) = buffer.sample(n_samples, beta)
+
+            all_states.append(states)
+            all_actions.extend(actions)
+            all_rewards.extend(rewards)
+            all_next_states.append(next_states)
+            all_terminateds.extend(terminateds)
+            # Tag indices with topology for priority updates
+            all_indices.extend([(topo_name, idx) for idx in indices])
+            all_weights.extend(weights)
+
+        if not all_states:
+            # Fallback to current topology
+            return self.buffers[self.current_topology].sample(batch_size, beta)
+
+        return (
+            np.concatenate(all_states),
+            all_actions,
+            all_rewards,
+            np.concatenate(all_next_states),
+            all_terminateds,
+            all_indices,  # Now tuples of (topology_name, index)
+            np.array(all_weights)
+        )
+
+    def update_priorities(self, indices, td_errors: np.ndarray):
+        """Update priorities for sampled experiences."""
+        for idx_entry, td_error in zip(indices, td_errors):
+            if isinstance(idx_entry, tuple):
+                topo_name, idx = idx_entry
+                self.buffers[topo_name].update_priorities([idx], np.array([td_error]))
+            else:
+                # Single buffer mode - should not happen but handle gracefully
+                self.buffers[self.current_topology].update_priorities([idx_entry], np.array([td_error]))
+
+    def __len__(self) -> int:
+        return sum(len(b) for b in self.buffers.values())
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get buffer sizes per topology."""
+        return {name: len(buf) for name, buf in self.buffers.items()}
+
+
 # =============================================================================
 #                           DUELING DQN NETWORK
 # =============================================================================
@@ -350,37 +456,52 @@ class DQNAgent:
     """
     Centralized DQN agent for QoS path optimization.
     Uses Double DQN + Dueling + Prioritized Experience Replay.
+    Supports EWC for multi-topology training and separate replay buffers.
     """
-    
-    def __init__(self, state_dim: int, action_dim: int, device: torch.device):
+
+    def __init__(self, state_dim: int, action_dim: int, device: torch.device,
+                 lr: float = LR, multi_buffer: bool = False,
+                 buffer_capacity: int = REPLAY_CAPACITY,
+                 balanced_sampling: bool = False):
         self.device = device
         self.action_dim = action_dim
-        
+        self.lr = lr  # Store for logging
+        self.multi_buffer = multi_buffer
+        self.balanced_sampling = balanced_sampling
+
         # Networks
         self.online_net = DuelingDQN(state_dim, action_dim, HIDDEN_DIM).to(device)
         self.target_net = DuelingDQN(state_dim, action_dim, HIDDEN_DIM).to(device)
         self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
-        
-        # Optimizer
-        self.optimizer = optim.Adam(self.online_net.parameters(), lr=LR)
-        
-        # Replay buffer
-        self.replay_buffer = PrioritizedReplayBuffer(REPLAY_CAPACITY, PER_ALPHA)
-        
+
+        # Optimizer with configurable learning rate
+        self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
+
+        # Replay buffer - single or multi-topology
+        if multi_buffer:
+            self.replay_buffer = MultiTopologyReplayBuffer(buffer_capacity, PER_ALPHA)
+        else:
+            self.replay_buffer = PrioritizedReplayBuffer(buffer_capacity, PER_ALPHA)
+
         # Epsilon schedule
         self.eps = EPS_START
         self.step_count = 0      # Global training steps (for PER beta)
         self.eps_step_count = 0  # Steps for epsilon decay (can be reset)
-        
+
         # PER beta schedule
         self.beta = PER_BETA_START
-        
+
+        # EWC (Elastic Weight Consolidation) state
+        self.ewc_fisher = None
+        self.ewc_optimal_params = None
+        self.ewc_lambda = 0.0  # Set via args, 0 means disabled
+
         # Metrics
         self.losses = deque(maxlen=100)
         self.rewards = deque(maxlen=100)
         self.last_loss = None
-        
+
         # Q-value tracking for logging
         self.q_values_max = deque(maxlen=100)
         self.q_values_mean = deque(maxlen=100)
@@ -442,17 +563,22 @@ class DQNAgent:
     def train_step(self) -> Optional[float]:
         """
         Perform one training step.
-        
+
         Returns:
             Loss value if training occurred, None otherwise
         """
         if len(self.replay_buffer) < MIN_REPLAY_SIZE:
             return None
-        
-        # Sample from prioritized replay buffer
-        (states, actions, rewards, next_states, terminateds, 
-         indices, weights) = self.replay_buffer.sample(BATCH_SIZE, self.beta)
-        
+
+        # Sample from prioritized replay buffer (with optional balanced sampling)
+        if self.multi_buffer:
+            (states, actions, rewards, next_states, terminateds,
+             indices, weights) = self.replay_buffer.sample(
+                 BATCH_SIZE, self.beta, balance=self.balanced_sampling)
+        else:
+            (states, actions, rewards, next_states, terminateds,
+             indices, weights) = self.replay_buffer.sample(BATCH_SIZE, self.beta)
+
         # Convert to tensors
         states_t = torch.FloatTensor(states).to(self.device)
         actions_t = torch.LongTensor(actions).to(self.device)
@@ -460,32 +586,36 @@ class DQNAgent:
         next_states_t = torch.FloatTensor(next_states).to(self.device)
         terminated_t = torch.BoolTensor(terminateds).to(self.device)
         weights_t = torch.FloatTensor(weights).to(self.device)
-        
+
         # Current Q values
         current_q = self.online_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
-        
+
         # Double DQN: use online net to select actions, target net to evaluate
         with torch.no_grad():
             next_actions = self.online_net(next_states_t).argmax(dim=1)
             next_q = self.target_net(next_states_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             next_q[terminated_t] = 0.0  # Only zero bootstrap for true terminals, not truncations
             target_q = rewards_t + GAMMA * next_q
-        
+
         # TD errors for priority update
         td_errors = (target_q - current_q).detach().cpu().numpy()
-        
-        # Weighted loss
-        loss = (weights_t * F.smooth_l1_loss(current_q, target_q, reduction='none')).mean()
-        
+
+        # Weighted base loss (TD loss)
+        base_loss = (weights_t * F.smooth_l1_loss(current_q, target_q, reduction='none')).mean()
+
+        # Add EWC penalty if enabled (prevents catastrophic forgetting)
+        ewc_loss = self.ewc_penalty()
+        loss = base_loss + ewc_loss
+
         # Optimize
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 10.0)
         self.optimizer.step()
-        
+
         # Update priorities
         self.replay_buffer.update_priorities(indices, td_errors)
-        
+
         # Soft update target network (Polyak averaging) - every step
         # This smooths Q-value evolution instead of sudden jumps from hard copies
         for target_param, online_param in zip(
@@ -495,10 +625,10 @@ class DQNAgent:
             target_param.data.copy_(
                 TAU * online_param.data + (1.0 - TAU) * target_param.data
             )
-        
+
         self.last_loss = loss.item()
         self.losses.append(self.last_loss)
-        
+
         return self.last_loss
     
     def save(self, path: str):
@@ -557,6 +687,99 @@ class DQNAgent:
             'q_max': np.mean(self.q_values_max) if self.q_values_max else 0.0,
             'q_mean': np.mean(self.q_values_mean) if self.q_values_mean else 0.0,
         }
+
+    # =========================================================================
+    #                      EWC (Elastic Weight Consolidation)
+    # =========================================================================
+    def ewc_penalty(self) -> torch.Tensor:
+        """
+        Compute EWC regularization penalty.
+
+        Returns penalty term: λ * Σ F_i * (θ_i - θ*_i)²
+        where F_i is Fisher information, θ* are optimal params from previous task.
+        """
+        if self.ewc_fisher is None or self.ewc_lambda == 0.0:
+            return torch.tensor(0.0, device=self.device)
+
+        penalty = torch.tensor(0.0, device=self.device)
+        for n, p in self.online_net.named_parameters():
+            if n in self.ewc_fisher:
+                penalty += (self.ewc_fisher[n] * (p - self.ewc_optimal_params[n]).pow(2)).sum()
+
+        return self.ewc_lambda * penalty
+
+    def compute_fisher_matrix(self, env, num_samples: int = EWC_FISHER_SAMPLES) -> Dict[str, torch.Tensor]:
+        """
+        Compute Fisher Information Matrix using sampled gradients.
+        Call this after training on a topology, before switching.
+
+        The Fisher matrix approximates parameter importance for the current task.
+        """
+        log.info(f"Computing Fisher Information Matrix ({num_samples} samples)...")
+        fisher = {n: torch.zeros_like(p) for n, p in self.online_net.named_parameters()}
+        self.online_net.train()
+
+        for i in range(num_samples):
+            if i % 50 == 0:
+                log.info(f"  Fisher sample {i}/{num_samples}")
+
+            # Get a state from the environment
+            state = env.reset(force_reset=True)
+
+            # Forward pass
+            state_t = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            q_values = self.online_net(state_t)
+
+            # Sample action from policy (softmax over Q-values)
+            probs = F.softmax(q_values, dim=1)
+            action = torch.multinomial(probs, 1).item()
+
+            # Compute log probability gradient
+            log_prob = F.log_softmax(q_values, dim=1)[0, action]
+
+            self.optimizer.zero_grad()
+            log_prob.backward()
+
+            # Accumulate squared gradients
+            for n, p in self.online_net.named_parameters():
+                if p.grad is not None:
+                    fisher[n] += p.grad.data.clone().pow(2)
+
+        # Average over samples
+        for n in fisher:
+            fisher[n] /= num_samples
+
+        log.info("Fisher Information Matrix computed.")
+        return fisher
+
+    def save_ewc(self, path: str, env, num_samples: int = EWC_FISHER_SAMPLES):
+        """
+        Save Fisher matrix and optimal parameters for EWC.
+        Call after training on a topology to prepare for next topology.
+        """
+        fisher = self.compute_fisher_matrix(env, num_samples)
+        optimal_params = {n: p.data.clone() for n, p in self.online_net.named_parameters()}
+
+        torch.save({
+            'fisher': fisher,
+            'optimal_params': optimal_params,
+        }, path)
+        log.info(f"EWC data saved to {path}")
+
+    def load_ewc(self, path: str):
+        """
+        Load Fisher matrix and optimal parameters for EWC regularization.
+        Call before training on a new topology.
+        """
+        data = torch.load(path, map_location=self.device)
+        self.ewc_fisher = {k: v.to(self.device) for k, v in data['fisher'].items()}
+        self.ewc_optimal_params = {k: v.to(self.device) for k, v in data['optimal_params'].items()}
+        log.info(f"EWC data loaded from {path}")
+
+    def set_topology(self, topology_name: str):
+        """Set current topology for multi-buffer replay."""
+        if self.multi_buffer:
+            self.replay_buffer.set_topology(topology_name)
 
 
 # =============================================================================
@@ -1849,6 +2072,10 @@ def train(args):
     interrupted = False
 
     
+    # Determine learning rate (override or default)
+    lr = args.lr if args.lr is not None else LR
+    buffer_capacity = args.buffer_capacity if args.multi_buffer else REPLAY_CAPACITY
+
     log.info("=" * 60)
     log.info("Starting RL Training - DQN Agent v4 (Stacked Obs + Actions)")
     log.info("=" * 60)
@@ -1856,12 +2083,18 @@ def train(args):
     log.info(f"  State dim: {STATE_DIM} ({RAW_STATE_DIM} obs * {STACK_SIZE} + {ACTION_DIM} act * {STACK_SIZE})")
     log.info(f"  Action dim: {ACTION_DIM} (one-hot encoded in state)")
     log.info(f"  Hidden dim: {HIDDEN_DIM}")
-    log.info(f"  Learning rate: {LR}, Gamma: {GAMMA}")
-    log.info(f"  Batch size: {BATCH_SIZE}, Replay capacity: {REPLAY_CAPACITY}")
+    log.info(f"  Learning rate: {lr}, Gamma: {GAMMA}")
+    log.info(f"  Batch size: {BATCH_SIZE}, Replay capacity: {buffer_capacity}")
     log.info(f"  Min replay: {MIN_REPLAY_SIZE}")
     log.info(f"  Epsilon: {EPS_START} -> {EPS_END} over {EPS_DECAY_STEPS} steps")
     log.info(f"  Timing: Window={WINDOW_SECONDS}s, Delay={DELAY_AFTER_ACTION}s, Cooldown={COOLDOWN_SECONDS}s")
     log.info(f"  Max steps: {args.steps}, Max episode steps: {MAX_EPISODE_STEPS}")
+    if args.multi_buffer:
+        log.info(f"  Multi-buffer: enabled (balanced_sampling={args.balanced_sampling})")
+    if args.ewc_lambda > 0 or args.ewc_file:
+        log.info(f"  EWC: lambda={args.ewc_lambda}, file={args.ewc_file}")
+    if args.compute_ewc:
+        log.info(f"  EWC: Will compute Fisher matrix after training")
     log.info("=" * 60)
     
     # Set seeds for reproducibility
@@ -1895,17 +2128,40 @@ def train(args):
         topology_builder=topology_builder,
         rules_dir=rules_dir
     )
-    agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
-    
+    agent = DQNAgent(
+        STATE_DIM, ACTION_DIM, device,
+        lr=lr,
+        multi_buffer=args.multi_buffer,
+        buffer_capacity=buffer_capacity,
+        balanced_sampling=args.balanced_sampling
+    )
+
+    # Set topology for multi-buffer mode
+    if args.multi_buffer:
+        topo_name = topology_builder.config.topology.name if topology_builder else "default"
+        agent.set_topology(topo_name)
+
     # Resume from checkpoint if specified
     if args.resume:
         resume_path = args.resume
         if not resume_path.endswith('.pth'):
-            resume_path = os.path.join(args.save_dir, f"dqn_v4_{args.resume}.pth")
+            # Try glob pattern for timestamped checkpoints first
+            # Pattern: YYYYMMDD-HHMMSS-dqn_v4_{tag}.pth
+            pattern = os.path.join(args.save_dir, f"*-dqn_v4_{args.resume}.pth")
+            matching_files = sorted(glob.glob(pattern), reverse=True)
+
+            if matching_files:
+                # Use the latest (most recent) checkpoint
+                resume_path = matching_files[0]
+                log.info(f"Found {len(matching_files)} matching checkpoints, using latest: {os.path.basename(resume_path)}")
+            else:
+                # Fallback to legacy naming without timestamp
+                resume_path = os.path.join(args.save_dir, f"dqn_v4_{args.resume}.pth")
+
         if os.path.exists(resume_path):
             agent.load(resume_path)
             log.info(f"Resumed training from {resume_path}")
-            
+
             # Override epsilon if specified
             if args.resume_eps is not None:
                 agent.eps = args.resume_eps
@@ -1913,7 +2169,35 @@ def train(args):
                 log.info(f"Reset epsilon to {agent.eps} for resume training (keeping global step count {agent.step_count})")
         else:
             log.warning(f"Checkpoint not found: {resume_path}, starting fresh")
-    
+
+    # Load EWC data if specified (for multi-topology continual learning)
+    if args.ewc_file:
+        ewc_path = args.ewc_file
+        # Support glob patterns and 'latest' keyword for EWC files
+        if not os.path.exists(ewc_path):
+            # Try glob pattern for timestamped EWC files
+            # Pattern: YYYYMMDD-HHMMSS-ewc.pth or user-provided glob
+            if '*' in ewc_path:
+                # User provided a glob pattern
+                matching_ewc = sorted(glob.glob(ewc_path), reverse=True)
+            else:
+                # Try standard timestamped pattern in save_dir
+                pattern = os.path.join(args.save_dir, "*-ewc.pth")
+                matching_ewc = sorted(glob.glob(pattern), reverse=True)
+
+            if matching_ewc:
+                ewc_path = matching_ewc[0]
+                log.info(f"Found {len(matching_ewc)} EWC files, using latest: {os.path.basename(ewc_path)}")
+
+        if os.path.exists(ewc_path):
+            agent.load_ewc(ewc_path)
+            agent.ewc_lambda = args.ewc_lambda
+            log.info(f"EWC enabled with lambda={args.ewc_lambda}")
+        else:
+            log.warning(f"EWC file not found: {args.ewc_file}, EWC disabled.")
+    elif args.ewc_lambda > 0 and not args.ewc_file:
+        log.warning("EWC lambda > 0 but no --ewc-file specified. EWC disabled.")
+
     # Parse traffic weights if specified
     category_weights = None
     if args.traffic_weights:
@@ -2104,9 +2388,16 @@ def train(args):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_final.pth")
         agent.save(path)
+
+        # Compute and save EWC Fisher matrix if requested (for next topology)
+        if args.compute_ewc and not interrupted:
+            ewc_path = os.path.join(args.save_dir, f"{timestamp}-ewc.pth")
+            log.info("Computing EWC Fisher matrix for next topology...")
+            agent.save_ewc(ewc_path, env, EWC_FISHER_SAMPLES)
+
         env.close()
         csv_file.close()
-        
+
     log.info("\nTraining complete!")
     log.info(f"Final stats: {agent.get_stats()}")
     log.info(f"Training log saved to: {csv_path}")
@@ -2256,6 +2547,26 @@ def main():
                         help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
     parser.add_argument('--traffic-profile', type=str, default=None,
                         help='Use specific traffic profile for all episodes (overrides --traffic-weights)')
+
+    # Learning rate override
+    parser.add_argument('--lr', type=float, default=None,
+                        help=f'Override learning rate (default: {LR})')
+
+    # EWC (Elastic Weight Consolidation) for multi-topology training
+    parser.add_argument('--ewc-lambda', type=float, default=0.0,
+                        help=f'EWC regularization strength (0 to disable, recommended: {EWC_LAMBDA})')
+    parser.add_argument('--compute-ewc', action='store_true',
+                        help='Compute and save Fisher matrix after training (for next topology)')
+    parser.add_argument('--ewc-file', type=str, default=None,
+                        help='Path to EWC Fisher matrix file from previous topology')
+
+    # Multi-topology replay buffer
+    parser.add_argument('--multi-buffer', action='store_true',
+                        help='Use separate replay buffers per topology')
+    parser.add_argument('--buffer-capacity', type=int, default=25000,
+                        help='Replay buffer capacity per topology (default: 25000)')
+    parser.add_argument('--balanced-sampling', action='store_true',
+                        help='Balance sampling across topology buffers (requires --multi-buffer)')
 
     # Topology configuration (optional - uses default if not specified)
     parser.add_argument('--config', '-c', type=str, default=None,
