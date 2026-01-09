@@ -167,6 +167,10 @@ def main():
         except Exception:
             pass
         c.flush_buffer()
+        try:
+            influx_client.close()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -205,7 +205,8 @@ class Collector:
         self.bucket_ns = int(max(1, int(aggregate_window_ms)) * 1_000_000)  # ms -> ns
         # key=(measurement, sorted(tags)) -> state dict
         self._agg = {}
-        
+        self._max_agg_entries = 5000  # Limit aggregation entries to prevent memory growth
+
         # Optional metrics flags
         self.enable_link_latency = bool(enable_link_latency)
         self.enable_queue_occupancy = bool(enable_queue_occupancy)
@@ -228,6 +229,7 @@ class Collector:
         self.bucket = bucket
         # (flow_id, switch_id, queue_id, egress_port) -> (last_count, last_ts_ns)
         self.last_drop_data = {}
+        self._max_drop_entries = 10000  # Limit drop data entries to prevent memory growth
 
     def flush_buffer(self):
         try:
@@ -268,6 +270,13 @@ class Collector:
 
         last = self.last_drop_data.get(tag_key)
         self.last_drop_data[tag_key] = (int(drop_count), current_time)
+
+        # Evict oldest entries if dict grows too large (memory leak prevention)
+        if len(self.last_drop_data) > self._max_drop_entries:
+            sorted_keys = sorted(self.last_drop_data.keys(),
+                                 key=lambda k: self.last_drop_data[k][1])
+            for k in sorted_keys[:len(sorted_keys) // 10]:  # Remove oldest 10%
+                del self.last_drop_data[k]
 
         if last is None:
             return None
@@ -357,6 +366,7 @@ class Collector:
     def _flush_agg_due(self, now_ns: int, out_points: list):
         """
         Flush buckets older than the current bucket to prevent points from getting stuck.
+        Also evicts oldest entries if _agg grows too large (memory leak prevention).
         """
         if not self.aggregate_enabled or not self._agg:
             return
@@ -370,6 +380,12 @@ class Collector:
                 to_delete.append(key)
         for key in to_delete:
             del self._agg[key]
+
+        # Safety eviction if _agg grows too large (shouldn't happen with proper flushing)
+        if len(self._agg) > self._max_agg_entries:
+            sorted_keys = sorted(self._agg.keys(), key=lambda k: self._agg[k]["bucket"])
+            for k in sorted_keys[:len(sorted_keys) // 10]:  # Remove oldest 10%
+                del self._agg[k]
 
     # ---------- Export ----------
     def export_influxdb(self, flow_info):

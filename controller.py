@@ -327,6 +327,7 @@ class Controller:
             self.forwarding_entries.clear()
             self.change_history_by_qid.clear()
             self.switch_usage.clear()
+            self.alt_rr_pos.clear()
             self.queue_changes = {0: 0, 1: 0, 7: 0}
             self.queue_last_change_step = {0: 0, 1: 0, 7: 0}
 

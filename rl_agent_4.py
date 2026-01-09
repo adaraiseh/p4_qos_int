@@ -2253,14 +2253,29 @@ class QoSRoutingEnv:
     
     def close(self):
         """Clean up resources."""
-        try:
-            if self.traffic_manager:
-                self.traffic_manager.stop_all()
+        # Stop traffic first
+        if self.traffic_manager:
+            try:
+                self.traffic_manager.stop_traffic()
                 log.info("Traffic stopped")
+            except Exception as e:
+                log.warning(f"Error stopping traffic: {e}")
+
+        # Close controller Thrift connections
+        if self.controller:
+            try:
+                self.controller.cleanup()
+                log.info("Controller connections closed")
+            except Exception as e:
+                log.warning(f"Error closing controller: {e}")
+
+        # Close InfluxDB connections
+        try:
             self.write_api.close()
             self.client.close()
-        except Exception:
-            pass
+            log.info("InfluxDB connections closed")
+        except Exception as e:
+            log.warning(f"Error closing InfluxDB: {e}")
 
 
 # =============================================================================
@@ -2396,7 +2411,7 @@ def train(args):
     total_steps = 0
     episode = 0
     best_avg_reward = -float('inf')
-    episode_rewards = []  # Track episode rewards for rolling average
+    episode_rewards = deque(maxlen=100)  # Track episode rewards for rolling average (bounded)
     
     # Checkpoints
     os.makedirs(args.save_dir, exist_ok=True)
@@ -2520,8 +2535,8 @@ def train(args):
             ep_reward = episode_reward / episode_steps if episode_steps > 0 else 0.0
             episode_rewards.append(ep_reward)
             
-            # Rolling 100-episode average
-            rolling_100 = sum(episode_rewards[-100:]) / min(len(episode_rewards), 100)
+            # Rolling 100-episode average (deque is already bounded to 100)
+            rolling_100 = sum(episode_rewards) / len(episode_rewards) if episode_rewards else 0.0
             
             log.info(
                 f"Episode {episode} finished: "
