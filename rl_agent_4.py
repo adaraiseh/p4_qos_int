@@ -110,7 +110,8 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 # Network
 HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
 RAW_STATE_DIM = 50      # 3×16 + 2: per-queue features + max_pressure + steps_since_action
-STACK_SIZE = 16         # Extended for burst detection (~12.8s history)
+STACK_SIZE = 16         # Extended for burst detection (~32s history at ~2s/step)
+STACK_DECAY = 0.95      # Exponential decay: older frames weighted less (oldest ~46% of newest)
 ACTION_DIM = 8          # No-op + 6 single (3 queues × 2 alts) + 1 multi
 # State composition: stacked observations + stacked one-hot actions
 # Observations: 50 metrics * 16 frames = 800
@@ -1505,29 +1506,42 @@ class QoSRoutingEnv:
     
     def _build_stacked_state(self) -> np.ndarray:
         """
-        Build stacked state from observation stack + action stack.
-        
+        Build stacked state with exponential decay weighting.
+        Newer frames have more impact than older ones.
+
         Returns:
-            464-dimensional state vector:
-              - [0-399]: Stacked observations (50 * 8 = 400 features)
-              - [400-463]: Stacked one-hot actions (8 * 8 = 64 features)
-            
-        Layout: [obs_t-7, ..., obs_t-1, obs_t, 
-                 act_t-7, ..., act_t-1, act_t]
-            
+            928-dimensional state vector:
+              - [0-799]: Stacked observations (50 * 16 = 800 features)
+              - [800-927]: Stacked one-hot actions (8 * 16 = 128 features)
+
+        Layout: [obs_t-15, ..., obs_t-1, obs_t,
+                 act_t-15, ..., act_t-1, act_t]
+
+        Decay weights (STACK_DECAY=0.95, 16 frames):
+          frame 0 (oldest): 0.95^15 = 0.46
+          frame 15 (newest): 0.95^0 = 1.0
+
         This allows the agent to see:
         - Trends: If latency is rising or falling (from observation history)
         - Causality: Full action history as one-hot vectors
-        - Example: If action_stack = [[1,0,...], [0,0,1,0,...], ...]
-                   means: noop -> video-alt-0 -> ...
+        - Recency bias: Recent observations weighted more heavily
         """
-        # Concatenate observations: oldest first, newest last
-        stacked_obs = np.concatenate(list(self.frame_stack), axis=0)
-        
-        # Concatenate one-hot actions: oldest first, newest last
-        stacked_actions = np.concatenate(list(self.action_stack), axis=0)
-        
-        # Combine: [400 obs features] + [64 action features] = 464 total
+        frames = list(self.frame_stack)
+        actions = list(self.action_stack)
+
+        # Apply exponential decay: older frames get smaller weights
+        # frames[0] is oldest, frames[-1] is newest
+        n = len(frames)
+        decay_weights = np.array([STACK_DECAY ** (n - 1 - i) for i in range(n)])
+
+        # Weight each frame's observations
+        weighted_obs = [frames[i] * decay_weights[i] for i in range(n)]
+        stacked_obs = np.concatenate(weighted_obs, axis=0)
+
+        # Weight each action's one-hot vector
+        weighted_actions = [actions[i] * decay_weights[i] for i in range(n)]
+        stacked_actions = np.concatenate(weighted_actions, axis=0)
+
         return np.concatenate([stacked_obs, stacked_actions], axis=0)
     
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
