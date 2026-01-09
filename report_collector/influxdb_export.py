@@ -154,27 +154,39 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    sniffer = AsyncSniffer(
-        iface=iface, filter=BPF, store=False,
-        prn=lambda x: handle_pkt(x, c)
-    )
-    sniffer.start()
+    # CPU Optimization: Create one sniffer per interface for parallel packet parsing
+    # This distributes Scapy parsing load across multiple threads instead of one
+    sniffers = []
+    for iface_name in iface:
+        s = AsyncSniffer(
+            iface=iface_name, filter=BPF, store=False,
+            prn=lambda x: handle_pkt(x, c)
+        )
+        s.start()
+        sniffers.append(s)
+        print(f"Started sniffer on {iface_name}")
 
-    try:
-        while not stop:
+    print(f"Total {len(sniffers)} sniffer threads running")
+    sys.stdout.flush()
+
+    while not stop:
+        try:
             signal.pause()
+        except InterruptedError:
+            # Normal signal interruption, continue
+            continue
+
+    # Cleanup - stop all sniffers
+    for s in sniffers:
+        try:
+            s.stop()
+        except Exception:
+            pass
+    c.flush_buffer()
+    try:
+        influx_client.close()
     except Exception:
         pass
-    finally:
-        try:
-            sniffer.stop()
-        except Exception:
-            pass
-        c.flush_buffer()
-        try:
-            influx_client.close()
-        except Exception:
-            pass
 
 
 if __name__ == '__main__':

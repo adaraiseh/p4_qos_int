@@ -5,6 +5,7 @@ import io
 import time
 import struct
 import threading
+import heapq
 
 from scapy.all import Packet
 from scapy.all import BitField, ShortField
@@ -12,6 +13,7 @@ from scapy.layers.inet import Ether, IP, TCP, UDP, bind_layers
 from influxdb_client import Point, WriteOptions
 from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.write.point import WritePrecision
+from reactivex.scheduler import ThreadPoolScheduler
 
 
 class INTREP(Packet):
@@ -219,7 +221,8 @@ class Collector:
                 retry_interval=1000,
                 max_retries=3,
                 max_retry_delay=5000,
-                exponential_base=2
+                exponential_base=2,
+                write_scheduler=ThreadPoolScheduler(max_workers=4)  # 4 threads for parallel writes
             ))
         else:
             self.write_api = influx_client.write_api(write_options=SYNCHRONOUS)
@@ -272,10 +275,12 @@ class Collector:
         self.last_drop_data[tag_key] = (int(drop_count), current_time)
 
         # Evict oldest entries if dict grows too large (memory leak prevention)
+        # CPU Optimization: Use heapq.nsmallest for O(n) partial sort instead of O(n log n) full sort
         if len(self.last_drop_data) > self._max_drop_entries:
-            sorted_keys = sorted(self.last_drop_data.keys(),
-                                 key=lambda k: self.last_drop_data[k][1])
-            for k in sorted_keys[:len(sorted_keys) // 10]:  # Remove oldest 10%
+            evict_count = len(self.last_drop_data) // 10
+            oldest_keys = heapq.nsmallest(evict_count, self.last_drop_data.keys(),
+                                           key=lambda k: self.last_drop_data[k][1])
+            for k in oldest_keys:
                 del self.last_drop_data[k]
 
         if last is None:
@@ -382,9 +387,11 @@ class Collector:
             del self._agg[key]
 
         # Safety eviction if _agg grows too large (shouldn't happen with proper flushing)
+        # CPU Optimization: Use heapq.nsmallest for O(n) partial sort instead of O(n log n) full sort
         if len(self._agg) > self._max_agg_entries:
-            sorted_keys = sorted(self._agg.keys(), key=lambda k: self._agg[k]["bucket"])
-            for k in sorted_keys[:len(sorted_keys) // 10]:  # Remove oldest 10%
+            evict_count = len(self._agg) // 10
+            oldest_keys = heapq.nsmallest(evict_count, self._agg.keys(), key=lambda k: self._agg[k]["bucket"])
+            for k in oldest_keys:
                 del self._agg[k]
 
     # ---------- Export ----------

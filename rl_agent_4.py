@@ -36,7 +36,6 @@ import time
 import random
 import logging
 import argparse
-import csv
 import math
 import glob
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -963,7 +962,12 @@ class QoSRoutingEnv:
         # Action stacking for causality tracking
         # Stores last STACK_SIZE actions as one-hot vectors (each 8-dim)
         self.action_stack: deque = deque(maxlen=STACK_SIZE)
-        
+
+        # CPU Optimization: Preallocated arrays for _build_stacked_state()
+        # Avoids repeated allocation every step
+        self._frames_buffer = np.zeros((STACK_SIZE, RAW_STATE_DIM), dtype=np.float32)
+        self._actions_buffer = np.zeros((STACK_SIZE, ACTION_DIM), dtype=np.float32)
+
         # EMA smoothed latency ratios for temporal smoothing
         self.lat_ema = {qid: 1.0 for qid in QIDS}
         
@@ -977,7 +981,11 @@ class QoSRoutingEnv:
         self.traffic_category_weights = None  # Optional: {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
         self.fixed_traffic_profile = None    # Optional: override to use specific profile for all episodes
         self.is_bursty_episode = False  # Track if current episode uses bursty profile
-    
+
+        # CPU Optimization: Persistent ThreadPoolExecutor for parallel InfluxDB queries
+        # Avoids thread creation/destruction overhead on every _collect_snapshot() call
+        self._query_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="influx_query")
+
     def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
         """Reset episode and return initial stacked state.
         
@@ -1205,33 +1213,33 @@ class QoSRoutingEnv:
             'data_valid': False,  # Track telemetry validity
         } for qid in QIDS}
 
-        # CPU Optimization: Run three independent queries in parallel using ThreadPoolExecutor
+        # CPU Optimization: Run three independent queries in parallel using persistent ThreadPoolExecutor
         # This reduces total query time from ~1.5-3s (sequential) to ~0.5-1s (parallel)
+        # Using persistent executor avoids thread creation/destruction overhead per step
         aggregated_result = None
         freshness_map = {qid: False for qid in QIDS}
         all_hot_demands = {}
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            # Submit all three queries in parallel
-            future_aggregated = executor.submit(self._query_aggregated_metrics, start, stop)
-            future_freshness = executor.submit(self._check_all_queues_freshness)
-            future_hottest = executor.submit(self._get_all_hottest_demands)
+        # Submit all three queries in parallel using persistent executor
+        future_aggregated = self._query_executor.submit(self._query_aggregated_metrics, start, stop)
+        future_freshness = self._query_executor.submit(self._check_all_queues_freshness)
+        future_hottest = self._query_executor.submit(self._get_all_hottest_demands)
 
-            # Collect results as they complete
-            try:
-                aggregated_result = future_aggregated.result(timeout=5.0)
-            except Exception as e:
-                log.warning(f"[Parallel Query] Aggregated metrics query failed: {e}")
+        # Collect results as they complete
+        try:
+            aggregated_result = future_aggregated.result(timeout=5.0)
+        except Exception as e:
+            log.warning(f"[Parallel Query] Aggregated metrics query failed: {e}")
 
-            try:
-                freshness_map = future_freshness.result(timeout=5.0)
-            except Exception as e:
-                log.warning(f"[Parallel Query] Freshness query failed: {e}")
+        try:
+            freshness_map = future_freshness.result(timeout=5.0)
+        except Exception as e:
+            log.warning(f"[Parallel Query] Freshness query failed: {e}")
 
-            try:
-                all_hot_demands = future_hottest.result(timeout=5.0)
-            except Exception as e:
-                log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
+        try:
+            all_hot_demands = future_hottest.result(timeout=5.0)
+        except Exception as e:
+            log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
 
         # Process aggregated metrics result
         metrics_received = {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS}
@@ -1716,15 +1724,17 @@ class QoSRoutingEnv:
         - Causality: Full action history as one-hot vectors
         - Recency bias: Recent observations weighted more heavily
         """
-        # Vectorized state building with pre-computed decay weights (CPU optimization)
-        # Convert deques to 2D arrays for efficient broadcasting
-        frames_arr = np.array(list(self.frame_stack))    # Shape: (STACK_SIZE, RAW_STATE_DIM)
-        actions_arr = np.array(list(self.action_stack))  # Shape: (STACK_SIZE, ACTION_DIM)
+        # CPU Optimization: Copy into preallocated buffers instead of allocating new arrays
+        # This avoids ~960 element allocation every step
+        for i, frame in enumerate(self.frame_stack):
+            self._frames_buffer[i] = frame
+        for i, action in enumerate(self.action_stack):
+            self._actions_buffer[i] = action
 
         # Broadcast multiply: (STACK_SIZE, dim) * (STACK_SIZE, 1) -> (STACK_SIZE, dim)
         # Uses pre-computed DECAY_WEIGHTS from module constants
-        weighted_obs = (frames_arr * DECAY_WEIGHTS[:, np.newaxis]).ravel()
-        weighted_actions = (actions_arr * DECAY_WEIGHTS[:, np.newaxis]).ravel()
+        weighted_obs = (self._frames_buffer * DECAY_WEIGHTS[:, np.newaxis]).ravel()
+        weighted_actions = (self._actions_buffer * DECAY_WEIGHTS[:, np.newaxis]).ravel()
 
         return np.concatenate([weighted_obs, weighted_actions])
     
@@ -2253,6 +2263,11 @@ class QoSRoutingEnv:
     
     def close(self):
         """Clean up resources."""
+        # Shutdown query executor gracefully
+        if hasattr(self, '_query_executor') and self._query_executor is not None:
+            self._query_executor.shutdown(wait=False)
+            self._query_executor = None
+
         # Stop traffic first
         if self.traffic_manager:
             try:
@@ -2415,25 +2430,13 @@ def train(args):
     
     # Checkpoints
     os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs('data', exist_ok=True)
     checkpoint_steps = {
         int(args.steps * 0.25): '25pct',
         int(args.steps * 0.50): '50pct',
         int(args.steps * 0.75): '75pct',
         args.steps: 'final',
     }
-    
-    # CSV logging for local analysis
-    csv_path = f"data/training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    csv_file = open(csv_path, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        'step', 'episode', 'action', 'reward', 'raw_reward',
-        'sla_met', 'sla_streak', 'eps', 'loss', 'avg_reward_100', 'alt_used',
-        'traffic_profile', 'traffic_category', 'timestamp'
-    ])
-    log.info(f"Training log: {csv_path}")
-    
+
     try:
         while total_steps < args.steps:
             episode += 1
@@ -2510,19 +2513,7 @@ def train(args):
                 info['traffic_category'] = env.current_traffic_category
                 env.write_training_metrics(total_steps, stats, reward, action, prev_action, info)
                 prev_action = action  # Update for next step's churn calculation
-                
-                # Write to local CSV
-                csv_writer.writerow([
-                    total_steps, episode, action, reward,
-                    info.get('raw_reward', 0),
-                    len(info['sla_met']), info['sla_streak'],
-                    stats['eps'], stats['avg_loss'], stats['avg_reward'],
-                    info.get('alt_used', ''),
-                    env.current_traffic_profile, env.current_traffic_category,
-                    datetime.now().isoformat()
-                ])
-                csv_file.flush()  # Ensure data is written immediately
-                
+
                 # Save checkpoints
                 if total_steps in checkpoint_steps:
                     tag = checkpoint_steps[total_steps]
@@ -2577,11 +2568,9 @@ def train(args):
             agent.save_ewc(ewc_path, env, EWC_FISHER_SAMPLES)
 
         env.close()
-        csv_file.close()
 
     log.info("\nTraining complete!")
     log.info(f"Final stats: {agent.get_stats()}")
-    log.info(f"Training log saved to: {csv_path}")
     
     if interrupted:
         sys.exit(130)
