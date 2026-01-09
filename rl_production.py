@@ -587,8 +587,8 @@ def main():
     parser.add_argument('--influx-url', default='http://192.168.56.1:8086')
     parser.add_argument('--influx-org', default='Research')
     parser.add_argument('--influx-bucket', default='INT')
-    parser.add_argument('--influx-token',
-                        default='4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==')
+    parser.add_argument('--influx-token', default=os.environ.get('INFLUX_TOKEN'),
+                        help='InfluxDB token (or set INFLUX_TOKEN env var)')
     
     # Controller
     parser.add_argument('--verbose', action='store_true',
@@ -611,9 +611,13 @@ def main():
                         help='Traffic profile to use during bursts (default: bursty_be_2)')
     
     args = parser.parse_args()
-    
+
     setup_logging(args.verbose)
-    
+
+    if not args.influx_token:
+        log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
+        sys.exit(1)
+
     runner = ProductionRunner(args)
     runner.run()
 

@@ -20,7 +20,7 @@ from collector import *
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 INFLUX_URL = "http://192.168.56.1:8086"
-INFLUX_TOKEN = "4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw=="
+INFLUX_TOKEN = os.environ.get('INFLUX_TOKEN')
 INFLUX_ORG = "Research"
 INFLUX_BUCKET = "INT"
 
@@ -90,7 +90,7 @@ def main():
     parser.add_argument(
         '--influx-token',
         default=INFLUX_TOKEN,
-        help='InfluxDB token'
+        help='InfluxDB token (or set INFLUX_TOKEN env var)'
     )
     parser.add_argument(
         '--influx-org',
@@ -120,6 +120,10 @@ def main():
 
     print(f"Sniffing on {iface} with BPF: {BPF}")
     sys.stdout.flush()
+
+    if not args.influx_token:
+        print("Error: InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
+        sys.exit(1)
 
     # Scapy performance knobs
     conf.use_pcap = True
