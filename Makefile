@@ -34,7 +34,7 @@ BURSTY_FLAG  := $(if $(BURSTY),--bursty-mode --burst-profile $(BURST),)
 # Common Command Variables
 # =============================================
 PYTHON      := python3
-SUDO_PYTHON := sudo PYTHONUNBUFFERED=1 python3 -u
+SUDO_PYTHON := sudo -E PYTHONUNBUFFERED=1 python3 -u
 RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(VERBOSE_FLAG)
 
 # Default target
@@ -74,7 +74,7 @@ clean: stop
 
 collect:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY)
+	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY)
 
 monitor:
 	$(PYTHON) monitor_iperf_s.py --dir /tmp --window 60 --refresh 1

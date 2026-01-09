@@ -136,7 +136,7 @@ class INTMetricsTester:
 
     def __init__(self, config_path: str,
                  influx_url: str = "http://192.168.56.1:8086",
-                 influx_token: str = "4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==",
+                 influx_token: str = None,
                  influx_org: str = "Research",
                  influx_bucket: str = "INT",
                  topology_file: str = "/tmp/topology.json",
@@ -158,6 +158,12 @@ class INTMetricsTester:
         self.bucket = influx_bucket
         self.org = influx_org
         self.window_seconds = window_seconds
+
+        # Resolve InfluxDB token from argument or environment variable
+        if influx_token is None:
+            influx_token = os.environ.get('INFLUX_TOKEN')
+        if not influx_token:
+            raise ValueError("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or pass influx_token argument.")
 
         # Load topology config
         log.info(f"Loading topology config from {config_path}")
@@ -838,7 +844,7 @@ def get_args():
     parser.add_argument(
         '--influx-token',
         type=str,
-        default="4amNKarg1cJlQjx3wluSZgBrgccdbodLAuUOUaL4P0W6GkDqa-B3jLZWWTOMwDoa2ImhaKvRDCwXDguRuco_yw==",
+        default=os.environ.get('INFLUX_TOKEN'),
         help='InfluxDB token (or set INFLUX_TOKEN env var)'
     )
     parser.add_argument(
