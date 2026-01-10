@@ -59,38 +59,37 @@ qos_queues:
     dscp: "0x00"
     sla_ms: 200
 
-# Traffic pairs: cross-pod communication
+# Traffic pairs: cross-pod communication (reduced senders for topology coverage)
 # Hosts: Pod1(h1-h4), Pod2(h5-h8), Pod3(h9-h12), Pod4(h13-h16)
+# 6 senders (h1,h3,h5,h9,h11,h13) with 18 pairs covering all 8 ToRs
 traffic:
   pairs:
-    # Pod1 senders -> other pods
-    - {src: h1, dst: h6}
-    - {src: h1, dst: h10}
-    - {src: h1, dst: h14}
-    - {src: h3, dst: h8}
-    - {src: h3, dst: h12}
-    - {src: h3, dst: h16}
+    # Pod1 sender (h1/t1) -> other pods
+    - {src: h1, dst: h6}     # -> Pod2/t3
+    - {src: h1, dst: h10}    # -> Pod3/t5
+    - {src: h1, dst: h14}    # -> Pod4/t7
 
-    # Pod2 senders -> other pods
-    - {src: h5, dst: h2}
-    - {src: h5, dst: h10}
-    - {src: h5, dst: h14}
-    - {src: h7, dst: h4}
-    - {src: h7, dst: h12}
-    - {src: h7, dst: h16}
+    # Pod1 sender (h3/t2) -> other pods
+    - {src: h3, dst: h8}     # -> Pod2/t4
+    - {src: h3, dst: h12}    # -> Pod3/t6
+    - {src: h3, dst: h16}    # -> Pod4/t8
 
-    # Pod3 senders -> other pods
-    - {src: h9, dst: h2}
-    - {src: h9, dst: h6}
-    - {src: h9, dst: h14}
-    - {src: h11, dst: h4}
-    - {src: h11, dst: h8}
-    - {src: h11, dst: h16}
+    # Pod2 sender (h5/t3) -> other pods
+    - {src: h5, dst: h2}     # -> Pod1/t1
+    - {src: h5, dst: h12}    # -> Pod3/t6
+    - {src: h5, dst: h16}    # -> Pod4/t8
 
-    # Pod4 senders -> other pods
-    - {src: h13, dst: h2}
-    - {src: h13, dst: h6}
-    - {src: h13, dst: h10}
-    - {src: h15, dst: h4}
-    - {src: h15, dst: h8}
-    - {src: h15, dst: h12}
+    # Pod3 sender (h9/t5) -> other pods
+    - {src: h9, dst: h4}     # -> Pod1/t2
+    - {src: h9, dst: h8}     # -> Pod2/t4
+    - {src: h9, dst: h14}    # -> Pod4/t7
+
+    # Pod3 sender (h11/t6) -> other pods
+    - {src: h11, dst: h2}    # -> Pod1/t1
+    - {src: h11, dst: h6}    # -> Pod2/t3
+    - {src: h11, dst: h16}   # -> Pod4/t8
+
+    # Pod4 sender (h13/t7) -> other pods
+    - {src: h13, dst: h4}    # -> Pod1/t2
+    - {src: h13, dst: h6}    # -> Pod2/t3
+    - {src: h13, dst: h10}   # -> Pod3/t5

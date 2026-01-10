@@ -281,20 +281,24 @@ class SumTree:
         self.n_entries = 0
     
     def _propagate(self, idx: int, change: float):
-        parent = (idx - 1) // 2
-        self.tree[parent] += change
-        if parent != 0:
-            self._propagate(parent, change)
+        # Iterative version - avoids recursive call overhead at deep tree levels
+        while idx != 0:
+            parent = (idx - 1) // 2
+            self.tree[parent] += change
+            idx = parent
     
     def _retrieve(self, idx: int, s: float) -> int:
-        left = 2 * idx + 1
-        right = left + 1
-        if left >= len(self.tree):
-            return idx
-        if s <= self.tree[left]:
-            return self._retrieve(left, s)
-        else:
-            return self._retrieve(right, s - self.tree[left])
+        # Iterative version - avoids recursive call overhead at deep tree levels
+        while True:
+            left = 2 * idx + 1
+            right = left + 1
+            if left >= len(self.tree):
+                return idx
+            if s <= self.tree[left]:
+                idx = left
+            else:
+                s -= self.tree[left]
+                idx = right
     
     def total(self) -> float:
         return self.tree[0]

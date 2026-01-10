@@ -151,9 +151,9 @@ class TrafficManager:
         # Medium traffic (~20% increase then -15% reduction = net ~2% increase over original)
         'medium_1': {0: (0.31, 0.44), 1: (0.39, 0.54), 7: (0.60, 0.85)},
         'medium_2': {0: (0.37, 0.51), 1: (0.46, 0.66), 7: (0.71, 0.97)},
-        # High traffic (~20% increase)
-        'high_1': {0: (0.44, 0.64), 1: (0.55, 0.78), 7: (0.88, 1.18)},
-        'high_2': {0: (0.52, 0.74), 1: (0.65, 0.93), 7: (1.02, 1.39)},
+        # High traffic (~20% increase then -10% reduction)
+        'high_1': {0: (0.40, 0.58), 1: (0.50, 0.70), 7: (0.79, 1.06)},
+        'high_2': {0: (0.47, 0.67), 1: (0.59, 0.84), 7: (0.92, 1.25)},
     }
     
     # TEST profiles for production - NOT used in training
@@ -713,7 +713,8 @@ class TrafficManager:
                 cfg['burst_duration_min'], cfg['burst_duration_max']
             )
             self._step_burst_end_step = self._step_burst_start_step + burst_duration
-            log.info(f"[BURST SCHEDULE] Profile={bursty_profile}: "
+            baseline = self._step_burst_baseline or 'medium_1'
+            log.info(f"[BURST SCHEDULE] Profile={bursty_profile} (base={baseline}): "
                      f"burst starts at step {self._step_burst_start_step}, "
                      f"duration={burst_duration} steps, ends at step {self._step_burst_end_step}")
         

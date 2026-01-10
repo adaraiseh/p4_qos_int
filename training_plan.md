@@ -38,7 +38,7 @@ python3 rl_agent_4.py --mode train \
 python3 rl_agent_4.py --mode train \
     --config config/topologies/fat_tree_k4.yaml \
     --steps 50000 \
-    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
+    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
 ```
 
 ### Alternative: Leaf-Spine Topology
@@ -47,7 +47,7 @@ python3 rl_agent_4.py --mode train \
 python3 rl_agent_4.py --mode train \
     --config config/topologies/leaf_spine_16x4.yaml \
     --steps 50000 \
-    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
+    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
 ```
 
 ### Expected Training Time
@@ -78,7 +78,7 @@ python3 rl_agent_4.py --mode train \
     --steps 40000 \
     --multi-buffer \
     --compute-ewc \
-    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
+    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
 ```
 
 **Parameters:**
@@ -109,7 +109,7 @@ python3 rl_agent_4.py --mode train \
     --ewc-file training_files/*-ewc.pth \
     --ewc-lambda 5000 \
     --balanced-sampling \
-    --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
+    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
 ```
 
 **Parameters:**

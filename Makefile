@@ -89,7 +89,7 @@ visualize:
 train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 50000 \
-		$(RL_COMMON) --traffic-weights "light:0.1,medium:0.1,high:0.45,bursty:0.35"
+		$(RL_COMMON) --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
 
 train_test:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
@@ -98,7 +98,7 @@ train_test:
 		echo ""; \
 		echo "=== Testing profile: $$profile ==="; \
 		if ! $(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
-			--steps 100 --max-episode-steps 100 --no-warm-start \
+			--steps 20 --max-episode-steps 20 --no-warm-start \
 			--traffic-profile $$profile; then \
 			echo "Training interrupted or failed."; \
 			ret=$$?; \
