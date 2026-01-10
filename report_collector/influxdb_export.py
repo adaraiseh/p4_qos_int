@@ -10,14 +10,18 @@ import sys
 import os
 import signal
 import argparse
+import logging
 from pathlib import Path
+
+# Add parent directory for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from logging_config import setup_unified_logging
 
 from scapy.all import AsyncSniffer, conf
 from influxdb_client import InfluxDBClient
 from collector import *
 
-# Add parent directory for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+log = logging.getLogger(__name__)
 
 INFLUX_URL = "http://192.168.56.1:8086"
 INFLUX_TOKEN = os.environ.get('INFLUX_TOKEN')
@@ -47,15 +51,15 @@ def get_interfaces_from_config(config_path: str) -> list:
         interfaces = builder.get_collector_interfaces()
 
         if interfaces:
-            print(f"Discovered {len(interfaces)} collector interfaces from topology")
+            log.info(f"Discovered {len(interfaces)} collector interfaces from topology")
             return interfaces
         else:
-            print("No collector interfaces found in topology, using defaults")
+            log.warning("No collector interfaces found in topology, using defaults")
             return DEFAULT_INTERFACES
 
     except Exception as e:
-        print(f"Error loading topology: {e}")
-        print("Falling back to default interfaces")
+        log.error(f"Error loading topology: {e}")
+        log.warning("Falling back to default interfaces")
         return DEFAULT_INTERFACES
 
 
@@ -102,27 +106,40 @@ def main():
         default=INFLUX_BUCKET,
         help='InfluxDB bucket'
     )
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='debug',
+        choices=['debug', 'info', 'warning', 'error'],
+        help='File log level (console always shows INFO)'
+    )
 
     args = parser.parse_args()
+
+    # Set up unified logging
+    setup_unified_logging(module_name="collector", log_level=args.log_level)
+
+    # Suppress Scapy's noisy internal loggers (Rx timeout spam every 50ms)
+    logging.getLogger("Rx").setLevel(logging.WARNING)
+    logging.getLogger("scapy.runtime").setLevel(logging.WARNING)
 
     # Determine interfaces to sniff
     if args.interfaces:
         # Explicit interface list overrides everything
         iface = [i.strip() for i in args.interfaces.split(',')]
-        print(f"Using explicit interfaces: {iface}")
+        log.info(f"Using explicit interfaces: {iface}")
     elif args.config:
         # Load from topology configuration
         iface = get_interfaces_from_config(args.config)
     else:
         # Fall back to defaults
         iface = DEFAULT_INTERFACES
-        print(f"Using default interfaces: {iface}")
+        log.info(f"Using default interfaces: {iface}")
 
-    print(f"Sniffing on {iface} with BPF: {BPF}")
-    sys.stdout.flush()
+    log.info(f"Sniffing on {iface} with BPF: {BPF}")
 
     if not args.influx_token:
-        print("Error: InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
+        log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
         sys.exit(1)
 
     # Scapy performance knobs
@@ -148,7 +165,7 @@ def main():
     def signal_handler(sig, frame):
         nonlocal stop
         stop = True
-        print("\nStopping...")
+        log.info("Stopping...")
         c.flush_buffer()
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -164,10 +181,9 @@ def main():
         )
         s.start()
         sniffers.append(s)
-        print(f"Started sniffer on {iface_name}")
+        log.info(f"Started sniffer on {iface_name}")
 
-    print(f"Total {len(sniffers)} sniffer threads running")
-    sys.stdout.flush()
+    log.info(f"Total {len(sniffers)} sniffer threads running")
 
     while not stop:
         try:

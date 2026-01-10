@@ -54,6 +54,9 @@ from p4utils.utils.task_scheduler import Task, TaskClient
 # Import helpers from network.py
 from network import _traffic_dst_port, QID_TOS, ALL_QUEUES
 
+# Import unified logging
+from logging_config import setup_unified_logging
+
 log = logging.getLogger(__name__)
 
 
@@ -303,6 +306,11 @@ class TrafficManager:
         self._step_burst_count = 0        # Track burst duration for logging
         self._step_burst_baseline = None  # Baseline profile used for this episode
         self._step_burst_baseline_loads = None  # Exact baseline loads to restore after burst
+
+        # Traffic transition tracking (for telemetry stability)
+        self._in_transition = False
+        self._transition_start_time = 0.0
+        self._transition_stabilization_time = 3.0  # Seconds to wait for traffic to stabilize
     
     def _discover_traffic_hosts(self) -> List[str]:
         """Discover traffic hosts from hosts_ips dict or topology.json (hosts with id < 100)."""
@@ -497,7 +505,11 @@ class TrafficManager:
         """
         self.stop_traffic()
         time.sleep(0.3)
-        
+
+        # Mark traffic as transitioning - telemetry will be unstable during ramp-up
+        self._in_transition = True
+        self._transition_start_time = time.monotonic()
+
         is_bursty = False
         
         if profile_name:
@@ -764,7 +776,11 @@ class TrafficManager:
         """
         self.stop_traffic()
         time.sleep(0.3)
-        
+
+        # Mark traffic as transitioning - telemetry will be unstable during ramp-up
+        self._in_transition = True
+        self._transition_start_time = time.monotonic()
+
         # Restore exact loads saved at episode start
         if self._step_burst_baseline_loads:
             self.current_load = self._step_burst_baseline_loads.copy()
@@ -817,6 +833,35 @@ class TrafficManager:
                 )
                 self._send_task(sender, cmd, delay=0.5)
 
+    def is_traffic_stable(self) -> bool:
+        """Check if traffic has had time to stabilize after a transition.
+
+        After start_traffic() or _restore_baseline_traffic() is called, traffic
+        needs time to ramp up before telemetry data is reliable. This method
+        returns False during the ramp-up period.
+
+        Returns:
+            True if traffic is stable and telemetry can be trusted,
+            False if still transitioning (within stabilization window).
+        """
+        if not self._in_transition:
+            return True
+        elapsed = time.monotonic() - self._transition_start_time
+        if elapsed >= self._transition_stabilization_time:
+            self._in_transition = False
+            return True
+        return False
+
+    def get_transition_elapsed(self) -> float:
+        """Get elapsed time since traffic transition started.
+
+        Returns:
+            Seconds since transition started, or 0.0 if not in transition.
+        """
+        if not self._in_transition:
+            return 0.0
+        return time.monotonic() - self._transition_start_time
+
 
 def get_args():
     """Parse command line arguments."""
@@ -851,11 +896,12 @@ def get_args():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    # Use unified logging when run standalone
+    setup_unified_logging(__name__, log_level="debug")
 
     if os.geteuid() != 0:
-        print("ERROR: Must run with sudo!")
-        print("Usage: sudo python3 traffic_generator.py [--config CONFIG] [--test] [--profile PROFILE]")
+        log.error("Must run with sudo!")
+        log.error("Usage: sudo python3 traffic_generator.py [--config CONFIG] [--test] [--profile PROFILE]")
         sys.exit(1)
 
     args = get_args()
@@ -865,16 +911,16 @@ if __name__ == "__main__":
         config_path=args.config
     )
 
-    print(f"Hosts: {tm.traffic_hosts}")
-    print(f"Host IPs: {tm.hosts_ips}")
-    print(f"Senders: {tm.senders} -> Receivers: {tm.receivers}")
-    print(f"Traffic pairs: {len(tm.traffic_pairs)}")
+    log.info(f"Hosts: {tm.traffic_hosts}")
+    log.info(f"Host IPs: {tm.hosts_ips}")
+    log.info(f"Senders: {tm.senders} -> Receivers: {tm.receivers}")
+    log.info(f"Traffic pairs: {len(tm.traffic_pairs)}")
 
     if args.test:
-        print("\nStarting traffic test (10 seconds)...")
+        log.info("Starting traffic test (10 seconds)...")
         info = tm.start_traffic(profile_name=args.profile)
-        print(f"Profile: {info['profile_name']} ({info['profile_category']})")
+        log.info(f"Profile: {info['profile_name']} ({info['profile_category']})")
         time.sleep(10)
-        print("\nStopping traffic...")
+        log.info("Stopping traffic...")
         tm.stop_traffic()
-        print("Done")
+        log.info("Done")

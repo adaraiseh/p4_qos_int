@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -9,10 +10,13 @@ from p4utils.mininetlib.network_API import NetworkAPI
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
+from logging_config import setup_unified_logging
 from topology.factory import create_topology
 from topology.base import TopologyBuilder
 from config.validator import validate_config
 from config.schema import TopologyConfig
+
+log = logging.getLogger(__name__)
 
 
 # ----------------------------
@@ -249,7 +253,7 @@ class NetworkBuilder:
             ref2 = self._host_refs.get(node2) or self._switch_refs.get(node2)
 
             if ref1 is None or ref2 is None:
-                print(f"Warning: Skipping link {node1} <-> {node2}: node not found")
+                log.warning(f"Skipping link {node1} <-> {node2}: node not found")
                 continue
 
             # Build kwargs for addLink
@@ -320,7 +324,7 @@ class NetworkBuilder:
             try:
                 self.net.stopNetwork()
             except Exception as e:
-                print(f"[WARNING] Error stopping network: {e}")
+                log.warning(f"Error stopping network: {e}")
 
     def __enter__(self):
         """Context manager support for automatic cleanup."""
@@ -344,20 +348,20 @@ def config_network(config_path: str, rules_dir: str = None) -> tuple[NetworkAPI,
         Tuple of (NetworkAPI instance, TopologyBuilder instance)
     """
     # Validate configuration
-    print(f"[INFO] Validating configuration: {config_path}")
+    log.info(f"Validating configuration: {config_path}")
     result = validate_config(config_path)
 
     if result.warnings:
         for warning in result.warnings:
-            print(f"[WARNING] {warning}")
+            log.warning(warning)
 
     if not result.is_valid:
-        print("[ERROR] Configuration validation failed:")
+        log.error("Configuration validation failed:")
         for error in result.errors:
-            print(f"  - {error}")
+            log.error(f"  - {error}")
         raise ValueError("Invalid configuration")
 
-    print(f"[INFO] Configuration valid: {result.config.topology.name}")
+    log.info(f"Configuration valid: {result.config.topology.name}")
 
     # Build topology
     builder = create_topology(config_path, validate=False)
@@ -394,12 +398,22 @@ def get_args():
         required=False,
         default=None
     )
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='debug',
+        choices=['debug', 'info', 'warning', 'error'],
+        help='File log level (console always shows INFO)'
+    )
 
     return parser.parse_args()
 
 
 def main():
     args = get_args()
+
+    # Set up unified logging
+    setup_unified_logging(module_name="network", log_level=args.log_level)
 
     # Build network from configuration
     net, builder = config_network(args.config, args.rules)
@@ -422,12 +436,12 @@ def main():
     from controller import Controller
     controller = Controller(topology_builder=builder, rules_dir=rules_dir)
 
-    print("\n\nSUMMARY:")
-    print(f"Topology: {builder.config.topology.name} ({builder.config.topology.type.value})")
-    print(f"Switches: {len(builder.switches)}")
-    print(f"Hosts: {len(builder.hosts)}")
-    print(f"INT Collectors: {len(builder.collectors)}")
-    print("\nOSPF Shortest Paths:")
+    log.info("SUMMARY:")
+    log.info(f"Topology: {builder.config.topology.name} ({builder.config.topology.type.value})")
+    log.info(f"Switches: {len(builder.switches)}")
+    log.info(f"Hosts: {len(builder.hosts)}")
+    log.info(f"INT Collectors: {len(builder.collectors)}")
+    log.info("OSPF Shortest Paths:")
     controller.print_paths()
 
     # Auto-launch visualization
@@ -435,7 +449,7 @@ def main():
 
     viz_script = os.path.join(os.getcwd(), "visualize_routes.py")
     if os.path.exists(viz_script):
-        print(f"\n[INFO] Auto-launching visualization: {viz_script}")
+        log.info(f"Auto-launching visualization: {viz_script}")
 
         cmd = ["python3", viz_script, "--config", args.config]
 

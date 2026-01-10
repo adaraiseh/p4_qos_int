@@ -5,6 +5,7 @@ import json
 import glob
 import os
 import threading
+import logging
 from collections import deque
 from contextlib import redirect_stdout, redirect_stderr
 from functools import lru_cache
@@ -18,6 +19,11 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="networkx")
 from p4utils.utils.helper import load_topo
 from p4utils.utils.sswitch_thrift_API import SimpleSwitchThriftAPI
+
+# Import unified logging
+from logging_config import setup_unified_logging
+
+log = logging.getLogger(__name__)
 
 
 class Controller:
@@ -123,8 +129,7 @@ class Controller:
                         if hasattr(controller.client._iprot.trans, 'close'):
                             controller.client._iprot.trans.close()
                 except Exception as e:
-                    if self.verbose:
-                        print(f"[WARNING] Error closing connection to {sw_name}: {e}")
+                    log.warning(f"Error closing connection to {sw_name}: {e}")
 
     def __enter__(self):
         """Context manager support for automatic cleanup."""
@@ -237,7 +242,7 @@ class Controller:
                 try:
                     path = nx.shortest_path(self.net_graph, src_host, dst_host, weight='weight')
                 except nx.NetworkXNoPath:
-                    print(f"No path between {src_host} and {dst_host}")
+                    log.warning(f"No path between {src_host} and {dst_host}")
                     continue
 
                 self.paths.append(f"Path from {src_host} to {dst_host}: {' -> '.join(path)}")
@@ -322,7 +327,7 @@ class Controller:
                     self._call(controller.table_clear, "port_forward.switching_table")
                     self._call(controller.table_clear, "port_forward.mac_rewriting_table")
                 except Exception as e:
-                    print(f"[WARN] Failed to clear tables on {sw_name}: {e}")
+                    log.warning(f"Failed to clear tables on {sw_name}: {e}")
 
             self.forwarding_entries.clear()
             self.change_history_by_qid.clear()
@@ -356,7 +361,7 @@ class Controller:
             self.forwarding_entries[sw_name]['lpm'][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
             return True
         except Exception as e:
-            print(f"[LPM upsert FAILED] {sw_name} {dst_prefix} dscp={dscp} -> {next_hop_ip}/{egress_port}: {e}")
+            log.error(f"[LPM upsert FAILED] {sw_name} {dst_prefix} dscp={dscp} -> {next_hop_ip}/{egress_port}: {e}")
             return False
 
     def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
@@ -435,14 +440,14 @@ class Controller:
                     text = f.read()
                 m = pat.search(text)
                 if not m:
-                    print(f"[WARN] No init_metadata ID found in {fname}; skipping mapping for {sw_name}")
+                    log.warning(f"No init_metadata ID found in {fname}; skipping mapping for {sw_name}")
                     continue
 
                 sid = int(m.group(1))
 
                 if sid in sid_to_name and sid_to_name[sid] != sw_name:
-                    print(f"[WARN] Duplicate switch_id {sid}: already mapped to {sid_to_name[sid]}, "
-                          f"ignoring later mapping from {sw_name} ({fname})")
+                    log.warning(f"Duplicate switch_id {sid}: already mapped to {sid_to_name[sid]}, "
+                                f"ignoring later mapping from {sw_name} ({fname})")
                     name_to_sid[sw_name] = sid
                     continue
 
@@ -451,7 +456,7 @@ class Controller:
                 sid_role[sid] = role
 
             except Exception as e:
-                print(f"Failed to parse {path}: {e}")
+                log.error(f"Failed to parse {path}: {e}")
 
         return sid_to_name, name_to_sid, sid_role
 
@@ -987,7 +992,12 @@ class Controller:
         if not src_host or not dst_host:
             return False, f"host name not found for src={src_ip} dst={dst_ip}"
 
-        path_fwd_orig = self.path_map.get((src_host, dst_host))
+        # Use queue-specific path first (matches snapshot's path lookup)
+        queue_paths = self.paths_per_queue.get(int(qid), {})
+        path_fwd_orig = queue_paths.get((src_host, dst_host))
+        if not path_fwd_orig:
+            # Fallback to global path_map
+            path_fwd_orig = self.path_map.get((src_host, dst_host))
         if not path_fwd_orig or worst_name not in path_fwd_orig:
             return False, "no stored forward path or worst not in path"
             
@@ -1041,21 +1051,19 @@ class Controller:
                 has_loop, loop_msg = self._detect_routing_loop(fwd_new_path)
                 if has_loop:
                     self.loop_detection_events += 1
-                    if self.verbose:
-                        print("=" * 60)
-                        print("ROUTING LOOP DETECTED")
-                        print("=" * 60)
-                        print(f"Source: {src_host}, Destination: {dst_host}")
-                        print(f"Bottleneck: {worst_name}, Alternative: {alt_switch_name}")
-                        print(f"\nP1 (src → alt): {' -> '.join(p1)}")
-                        print(f"P2 (alt → dst): {' -> '.join(p2)}")
-                        print(f"Merged path:    {' -> '.join(fwd_new_path)}")
-                        print(f"\n{loop_msg}")
-                        print("=" * 60)
+                    log.warning("=" * 60)
+                    log.warning("ROUTING LOOP DETECTED")
+                    log.warning("=" * 60)
+                    log.warning(f"Source: {src_host}, Destination: {dst_host}")
+                    log.warning(f"Bottleneck: {worst_name}, Alternative: {alt_switch_name}")
+                    log.warning(f"P1 (src -> alt): {' -> '.join(p1)}")
+                    log.warning(f"P2 (alt -> dst): {' -> '.join(p2)}")
+                    log.warning(f"Merged path:    {' -> '.join(fwd_new_path)}")
+                    log.warning(f"{loop_msg}")
+                    log.warning("=" * 60)
                     return False, f"merged path contains routing loop: {loop_msg}"
 
-                if self.verbose:
-                    print(f"Sticky fallback path found: {' -> '.join(fwd_new_path)}")
+                log.debug(f"Sticky fallback path found: {' -> '.join(fwd_new_path)}")
             except nx.NetworkXNoPath:
                 return False, f"no physical path found via {alt_switch_name} (sticky fallback failed)"
 
@@ -1190,16 +1198,43 @@ class Controller:
             return None
         return self.get_path_by_hosts(sh, dh)
 
+    def get_path_by_ips_for_queue(self, src_ip: str, dst_ip: str, qid: int):
+        """Get the path for a specific queue between two IPs.
+
+        Each queue can have its own rerouted path stored in paths_per_queue.
+        This method looks up the queue-specific path first, falling back to
+        the global path_map if no queue-specific path exists.
+
+        Args:
+            src_ip: Source IP address
+            dst_ip: Destination IP address
+            qid: Queue ID (0=voice, 1=video, 7=BE)
+
+        Returns:
+            List of node names representing the path, or None if not found.
+        """
+        sh = self.host_from_ip(src_ip)
+        dh = self.host_from_ip(dst_ip)
+        if not sh or not dh:
+            return None
+        # Try queue-specific path first (has rerouted paths per queue)
+        queue_paths = self.paths_per_queue.get(int(qid), {})
+        path = queue_paths.get((sh, dh))
+        if path:
+            return path
+        # Fallback to global path_map
+        return self.path_map.get((sh, dh))
+
     # -----------------------
     # Debug
     # -----------------------
 
     def print_paths(self):
         for (src, dst), path in sorted(self.path_map.items()):
-            print(f"Path from {src} to {dst}: {' -> '.join(path)}")
+            log.debug(f"Path from {src} to {dst}: {' -> '.join(path)}")
 
     def print_forwarding_entries(self):
         for sw_name, entries in self.forwarding_entries.items():
-            print(f"Switch: {sw_name}")
+            log.debug(f"Switch: {sw_name}")
             for entry in entries:
-                print(f"  {entry}")
+                log.debug(f"  {entry}")

@@ -14,6 +14,7 @@ topo       ?= fat_tree_k4
 profile    ?= high_1
 CHECKPOINT ?= 50pct
 BURST      ?= bursty_be_2
+LOG_LEVEL  ?= info
 
 # =============================================
 # Dynamic Topology Mapping
@@ -27,15 +28,15 @@ DETECT_TOPOLOGY = $(shell cat .active_topology 2>/dev/null || echo "$(TOPO_DIR)/
 # =============================================
 # Flag Handling
 # =============================================
-VERBOSE_FLAG := $(if $(VERBOSE),--verbose,)
 BURSTY_FLAG  := $(if $(BURSTY),--bursty-mode --burst-profile $(BURST),)
+LOG_LEVEL_FLAG := --log-level $(LOG_LEVEL)
 
 # =============================================
 # Common Command Variables
 # =============================================
 PYTHON      := python3
 SUDO_PYTHON := sudo -E PYTHONUNBUFFERED=1 python3 -u
-RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(VERBOSE_FLAG)
+RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(LOG_LEVEL_FLAG)
 
 # Default target
 all: train
@@ -56,7 +57,7 @@ rules: validate
 
 run: rules
 	@echo "$(TOPOLOGY_CONFIG)" > .active_topology
-	sudo $(PYTHON) network.py --config $(TOPOLOGY_CONFIG) --p4 $(P4SRC_FILE)
+	sudo $(PYTHON) network.py --config $(TOPOLOGY_CONFIG) --p4 $(P4SRC_FILE) $(LOG_LEVEL_FLAG)
 
 stop:
 	sudo mn -c
@@ -74,7 +75,7 @@ clean: stop
 
 collect:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY)
+	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY) $(LOG_LEVEL_FLAG)
 
 monitor:
 	$(PYTHON) monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
@@ -86,20 +87,23 @@ visualize:
 # RL Training
 # =============================================
 
+# Full training: 50K steps on fat_tree_k4
 train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 50000 \
 		$(RL_COMMON) --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
 
+# Test training: 20 steps per episode, cycles through all traffic profiles
 train_test:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	@echo "=== Testing all training profiles (1 episode each) ==="
-	@for profile in bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
+	@echo "=== Testing all training profiles (20 steps each) ==="
+	@for p in bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
 		echo ""; \
-		echo "=== Testing profile: $$profile ==="; \
+		echo "=== Testing profile: $$p ==="; \
 		if ! $(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
 			--steps 20 --max-episode-steps 20 --no-warm-start \
-			--traffic-profile $$profile; then \
+			--traffic-profile $$p; then \
 			echo "Training interrupted or failed."; \
 			ret=$$?; \
 			if [ $$ret -eq 130 ]; then \
@@ -119,27 +123,18 @@ resume:
 		--traffic-weights "light:0.05,medium:0.05,high:0.35,bursty:0.55"
 
 # =============================================
-# RL Evaluation
-# =============================================
-
-TEST_COMMON = PYTHONUNBUFFERED=1 $(PYTHON) -u rl_agent_4.py --mode eval $(RL_COMMON) --steps 1500
-
-test:
-	$(TEST_COMMON) --weights-tag final
-
-test_best:
-	$(TEST_COMMON) --weights-tag best
-
-# =============================================
 # Traffic Testing
 # =============================================
 
+# Load specific traffic profile and run indefinitely (Ctrl+C to stop)
 test_traffic:
 	@echo "Testing traffic profile: $(profile)"
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "Running indefinitely (Ctrl+C to stop)..."
 	$(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
-		--steps 200 --max-episode-steps 200 --no-warm-start \
+		--steps 999999 --max-episode-steps 999999 --no-warm-start \
 		--traffic-profile $(profile)
+
 
 # =============================================
 # Production Mode
@@ -148,8 +143,10 @@ test_traffic:
 PROD_COMMON = $(SUDO_PYTHON) rl_production.py $(RL_COMMON) \
 	--generate-traffic --traffic-profile $(profile) $(BURSTY_FLAG)
 
+# Run production with specific traffic profile
 production:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "Traffic profile: $(profile)"
 	$(PROD_COMMON) --weights-tag best
 
 production_best: production
@@ -167,7 +164,7 @@ production_75pct:
 help:
 	@echo "P4 QoS INT - Dynamic Multi-Topology Support"
 	@echo ""
-	@echo "Network Operations (use 'topo=' to select topology):"
+	@echo "Network Operations:"
 	@echo "  make run topo=<name>      Start network with specified topology"
 	@echo "  make stop                 Stop mininet"
 	@echo "  make clean                Clean up all files"
@@ -175,36 +172,38 @@ help:
 	@echo "Available topologies for 'topo=':"
 	@echo "  Fat-Tree:    fat_tree_k2, fat_tree_k4 [default], fat_tree_k8"
 	@echo "  Leaf-Spine:  leaf_spine_{4,6,8,10,12,14,16}x{2,3,4}"
-	@echo "               (e.g., leaf_spine_6x3 = 6 leaves x 3 spines)"
 	@echo "  Three-Tier:  three_tier_4, three_tier_6, three_tier_8"
 	@echo ""
-	@echo "Training/Evaluation (auto-detect running topology):"
-	@echo "  make train                Train RL agent on running network"
-	@echo "  make train_test           Quick test all traffic profiles"
-	@echo "  make test                 Evaluate with final model"
-	@echo "  make test_best            Evaluate with best model"
+	@echo "Training:"
+	@echo "  make train                Full training (50K steps, fat_tree_k4)"
+	@echo "  make train_test           Test all profiles (20 steps each)"
 	@echo "  make resume               Resume training from checkpoint"
 	@echo ""
-	@echo "Traffic Testing (auto-detect running topology):"
-	@echo "  make test_traffic profile=<name>   Test specific traffic profile"
+	@echo "Traffic Testing:"
+	@echo "  make test_traffic profile=<name>   Run specific profile indefinitely"
 	@echo "  Profiles: light_{1,2}, medium_{1,2}, high_{1,2},"
 	@echo "            bursty_{vo,vi,be}_{1,2}"
 	@echo ""
-	@echo "Production Mode (auto-detect running topology):"
-	@echo "  make production profile=<name>              Run with best model"
-	@echo "  make production_final profile=<name>        Run with final model"
-	@echo "  make production profile=<name> BURSTY=1     Enable burst mode"
+	@echo "Production Mode:"
+	@echo "  make production profile=<name>     Run with best model"
+	@echo "  make production_final profile=<name>"
+	@echo "  make production profile=<name> BURSTY=1  Enable burst mode"
 	@echo ""
-	@echo "Collector & Visualization (auto-detect topology):"
+	@echo "Monitoring:"
 	@echo "  make collect              Run INT collector"
 	@echo "  make visualize            Run traffic visualization"
 	@echo "  make monitor              Monitor iperf traffic"
 	@echo ""
+	@echo "Logging Options:"
+	@echo "  LOG_LEVEL=debug           Log debug output to file (default)"
+	@echo "  LOG_LEVEL=info            Log info output to file only"
+	@echo "  (Console always shows INFO level)"
+	@echo ""
 	@echo "Examples:"
-	@echo "  make run topo=leaf_spine_6x3"
-	@echo "  make train                           # auto-detects running topology"
-	@echo "  make test_traffic profile=high_2     # test specific traffic profile"
-	@echo "  make production profile=bursty_be_1  # production with traffic profile"
+	@echo "  make run topo=fat_tree_k4"
+	@echo "  make train LOG_LEVEL=debug"
+	@echo "  make test_traffic profile=high_2"
+	@echo "  make production profile=bursty_be_1"
 
 .PHONY: all validate rules run stop clean collect monitor visualize \
         train train_test resume test test_best test_traffic \

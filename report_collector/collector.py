@@ -1,11 +1,19 @@
 # collector.py
 
 import sys
+import os
 import io
 import time
 import struct
 import threading
 import heapq
+import logging
+
+# Add parent directory to path for logging_config import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from logging_config import setup_unified_logging
+
+log = logging.getLogger(__name__)
 
 from scapy.all import Packet
 from scapy.all import BitField, ShortField
@@ -134,32 +142,31 @@ class FlowInfo:
         self.e_q_occupancy = None
 
     def show(self):
-        print("src_ip %s" % (self.src_ip))
-        print("dst_ip %s" % (self.dst_ip))
-        print("src_port %s" % (self.src_port))
-        print("dst_port %s" % (self.dst_port))
-        print("ip_proto %s" % (self.ip_proto))
-        print("hop_cnt %s" % (self.hop_cnt))
-        print("flow_latency %s" % (self.flow_latency))
+        log.debug(f"src_ip {self.src_ip}")
+        log.debug(f"dst_ip {self.dst_ip}")
+        log.debug(f"src_port {self.src_port}")
+        log.debug(f"dst_port {self.dst_port}")
+        log.debug(f"ip_proto {self.ip_proto}")
+        log.debug(f"hop_cnt {self.hop_cnt}")
+        log.debug(f"flow_latency {self.flow_latency}")
         if len(self.switch_ids) > 0:
-            print("switch_ids %s" % (self.switch_ids))
+            log.debug(f"switch_ids {self.switch_ids}")
         if len(self.l1_ingress_ports) > 0:
-            print("l1_ingress_ports %s" % (self.l1_ingress_ports))
-            print("l1_egress_ports %s" % (self.l1_egress_ports))
+            log.debug(f"l1_ingress_ports {self.l1_ingress_ports}")
+            log.debug(f"l1_egress_ports {self.l1_egress_ports}")
         if len(self.hop_latencies) > 0:
-            print("hop_latencies %s" % (self.hop_latencies))
+            log.debug(f"hop_latencies {self.hop_latencies}")
         if len(self.queue_ids) > 0:
-            print("queue_ids %s" % (self.queue_ids))
-            print("queue_occups %s" % (self.queue_occups))
+            log.debug(f"queue_ids {self.queue_ids}")
+            log.debug(f"queue_occups {self.queue_occups}")
         if len(self.ingress_tstamps) > 0:
-            print("ingress_tstamps %s" % (self.ingress_tstamps))
-            print("egress_tstamps %s" % (self.egress_tstamps))
+            log.debug(f"ingress_tstamps {self.ingress_tstamps}")
+            log.debug(f"egress_tstamps {self.egress_tstamps}")
         if len(self.l2_ingress_ports) > 0:
-            print("l2_ingress_ports %s" % (self.l2_ingress_ports))
-            print("l2_egress_ports %s" % (self.l2_egress_ports))
+            log.debug(f"l2_ingress_ports {self.l2_ingress_ports}")
+            log.debug(f"l2_egress_ports {self.l2_egress_ports}")
         if len(self.egress_tx_utils) > 0:
-            print("egress_tx_utils %s" % (self.egress_tx_utils))
-        print("\n")
+            log.debug(f"egress_tx_utils {self.egress_tx_utils}")
 
     def clear_metadata(self):
         self.switch_ids.clear()
@@ -253,8 +260,7 @@ class Collector:
         if now - self._last_log >= 1.0:   # once per second
             q0, q1, q7 = self.records_per_queue.get(0, 0), self.records_per_queue.get(1, 0), self.records_per_queue.get(7, 0)
             total = self.records_exported
-            print(f"[INFO] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7})")
-            sys.stdout.flush()
+            log.info(f"[Collector] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7})")
             self.records_exported = 0
             self.records_per_queue = {0: 0, 1: 0, 7: 0}
             self._last_log = now
@@ -585,16 +591,27 @@ class Collector:
                         )
 
             # --- Flow Latency (Only once per packet) ---
-            if len(flow_info.ingress_tstamps) >= 1 and len(flow_info.egress_tstamps) >= safe_hops:
+            # INT metadata is prepended by each switch, so:
+            #   - Index 0 = last hop (most recent metadata)
+            #   - Index n-1 = first hop (oldest metadata)
+            # Flow latency = (last hop egress time) - (first hop ingress time)
+            if len(flow_info.egress_tstamps) >= 1 and len(flow_info.ingress_tstamps) >= safe_hops:
                 flow_latency = (
-                    flow_info.ingress_tstamps[0] - flow_info.egress_tstamps[safe_hops - 1]
+                    flow_info.egress_tstamps[0] - flow_info.ingress_tstamps[safe_hops - 1]
                 ) / 1_000_000.0
-                
-                if not self.aggregate_enabled:
+
+                # Sanity check: reject negative latency or latency > 10 seconds (10000ms)
+                # This catches timestamp wraparound issues and stale packet data
+                if flow_latency < 0 or flow_latency > 10000:
+                    log.debug(f"[Latency] Rejected insane value: {flow_latency:.2f}ms "
+                              f"(egr[0]={flow_info.egress_tstamps[0]}, "
+                              f"ing[{safe_hops-1}]={flow_info.ingress_tstamps[safe_hops-1]}) "
+                              f"flow={flow_id} queue={expected_queue_id}")
+                elif not self.aggregate_enabled:
                      points.append(
                         f"flow_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={expected_queue_id},src_ip={src_ip} value={float(flow_latency)} {report_time}"
                      )
-                else: 
+                else:
                      self._emit_or_aggregate(
                         "flow_latency",
                         {

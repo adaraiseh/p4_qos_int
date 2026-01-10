@@ -56,67 +56,33 @@ import torch.nn.functional as F
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# CPU Optimization: Batch flushing instead of per-message flushing
-# This reduces I/O overhead from ~10-50ms per step to ~2-5ms
-class BatchFlushHandler(logging.StreamHandler):
-    """
-    A logging handler that batches flushes for CPU efficiency.
-    Flushes after every N messages instead of every message.
-    """
-    def __init__(self, stream=None, flush_interval: int = 10):
-        super().__init__(stream)
-        self._count = 0
-        self._flush_interval = flush_interval
+# Import unified logging configuration
+from logging_config import setup_unified_logging, get_log_file_path, set_console_level
 
-    def emit(self, record):
-        super().emit(record)
-        self._count += 1
-        if self._count >= self._flush_interval:
-            self.flush()
-            self._count = 0
-
-# Legacy handler for compatibility - can be used when real-time logs are critical
-class FlushingStreamHandler(logging.StreamHandler):
-    def emit(self, record):
-        super().emit(record)
-        self.flush()
-
-# Define setup_logging function to be called by main
-def setup_logging(verbose: bool = False, batch_flush: bool = True):
-    """Configure logging with appropriate level and optional batch flushing.
+def setup_logging(log_level: str = "info"):
+    """Configure logging with appropriate level and file output.
 
     Args:
-        verbose: Enable DEBUG level logging
-        batch_flush: Use batch flushing (CPU efficient) vs immediate flushing (real-time)
+        log_level: File log level ("debug", "info", "warning", "error")
     """
-    # Determine level
-    level = logging.DEBUG if verbose else logging.INFO
+    # Configure root logger with unified logging (file + console)
+    setup_unified_logging(module_name="rl_agent", log_level=log_level)
 
-    # Choose handler based on batch_flush preference
-    if batch_flush:
-        handler = BatchFlushHandler(sys.stdout, flush_interval=10)
-    else:
-        handler = FlushingStreamHandler(sys.stdout)
-
-    # Configure root logger
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[handler],
-        force=True,
-    )
-
-    # Set level for this module matches root
+    # Set level for this module
     log = logging.getLogger(__name__)
-    log.setLevel(level)
+    log.setLevel(logging.DEBUG)
 
     # Ensure traffic_generator logger matches
-    logging.getLogger('traffic_generator').setLevel(level)
+    logging.getLogger('traffic_generator').setLevel(logging.DEBUG)
 
-    # If verbose, set controller logger to DEBUG restricted (or handle elsewhere)
-    # The Controller class handles its own verbosity, but we can set the logger level here too
-    
+    # Ensure controller logger matches
+    logging.getLogger('controller').setLevel(logging.DEBUG)
+
+    # Log the log file location
+    log_path = get_log_file_path()
+    if log_path:
+        log.info(f"Debug logs will be written to: {log_path}")
+
 log = logging.getLogger(__name__)
 # Default to INFO until setup_logging is called
 log.setLevel(logging.INFO)
@@ -1302,8 +1268,8 @@ class QoSRoutingEnv:
             snapshot[qid]['hot_src_ip'] = src_ip
             snapshot[qid]['hot_dst_ip'] = dst_ip
             
-            # Get current path
-            path = self.controller.get_path_by_ips(src_ip, dst_ip)
+            # Get current path for THIS queue (uses queue-specific paths after reroutes)
+            path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
             if not path:
                 log.info(f"[Snapshot] Queue {qid}: No path found for ({src_ip}, {dst_ip})")
                 continue
@@ -1996,9 +1962,19 @@ class QoSRoutingEnv:
         # Wait for network to settle
         delay = DELAY_AFTER_ACTION if action_applied else DELAY_NO_ACTION
         time.sleep(delay)
-        
-        # Collect new snapshot
-        next_snapshot = self._collect_snapshot()
+
+        # Check if traffic is stable before collecting metrics
+        # During traffic transitions (burst start/end), telemetry is unreliable
+        if self.traffic_manager and not self.traffic_manager.is_traffic_stable():
+            elapsed = self.traffic_manager.get_transition_elapsed()
+            log.info(f"[Step {self.episode_step}] Traffic transitioning ({elapsed:.1f}s elapsed), using last snapshot")
+            next_snapshot = self.last_snapshot.copy() if self.last_snapshot else self._collect_snapshot()
+            # Mark as transitioning for reward calculation
+            for qid in QIDS:
+                next_snapshot[qid]['transitioning'] = True
+        else:
+            # Collect new snapshot
+            next_snapshot = self._collect_snapshot()
         
         # Compute base reward (action cost applied separately below)
         reward, info = self._compute_reward(next_snapshot)
@@ -2378,8 +2354,12 @@ def train(args):
             # Override epsilon if specified
             if args.resume_eps is not None:
                 agent.eps = args.resume_eps
-                agent.eps_step_count = 0  # Reset ONLY epsilon decay steps
-                log.info(f"Reset epsilon to {agent.eps} for resume training (keeping global step count {agent.step_count})")
+                # Calculate eps_step_count to match the desired starting epsilon
+                # eps = EPS_END + (EPS_START - EPS_END) * (1 - progress)
+                # Solving for progress: progress = 1 - (eps - EPS_END) / (EPS_START - EPS_END)
+                progress = 1.0 - (args.resume_eps - EPS_END) / (EPS_START - EPS_END)
+                agent.eps_step_count = int(progress * EPS_DECAY_STEPS)
+                log.info(f"Reset epsilon to {agent.eps} for resume training (eps_step_count={agent.eps_step_count}, keeping global step count {agent.step_count})")
         else:
             log.warning(f"Checkpoint not found: {resume_path}, starting fresh")
 
@@ -2721,16 +2701,17 @@ def main():
     parser.add_argument('--influx-token', default=os.environ.get('INFLUX_TOKEN'),
                         help='InfluxDB token (or set INFLUX_TOKEN env var)')
     
-    # Controller output verbosity
-    parser.add_argument('--verbose', action='store_true',
-                        help='Show verbose P4 controller output (route add/delete messages)')
+    # Logging
+    parser.add_argument('--log-level', type=str, default='info',
+                        choices=['debug', 'info', 'warning', 'error'],
+                        help='Console log level (file always logs DEBUG)')
     parser.add_argument('--no-warm-start', action='store_true',
                         help='Force baseline resets (no warm-start episodes)')
-    
+
     args = parser.parse_args()
 
-    # Setup logging based on verbose flag
-    setup_logging(args.verbose)
+    # Setup logging based on log level
+    setup_logging(log_level=args.log_level)
 
     if not args.influx_token:
         log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
