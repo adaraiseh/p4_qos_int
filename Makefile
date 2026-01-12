@@ -91,8 +91,8 @@ visualize:
 train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
-	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 50000 \
-		$(RL_COMMON) --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 55000 \
+		$(RL_COMMON) --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
 
 # Test training: 20 steps per episode, cycles through all traffic profiles
 train_test:

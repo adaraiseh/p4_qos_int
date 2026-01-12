@@ -130,7 +130,7 @@ PER_BETA_STEPS = 25_000  # Anneal to 1.0 by ~50% of 50K training
 # Epsilon schedule
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_STEPS = 40_000  # Decay over 80% of 50K training for thorough exploration
+EPS_DECAY_STEPS = 45_000  # Decay over 80% of 55K training for thorough exploration
 
 # Target network - Soft updates (Polyak averaging) for smooth Q-value evolution
 TAU = 0.005  # Soft update rate: target = TAU * online + (1-TAU) * target

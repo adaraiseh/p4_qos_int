@@ -32,13 +32,13 @@ For training on a single topology (e.g., `fat_tree_k4`), use the default paramet
 # Basic training on fat-tree k=4
 python3 rl_agent_4.py --mode train \
     --config config/topologies/fat_tree_k4.yaml \
-    --steps 50000
+    --steps 55000
 
 # With traffic mix (recommended, rebalanced for more stationary training)
 python3 rl_agent_4.py --mode train \
     --config config/topologies/fat_tree_k4.yaml \
-    --steps 50000 \
-    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
+    --steps 55000 \
+    --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
 ```
 
 ### Alternative: Leaf-Spine Topology
@@ -46,8 +46,8 @@ python3 rl_agent_4.py --mode train \
 ```bash
 python3 rl_agent_4.py --mode train \
     --config config/topologies/leaf_spine_16x4.yaml \
-    --steps 50000 \
-    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
+    --steps 55000 \
+    --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
 ```
 
 ### Expected Training Time
@@ -78,7 +78,7 @@ python3 rl_agent_4.py --mode train \
     --steps 40000 \
     --multi-buffer \
     --compute-ewc \
-    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
+    --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
 ```
 
 **Parameters:**
@@ -109,7 +109,7 @@ python3 rl_agent_4.py --mode train \
     --ewc-file training_files/*-ewc.pth \
     --ewc-lambda 5000 \
     --balanced-sampling \
-    --traffic-weights "light:0.05,medium:0.05,high:0.50,bursty:0.40"
+    --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
 ```
 
 **Parameters:**
