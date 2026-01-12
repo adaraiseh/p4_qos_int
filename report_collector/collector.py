@@ -9,6 +9,7 @@ import threading
 import heapq
 import logging
 
+
 # Add parent directory to path for logging_config import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from logging_config import setup_unified_logging
@@ -189,12 +190,12 @@ class Collector:
     """
     Per-report writes with batched async option.
     - write_async=True: ~0.5s flush cadence, much lower CPU/latency.
-    - use_device_time=False: use server now() to avoid device clock skew.
+    - use_device_time=True: use device timestamps for accurate latency measurement.
     - aggregate_enabled=True caps each series at <= 10 pts/sec via 100ms averaging.
     """
     def __init__(self, influx_client, org, bucket,
                  write_async=True, flush_interval_ms=500, batch_size=1000,
-                 use_device_time=False,
+                 use_device_time=False,  # P4 device timestamps are NOT Unix epoch - must use system time
                  aggregate_enabled=True,        # knob to enable/disable averaging
                  aggregate_window_ms=500,       # aggregation window in ms
                  # Optional metrics (disabled for CPU efficiency, enable when needed)
@@ -260,9 +261,26 @@ class Collector:
         if now - self._last_log >= 1.0:   # once per second
             q0, q1, q7 = self.records_per_queue.get(0, 0), self.records_per_queue.get(1, 0), self.records_per_queue.get(7, 0)
             total = self.records_exported
-            log.info(f"[Collector] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7})")
+            drop_cache = len(self.last_drop_data)
+            agg_cache = len(self._agg)
+            lat_cnt = getattr(self, '_lat_count', 0)
+            lat_skip = getattr(self, '_lat_skip_count', 0)
+            # Per-queue lat breakdown for diagnostics (shows which queue_ids flow_latency is tagged with)
+            lat_per_q = getattr(self, '_lat_per_queue', {})
+            # Format all queue_ids found (not just 0,1,7 - to detect mismatches)
+            lat_per_q_str = " ".join(f"Q{k}:{v}" for k, v in sorted(lat_per_q.items()))
+            lat_str = f"lat:{lat_cnt} ({lat_per_q_str})" if lat_per_q_str else f"lat:{lat_cnt}"
+            # Per-queue skip breakdown for diagnostics
+            skip_per_q = getattr(self, '_lat_skip_per_queue', {0: 0, 1: 0, 7: 0})
+            skip_q0, skip_q1, skip_q7 = skip_per_q.get(0, 0), skip_per_q.get(1, 0), skip_per_q.get(7, 0)
+            skip_str = f" (Q0:{skip_q0} Q1:{skip_q1} Q7:{skip_q7})" if lat_skip > 0 else ""
+            log.info(f"[Collector] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7}) | caches: drop={drop_cache} agg={agg_cache} | {lat_str} skip:{lat_skip}{skip_str}")
             self.records_exported = 0
             self.records_per_queue = {0: 0, 1: 0, 7: 0}
+            self._lat_count = 0
+            self._lat_skip_count = 0
+            self._lat_skip_per_queue = {0: 0, 1: 0, 7: 0}
+            self._lat_per_queue = {}  # Reset per-queue lat counter
             self._last_log = now
 
     # ---------- Drop-rate (structured return for aggregation) ----------
@@ -431,9 +449,10 @@ class Collector:
             if hop_latency_len == 0 or egress_port_len == 0:
                 return
 
-            # Calc safe_hops based on minimum length of available data arrays
-            # We can use min() on a generator to avoid creating a temporary list
-            # Arrays always accessed: switch_ids, l1_egress_ports, hop_latencies, queue_ids, egress_tx_utils, queue_drops
+            # Calc safe_hops based on minimum length of core per-hop data arrays
+            # NOTE: Timestamps (ingress_tstamps, egress_tstamps) are NOT included here
+            # because they're optional and only used for flow_latency calculation.
+            # Per-hop metrics (drop_rate, tx_util, switch_latency) don't require timestamps.
             safe_hops = min(
                 len(flow_info.switch_ids),
                 len(flow_info.l1_ingress_ports),
@@ -442,8 +461,6 @@ class Collector:
                 len(flow_info.queue_ids),
                 len(flow_info.queue_occups),
                 len(flow_info.queue_drops),
-                len(flow_info.ingress_tstamps),
-                len(flow_info.egress_tstamps),
                 len(flow_info.egress_tx_utils),
                 flow_info.hop_cnt
             )
@@ -452,11 +469,15 @@ class Collector:
                 return
 
             # Choose a unified timestamp in ns
-            # Direct access to last element is faster than [-1]
+            # Use first hop (index -1) timestamp for consistency with flow_latency calculation
             if self.use_device_time:
-                 # Prefer egress ts, fallback to ingress
-                 times = flow_info.egress_tstamps if len(flow_info.egress_tstamps) >= safe_hops else flow_info.ingress_tstamps
-                 report_time = int(times[safe_hops - 1])
+                 # Prefer egress ts from first hop, fallback to ingress, fallback to now()
+                 if len(flow_info.egress_tstamps) >= 1:
+                     report_time = int(flow_info.egress_tstamps[-1])
+                 elif len(flow_info.ingress_tstamps) >= 1:
+                     report_time = int(flow_info.ingress_tstamps[-1])
+                 else:
+                     report_time = time.time_ns()
             else:
                 report_time = time.time_ns()
 
@@ -593,24 +614,48 @@ class Collector:
             # --- Flow Latency (Only once per packet) ---
             # INT metadata is prepended by each switch, so:
             #   - Index 0 = last hop (most recent metadata)
-            #   - Index n-1 = first hop (oldest metadata)
+            #   - Index -1 = first hop (oldest metadata)
             # Flow latency = (last hop egress time) - (first hop ingress time)
-            if len(flow_info.egress_tstamps) >= 1 and len(flow_info.ingress_tstamps) >= safe_hops:
+            # No dependency on safe_hops - timestamps are independent of per-hop data
+            egress_ts_len = len(flow_info.egress_tstamps)
+            ingress_ts_len = len(flow_info.ingress_tstamps)
+
+            # Only need at least 1 egress and 1 ingress timestamp
+            if egress_ts_len >= 1 and ingress_ts_len >= 1:
+                # egress[0] = last hop egress time, ingress[-1] = first hop ingress time
                 flow_latency = (
-                    flow_info.egress_tstamps[0] - flow_info.ingress_tstamps[safe_hops - 1]
+                    flow_info.egress_tstamps[0] - flow_info.ingress_tstamps[-1]
                 ) / 1_000_000.0
+
+                # Use queue_id from first hop (index -1, oldest metadata)
+                int_queue_id = q_ids[-1] if len(q_ids) > 0 else expected_queue_id
+
+                # Debug: Log when INT queue_id differs from expected (from dst_port)
+                if int_queue_id != expected_queue_id:
+                    log.debug(f"[Latency Queue Mismatch] expected={expected_queue_id} actual={int_queue_id} "
+                              f"flow={flow_id} q_ids={list(q_ids)}")
+
+                # Debug: log if timestamp arrays differ in length (could indicate parsing issues)
+                if egress_ts_len != ingress_ts_len:
+                    log.debug(f"[Latency] Timestamp array mismatch: egress={egress_ts_len}, ingress={ingress_ts_len}, "
+                              f"flow={flow_id}, queue={int_queue_id}")
 
                 # Sanity check: reject negative latency or latency > 10 seconds (10000ms)
                 # This catches timestamp wraparound issues and stale packet data
                 if flow_latency < 0 or flow_latency > 10000:
-                    log.debug(f"[Latency] Rejected insane value: {flow_latency:.2f}ms "
-                              f"(egr[0]={flow_info.egress_tstamps[0]}, "
-                              f"ing[{safe_hops-1}]={flow_info.ingress_tstamps[safe_hops-1]}) "
-                              f"flow={flow_id} queue={expected_queue_id}")
+                    log.warning(f"[Latency] Rejected insane value: {flow_latency:.2f}ms "
+                                f"(egr[0]={flow_info.egress_tstamps[0]}, "
+                                f"ing[-1]={flow_info.ingress_tstamps[-1]}) "
+                                f"flow={flow_id} queue={int_queue_id}")
                 elif not self.aggregate_enabled:
                      points.append(
-                        f"flow_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={expected_queue_id},src_ip={src_ip} value={float(flow_latency)} {report_time}"
+                        f"flow_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={int_queue_id},src_ip={src_ip} value={float(flow_latency)} {report_time}"
                      )
+                     self._lat_count = getattr(self, '_lat_count', 0) + 1
+                     # Track per-queue flow_latency distribution for diagnostics
+                     if not hasattr(self, '_lat_per_queue'):
+                         self._lat_per_queue = {}
+                     self._lat_per_queue[int_queue_id] = self._lat_per_queue.get(int_queue_id, 0) + 1
                 else:
                      self._emit_or_aggregate(
                         "flow_latency",
@@ -618,13 +663,39 @@ class Collector:
                             "flow_id": flow_id,
                             "src_ip": flow_info.src_ip,
                             "dst_ip": flow_info.dst_ip,
-                            "queue_id": expected_queue_id,
+                            "queue_id": int_queue_id,
                         },
                         float(flow_latency),
                         report_time,
                         points,
                     )
-                    
+                     # Track per-queue flow_latency distribution for diagnostics (aggregation path)
+                     if not hasattr(self, '_lat_per_queue'):
+                         self._lat_per_queue = {}
+                     self._lat_per_queue[int_queue_id] = self._lat_per_queue.get(int_queue_id, 0) + 1
+            else:
+                # Count skipped latency records
+                self._lat_skip_count = getattr(self, '_lat_skip_count', 0) + 1
+
+                # Track skips per queue for diagnostics
+                if not hasattr(self, '_lat_skip_per_queue'):
+                    self._lat_skip_per_queue = {0: 0, 1: 0, 7: 0}
+                self._lat_skip_per_queue[expected_queue_id] = self._lat_skip_per_queue.get(expected_queue_id, 0) + 1
+
+                # Log detailed info for EVERY skip at debug level
+                log.debug(f"[Latency Skip] queue={expected_queue_id} flow={flow_id} "
+                          f"egress_ts={egress_ts_len} ingress_ts={ingress_ts_len} "
+                          f"hop_cnt={flow_info.hop_cnt}")
+
+                # Also log first occurrence at warning level (existing behavior)
+                if not hasattr(self, '_lat_skip_logged'):
+                    self._lat_skip_logged = set()
+                skip_key = (egress_ts_len, ingress_ts_len)
+                if skip_key not in self._lat_skip_logged:
+                    self._lat_skip_logged.add(skip_key)
+                    log.warning(f"[Latency Skip] FIRST: egress_ts={egress_ts_len}, ingress_ts={ingress_ts_len}, "
+                               f"hop_cnt={flow_info.hop_cnt}, queue={expected_queue_id}")
+
             # Flush aggregation buckets if enabled
             self._flush_agg_due(report_time, points)
 
@@ -659,6 +730,9 @@ class Collector:
             flow_info.src_port = ip_pkt[TCP].sport
             flow_info.dst_port = ip_pkt[TCP].dport
 
+    # Debug counter for instruction mask logging (avoid flooding)
+    _ins_map_logged = set()
+
     def parse_int_metadata(self, flow_info, int_pkt):
         if INTShim not in int_pkt:
             return
@@ -679,6 +753,13 @@ class Collector:
         has_egress_ts = bool(ins_map & EGRESS_TSTAMP_BIT)
         has_l2_ports = bool(ins_map & L2_PORT_IDS_BIT)
         has_tx_util = bool(ins_map & EGRESS_PORT_TX_UTIL_BIT)
+
+        # Debug: Log instruction mask once per unique value (to understand what's being received)
+        if ins_map not in Collector._ins_map_logged:
+            Collector._ins_map_logged.add(ins_map)
+            log.info(f"[INT Debug] ins_map=0x{ins_map:02X}, hops={hop_count}, hop_meta_len={hop_meta_len_bytes}B, "
+                     f"sw={has_switch_id}, l1={has_l1_ports}, lat={has_hop_latency}, q={has_queue}, "
+                     f"ing_ts={has_ingress_ts}, eg_ts={has_egress_ts}, l2={has_l2_ports}, tx={has_tx_util}")
 
         # Local references for faster access
         switch_ids = flow_info.switch_ids

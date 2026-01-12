@@ -146,7 +146,7 @@ EWC_FISHER_SAMPLES = 200  # Samples for Fisher matrix estimation
 WINDOW_SECONDS = 1.0        # Observation window
 SAFETY_LAG_MS = 0           # REMOVED: No safety lag (user constraint: minimize delay)
 COOLDOWN_SECONDS = 0.0      # No cooldown for faster learning
-DELAY_AFTER_ACTION = 1.0    # INCREASED from 0.8s to 1.0s (user max, ensures action effects visible)
+DELAY_AFTER_ACTION = 1.0    # Sleep after action
 DELAY_NO_ACTION = 1.0       # Match action delay
 
 # Freshness validation - minimum data points required per metric in window
@@ -924,7 +924,7 @@ class QoSRoutingEnv:
         
         # Cache snapshots for comparison
         self.last_snapshot = None
-        
+
         # Frame stacking for velocity/trend detection
         # Stores last STACK_SIZE raw observation states (each 50-dim)
         self.frame_stack: deque = deque(maxlen=STACK_SIZE)
@@ -1070,10 +1070,15 @@ class QoSRoutingEnv:
             Query result tables, or None if all retries failed
         """
         backoff_delays = [0.1, 0.2, 0.4]  # 100ms, 200ms, 400ms
+        start_time = time.monotonic()
 
         for attempt in range(max_retries):
             try:
-                return self.query_api.query(org=self.org, query=flux)
+                result = self.query_api.query(org=self.org, query=flux)
+                elapsed_ms = (time.monotonic() - start_time) * 1000
+                if elapsed_ms > 500:
+                    log.warning(f"[Query Slow] {elapsed_ms:.0f}ms total ({attempt + 1} attempts)")
+                return result
             except Exception as e:
                 if attempt < max_retries - 1:
                     delay = backoff_delays[attempt]
@@ -1081,7 +1086,8 @@ class QoSRoutingEnv:
                               f"retrying in {delay*1000:.0f}ms: {e}")
                     time.sleep(delay)
                 else:
-                    log.error(f"Query failed after {max_retries} attempts: {e}")
+                    elapsed_ms = (time.monotonic() - start_time) * 1000
+                    log.error(f"Query failed after {max_retries} attempts ({elapsed_ms:.0f}ms): {e}")
                     return None
 
     def _time_window(self) -> Tuple[str, str]:
@@ -1090,10 +1096,15 @@ class QoSRoutingEnv:
         start_dt = stop_dt - timedelta(seconds=WINDOW_SECONDS)
         return start_dt.isoformat() + 'Z', stop_dt.isoformat() + 'Z'
 
-    def _query_aggregated_metrics(self, start: str, stop: str) -> Dict:
+    def _query_aggregated_metrics(self, start: str, stop: str, step: int) -> Dict:
         """
         Query aggregated p95 metrics for all queues.
         Returns: Dict with 'tables' and 'metrics_received' keys.
+
+        Args:
+            start: Query window start time (ISO format)
+            stop: Query window stop time (ISO format)
+            step: Global step number for logging (captured at call time)
         """
         flux = f'''
         base = from(bucket:"{self.bucket}")
@@ -1148,6 +1159,135 @@ class QoSRoutingEnv:
                     except (ValueError, TypeError):
                         continue
 
+        # Check if any queue is missing metrics and trigger retry for each type
+        result['recovered_via_retry'] = set()  # Track queues recovered via retry
+
+        # Retry flow_latency (lat)
+        missing_lat_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['lat']]
+        if missing_lat_queues:
+            log.warning(f"[Query S{step}] flow_latency missing for Q{missing_lat_queues}, triggering retry")
+            recovered = self._retry_metric_query(start, stop, missing_lat_queues, "flow_latency", "flow_latency", step)
+            for qid, value in recovered.items():
+                result['metrics'][qid]['lat_p95'] = value
+                result['metrics_received'][qid]['lat'] = True
+                result['recovered_via_retry'].add(qid)
+                log.info(f"[Query S{step}] Recovered lat_p95={value:.2f}ms for Q{qid}")
+
+        # Retry drop rate
+        missing_drop_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['drop']]
+        if missing_drop_queues:
+            log.warning(f"[Query S{step}] drop_rate missing for Q{missing_drop_queues}, triggering retry")
+            recovered = self._retry_metric_query(start, stop, missing_drop_queues, "q_drop_rate_100ms", "drop", step)
+            for qid, value in recovered.items():
+                result['metrics'][qid]['drop_p95'] = value
+                result['metrics_received'][qid]['drop'] = True
+                result['recovered_via_retry'].add(qid)
+                log.info(f"[Query S{step}] Recovered drop_p95={value:.4f} for Q{qid}")
+
+        # Retry utilization
+        missing_util_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['util']]
+        if missing_util_queues:
+            log.warning(f"[Query S{step}] util missing for Q{missing_util_queues}, triggering retry")
+            recovered = self._retry_metric_query(start, stop, missing_util_queues, "tx_utilization", "util", step)
+            for qid, value in recovered.items():
+                result['metrics'][qid]['util_p95'] = value
+                result['metrics_received'][qid]['util'] = True
+                result['recovered_via_retry'].add(qid)
+                log.info(f"[Query S{step}] Recovered util_p95={value:.2f}% for Q{qid}")
+
+        return result
+
+    def _retry_metric_query(self, start: str, stop: str, target_queues: List[int],
+                             measurement: str, metric_name: str, step: int) -> Dict[int, float]:
+        """
+        Retry a metric query with up to 5 attempts, 1 second delay between each.
+        Max wait time: 5 seconds before declaring metric missing.
+
+        On each retry, the query window expands by the cumulative wait time to catch
+        data that was written during the delay.
+
+        Continues retrying until ALL target_queues are recovered or retries exhausted.
+
+        Args:
+            start: Query window start time (ISO format)
+            stop: Query window stop time (ISO format)
+            target_queues: List of queue IDs that need to be recovered
+            measurement: InfluxDB measurement name (e.g., "flow_latency", "q_drop_rate_100ms", "tx_utilization")
+            metric_name: Human-readable name for logging (e.g., "flow_latency", "drop", "util")
+            step: Global step number for logging (passed from caller)
+
+        Returns: Dict mapping queue_id -> p95 value
+        """
+        result = {}
+        remaining_queues = set(target_queues)
+        max_retries = 5
+        retry_delay = 1.0  # 1 second
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                time.sleep(retry_delay)
+
+            # Expand stop time by cumulative wait (attempt * retry_delay seconds)
+            # This catches data written during our retry delays
+            window_extension = attempt * retry_delay
+            if window_extension > 0:
+                stop_dt = datetime.fromisoformat(stop.rstrip('Z')) + timedelta(seconds=window_extension)
+                current_stop = stop_dt.isoformat() + 'Z'
+            else:
+                current_stop = stop
+
+            flux = f'''
+            from(bucket:"{self.bucket}")
+                |> range(start:{start}, stop:{current_stop})
+                |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+                |> filter(fn: (r) => r._measurement == "{measurement}")
+                |> toFloat()
+                |> group(columns:["queue_id"])
+                |> quantile(q:0.95, method:"estimate_tdigest")
+            '''
+
+            t0 = time.time()
+            try:
+                tables = self.query_api.query(org=self.org, query=flux)
+                elapsed_ms = (time.time() - t0) * 1000
+
+                if tables:
+                    for table in tables:
+                        for record in table.records:
+                            try:
+                                qid = int(record.values.get('queue_id', -1))
+                                value = record.get_value()
+                                if qid in remaining_queues and value is not None:
+                                    result[qid] = float(value)
+                                    remaining_queues.discard(qid)
+                            except (ValueError, TypeError):
+                                continue
+
+                window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
+                if not remaining_queues:
+                    # All target queues recovered
+                    log.info(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} SUCCESS: "
+                            f"got ALL Q{list(result.keys())} in {elapsed_ms:.0f}ms {window_info}")
+                    return result
+                elif result:
+                    # Some queues recovered, but not all - continue retrying
+                    log.info(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} PARTIAL: "
+                            f"got Q{list(result.keys())}, still missing Q{list(remaining_queues)} "
+                            f"({elapsed_ms:.0f}ms {window_info})")
+                else:
+                    log.warning(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries}: "
+                               f"no data ({elapsed_ms:.0f}ms, {window_info})")
+
+            except Exception as e:
+                elapsed_ms = (time.time() - t0) * 1000
+                log.warning(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} FAILED "
+                           f"({elapsed_ms:.0f}ms): {e}")
+
+        if result:
+            log.warning(f"[Query S{step}] {metric_name} retry exhausted after {max_retries} attempts - "
+                       f"recovered Q{list(result.keys())}, missing Q{list(remaining_queues)}")
+        else:
+            log.warning(f"[Query S{step}] {metric_name} retry exhausted after {max_retries} attempts (5s max)")
         return result
 
     def _collect_snapshot(self) -> Dict[int, Dict]:
@@ -1183,17 +1323,24 @@ class QoSRoutingEnv:
             'data_valid': False,  # Track telemetry validity
         } for qid in QIDS}
 
-        # CPU Optimization: Run three independent queries in parallel using persistent ThreadPoolExecutor
+        # CPU Optimization: Run two independent queries in parallel using persistent ThreadPoolExecutor
         # This reduces total query time from ~1.5-3s (sequential) to ~0.5-1s (parallel)
         # Using persistent executor avoids thread creation/destruction overhead per step
         aggregated_result = None
-        freshness_map = {qid: False for qid in QIDS}
         all_hot_demands = {}
 
-        # Submit all three queries in parallel using persistent executor
-        future_aggregated = self._query_executor.submit(self._query_aggregated_metrics, start, stop)
-        future_freshness = self._query_executor.submit(self._check_all_queues_freshness)
-        future_hottest = self._query_executor.submit(self._get_all_hottest_demands)
+        # Capture step number NOW before submitting to thread pool
+        # This ensures consistent step logging even if retries run after step increments
+        step = self.global_step
+
+        # ThreadPoolExecutor health check
+        queue_size = self._query_executor._work_queue.qsize()
+        if queue_size > 2:
+            log.warning(f"[ThreadPool] Work queue backlog: {queue_size} (expected ~0)")
+
+        # Submit queries in parallel using persistent executor (pass step for logging)
+        future_aggregated = self._query_executor.submit(self._query_aggregated_metrics, start, stop, step)
+        future_hottest = self._query_executor.submit(self._get_all_hottest_demands, step)
 
         # Collect results as they complete
         try:
@@ -1202,18 +1349,15 @@ class QoSRoutingEnv:
             log.warning(f"[Parallel Query] Aggregated metrics query failed: {e}")
 
         try:
-            freshness_map = future_freshness.result(timeout=5.0)
-        except Exception as e:
-            log.warning(f"[Parallel Query] Freshness query failed: {e}")
-
-        try:
             all_hot_demands = future_hottest.result(timeout=5.0)
         except Exception as e:
             log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
 
         # Process aggregated metrics result
         metrics_received = {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS}
+        recovered_via_retry = set()  # Track queues that were recovered via retry
         if aggregated_result is not None:
+            recovered_via_retry = aggregated_result.get('recovered_via_retry', set())
             for qid in QIDS:
                 metrics = aggregated_result['metrics'].get(qid, {})
                 received = aggregated_result['metrics_received'].get(qid, {})
@@ -1227,15 +1371,14 @@ class QoSRoutingEnv:
                     snapshot[qid]['util_p95'] = metrics['util_p95']
                     metrics_received[qid]['util'] = received.get('util', False)
 
-        # Mark data_valid only if ALL 3 metrics were returned, values are sane, AND data is fresh
+        # Mark data_valid - if metrics present and sane, data is valid
+        # Freshness check removed - if we got data from InfluxDB, it's fresh enough
         for qid in QIDS:
             m = metrics_received[qid]
             metrics_present = m['lat'] and m['drop'] and m['util']
             values_sane = self._metric_sane(snapshot[qid]) if metrics_present else False
-            # Check freshness from batch result
-            data_fresh = freshness_map.get(qid, False)
-            snapshot[qid]['data_valid'] = metrics_present and values_sane and data_fresh
-            snapshot[qid]['data_fresh'] = data_fresh  # For debugging
+            snapshot[qid]['data_valid'] = metrics_present and values_sane
+            snapshot[qid]['recovered_via_retry'] = qid in recovered_via_retry
 
         # Log telemetry status for monitoring
         valid_count = sum(1 for qid in QIDS if snapshot[qid]['data_valid'])
@@ -1247,9 +1390,12 @@ class QoSRoutingEnv:
                     reasons.append(f"q{qid}:missing_metrics")
                 elif not self._metric_sane(snapshot[qid]):
                     reasons.append(f"q{qid}:insane_values")
-                elif not snapshot[qid].get('data_fresh', True):
-                    reasons.append(f"q{qid}:stale_data")
             log.warning(f"[Telemetry] Invalid data for queues {missing} ({', '.join(reasons)}) - only {valid_count}/{len(QIDS)} valid")
+            # Detailed diagnostics for debugging missing metrics
+            log.warning(f"[Telemetry Debug] Time window: {start} to {stop}")
+            log.warning(f"[Telemetry Debug] Global step: {self.global_step}")
+            log.warning(f"[Telemetry Debug] Metrics received: {metrics_received}")
+            log.warning(f"[Telemetry Debug] Hot demands: {all_hot_demands}")
 
         # 2. Get Path and Bottleneck Info (Queue-Specific)
         # Each queue gets its own bottleneck detection and alternative metrics
@@ -1260,9 +1406,10 @@ class QoSRoutingEnv:
             # Find hottest demand for this queue from batch result
             hot = all_hot_demands.get(qid)
             if not hot:
-                log.info(f"[Snapshot] Queue {qid}: No hot demand found, skipping bottleneck detection")
+                # No cache fallback - retry logic already exhausted in _get_all_hottest_demands
+                log.info(f"[Snapshot] Queue {qid}: No hot demand found after retries, skipping bottleneck detection")
                 continue
-            
+
             src_ip, dst_ip = hot
             log.debug(f"[Snapshot] Queue {qid}: hot_demand=({src_ip}, {dst_ip})")
             snapshot[qid]['hot_src_ip'] = src_ip
@@ -1375,7 +1522,7 @@ class QoSRoutingEnv:
                 else:
                     snapshot[qid]['alternatives'] = []
                     snapshot[qid]['alt_exists'] = False
-        
+
         return snapshot
 
     def _query_switch_metrics_for_queue(self, sw_ids: List[int], qid: int) -> Dict[int, Dict]:
@@ -1424,82 +1571,97 @@ class QoSRoutingEnv:
                     }
 
         return results
-    
-    def _check_all_queues_freshness(self) -> Dict[int, bool]:
-        """
-        Check freshness for ALL queues in a single query.
-        Returns: Dict[qid, bool]
+
+    def _get_all_hottest_demands(self, step: int) -> Dict[int, Tuple[str, str]]:
+        """Get the demand with highest latency for ALL queues in one query.
+
+        Uses retry logic similar to flow_latency recovery:
+        - Up to 5 retries with 1 second delay between each
+        - Query window expands on each retry to catch delayed data
+        - Continues until all queues have hot demands or retries exhausted
+
+        Args:
+            step: Global step number for logging (passed from caller)
         """
         start, stop = self._time_window()
-        
-        # Group by both queue_id and _measurement
-        flux = f'''
-        from(bucket:"{self.bucket}")
-            |> range(start:{start}, stop:{stop})
-            |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
-            |> filter(fn: (r) => r._measurement == "flow_latency" or r._measurement == "q_drop_rate_100ms" or r._measurement == "tx_utilization")
-            |> group(columns:["queue_id", "_measurement"])
-            |> count()
-        '''
-        
-        # Initialize counts: qid -> measurement -> count
-        counts = {qid: {'flow_latency': 0, 'q_drop_rate_100ms': 0, 'tx_utilization': 0} for qid in QIDS}
-        freshness_map = {qid: False for qid in QIDS}
 
-        # PHASE 2.4: Use retry wrapper for query
-        tables = self._influx_query_with_retry(flux)
-        if tables is not None:
-            for table in tables:
-                for record in table.records:
-                    try:
-                        qid = int(record.values.get('queue_id', -1))
-                        measurement = record.values.get('_measurement')
-                        count = record.get_value()
-
-                        if qid in counts and measurement in counts[qid] and count is not None:
-                            counts[qid][measurement] = int(count)
-                    except (ValueError, TypeError):
-                        continue
-
-        # Check freshness per queue
-        for qid in QIDS:
-            c = counts[qid]
-            fresh = all(cnt >= MIN_POINTS_PER_METRIC for cnt in c.values())
-            freshness_map[qid] = fresh
-            if not fresh:
-                log.debug(f"[Freshness] Queue {qid} has insufficient points: {c}")
-                
-        return freshness_map
-    
-    def _get_all_hottest_demands(self) -> Dict[int, Tuple[str, str]]:
-        """Get the demand with highest latency for ALL queues in one query."""
-        start, stop = self._time_window()
-        flux = f'''
-        from(bucket:"{self.bucket}")
-            |> range(start:{start}, stop:{stop})
-            |> filter(fn: (r) => r._measurement == "flow_latency")
-            |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
-            |> toFloat()
-            |> group(columns:["queue_id", "src_ip", "dst_ip"])
-            |> mean(column:"_value")
-            |> group(columns:["queue_id"])
-            |> sort(columns:["_value"], desc:true)
-            |> limit(n:1)
-        '''
         results = {}
-        # PHASE 2.4: Use retry wrapper for query
-        tables = self._influx_query_with_retry(flux)
-        if tables is not None:
-            for table in tables:
-                for record in table.records:
-                    try:
-                        qid = int(record.values.get('queue_id', -1))
-                        src = record.values.get('src_ip')
-                        dst = record.values.get('dst_ip')
-                        if qid in QIDS and src and dst:
-                            results[qid] = (str(src), str(dst))
-                    except (ValueError, TypeError):
-                        continue
+        remaining_queues = set(QIDS)
+        max_retries = 5
+        retry_delay = 1.0
+
+        for attempt in range(max_retries):
+            if attempt > 0:
+                time.sleep(retry_delay)
+
+            # Expand stop time by cumulative wait
+            window_extension = attempt * retry_delay
+            if window_extension > 0:
+                stop_dt = datetime.fromisoformat(stop.rstrip('Z')) + timedelta(seconds=window_extension)
+                current_stop = stop_dt.isoformat() + 'Z'
+            else:
+                current_stop = stop
+
+            flux = f'''
+            from(bucket:"{self.bucket}")
+                |> range(start:{start}, stop:{current_stop})
+                |> filter(fn: (r) => r._measurement == "flow_latency")
+                |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+                |> toFloat()
+                |> group(columns:["queue_id", "src_ip", "dst_ip"])
+                |> mean(column:"_value")
+                |> group(columns:["queue_id"])
+                |> sort(columns:["_value"], desc:true)
+                |> limit(n:1)
+            '''
+
+            t0 = time.time()
+            try:
+                tables = self.query_api.query(org=self.org, query=flux)
+                elapsed_ms = (time.time() - t0) * 1000
+
+                if tables:
+                    for table in tables:
+                        for record in table.records:
+                            try:
+                                qid = int(record.values.get('queue_id', -1))
+                                src = record.values.get('src_ip')
+                                dst = record.values.get('dst_ip')
+                                if qid in remaining_queues and src and dst:
+                                    results[qid] = (str(src), str(dst))
+                                    remaining_queues.discard(qid)
+                            except (ValueError, TypeError):
+                                continue
+
+                window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
+                if not remaining_queues:
+                    # All queues have hot demands
+                    if attempt > 0:
+                        log.info(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} SUCCESS: "
+                                f"got ALL Q{list(results.keys())} in {elapsed_ms:.0f}ms {window_info}")
+                    return results
+                elif results and attempt > 0:
+                    # Some found, continue retrying for the rest
+                    log.info(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} PARTIAL: "
+                            f"got Q{list(results.keys())}, still missing Q{list(remaining_queues)} "
+                            f"({elapsed_ms:.0f}ms {window_info})")
+                elif attempt > 0:
+                    log.warning(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries}: "
+                               f"no data ({elapsed_ms:.0f}ms, {window_info})")
+
+            except Exception as e:
+                elapsed_ms = (time.time() - t0) * 1000
+                if attempt > 0:
+                    log.warning(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} FAILED "
+                               f"({elapsed_ms:.0f}ms): {e}")
+
+            # On first attempt, if we got partial results, trigger retry
+            if attempt == 0 and remaining_queues:
+                log.warning(f"[Query S{step}] hot_demands missing for Q{list(remaining_queues)}, triggering retry")
+
+        if results and remaining_queues:
+            log.warning(f"[Query S{step}] hot_demands retry exhausted - "
+                       f"got Q{list(results.keys())}, missing Q{list(remaining_queues)}")
         return results
     
     def _metric_sane(self, q: Dict) -> bool:
@@ -2531,9 +2693,22 @@ def train(args):
             if rolling_100 > best_avg_reward and len(episode_rewards) >= 50:
                 best_avg_reward = rolling_100
                 timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_best.pth")
-                agent.save(path)
+                new_path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_best.pth")
+
+                # Find old best checkpoints (to delete after successful save)
+                old_bests = glob.glob(os.path.join(args.save_dir, "*-dqn_v4_best.pth"))
+
+                # Save new checkpoint first
+                agent.save(new_path)
                 log.info(f"New best model saved: rolling_avg_100={best_avg_reward:.3f}")
+
+                # Delete previous best checkpoint(s) after successful save
+                for old_path in old_bests:
+                    try:
+                        os.remove(old_path)
+                        log.info(f"Deleted old best checkpoint: {old_path}")
+                    except OSError as e:
+                        log.warning(f"Failed to delete old checkpoint {old_path}: {e}")
     
     except KeyboardInterrupt:
         log.info("\nTraining interrupted by user")

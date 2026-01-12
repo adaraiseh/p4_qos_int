@@ -7,6 +7,7 @@ Provides consistent logging across all modules with:
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 from datetime import datetime
@@ -79,7 +80,12 @@ def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug
 
     if not has_this_file_handler:
         # File handler - configurable level with full timestamps
-        file_handler = logging.FileHandler(log_file_path)
+        # 50 MB limit, no backup files (older data deleted when limit reached)
+        file_handler = RotatingFileHandler(
+            log_file_path,
+            maxBytes=50 * 1024 * 1024,  # 50 MB
+            backupCount=0,
+        )
         file_handler.setLevel(file_level)
         file_formatter = logging.Formatter(
             "%(asctime)s.%(msecs)03d [%(levelname)s] [%(name)s] %(message)s",

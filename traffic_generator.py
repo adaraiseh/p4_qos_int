@@ -41,12 +41,16 @@ Key features:
 import os
 import sys
 import json
+import glob
 import time
 import random
+import threading
 import subprocess
 import logging
 import argparse
+import csv
 from pathlib import Path
+from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
 from p4utils.utils.task_scheduler import Task, TaskClient
@@ -286,7 +290,11 @@ class TrafficManager:
         self.current_load: Dict[int, float] = {}
         self.current_profile_name: str = ""
         self.current_profile_category: str = ""
-        
+
+        # iPerf log cleanup thread (CPU-efficient, runs every 120s)
+        self._log_cleanup_stop = threading.Event()
+        self._log_cleanup_thread = None
+
         # Balanced random selection with 60-episode windows
         self._profile_names = list(self.TRAFFIC_PROFILES.keys())
         self._episode_count = 0
@@ -311,7 +319,21 @@ class TrafficManager:
         self._in_transition = False
         self._transition_start_time = 0.0
         self._transition_stabilization_time = 3.0  # Seconds to wait for traffic to stabilize
-    
+
+        # Health monitoring thread (auto-restart crashed iperf processes)
+        self._health_monitor_stop = threading.Event()
+        self._health_monitor_thread = None
+        self._traffic_active = False  # True when traffic should be running
+        self._last_packet_len = 1250  # Remember packet length for restarts
+        self._health_check_interval = 10.0  # Check every 10 seconds
+        self._restart_count = 0  # Track restarts for logging
+
+        # Traffic logging - stores traffic configurations to CSV for analysis
+        self._traffic_log_dir = Path("log")
+        self._traffic_log_dir.mkdir(exist_ok=True)
+        self._traffic_log_file = self._traffic_log_dir / "traffic_log.csv"
+        self._traffic_log_initialized = False
+
     def _discover_traffic_hosts(self) -> List[str]:
         """Discover traffic hosts from hosts_ips dict or topology.json (hosts with id < 100)."""
         # If we loaded from config, use those host names
@@ -344,7 +366,46 @@ class TrafficManager:
                 if name.startswith('h') and int(name[1:]) < 100
             ]
         return sorted(hosts, key=lambda x: int(x[1:]))
-    
+
+    def _log_traffic_config(self, event: str = "start", extra_info: Dict = None):
+        """Log traffic configuration to CSV file for analysis.
+
+        Args:
+            event: Event type (start, stop, burst_start, burst_end, restart)
+            extra_info: Optional dict with additional info to log
+        """
+        try:
+            # Initialize CSV with header if needed
+            if not self._traffic_log_initialized:
+                if not self._traffic_log_file.exists():
+                    with open(self._traffic_log_file, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            'timestamp', 'event', 'profile_name', 'profile_category',
+                            'load_q0', 'load_q1', 'load_q7', 'is_bursty',
+                            'baseline_profile', 'num_traffic_pairs', 'extra_info'
+                        ])
+                self._traffic_log_initialized = True
+
+            # Write traffic configuration row
+            with open(self._traffic_log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    event,
+                    self.current_profile_name,
+                    self.current_profile_category,
+                    f"{self.current_load.get(0, 0):.3f}",
+                    f"{self.current_load.get(1, 0):.3f}",
+                    f"{self.current_load.get(7, 0):.3f}",
+                    getattr(self, '_step_burst_profile', None) is not None,
+                    getattr(self, '_step_burst_baseline', ''),
+                    len(self.traffic_pairs),
+                    json.dumps(extra_info) if extra_info else ''
+                ])
+        except Exception as e:
+            log.warning(f"Failed to log traffic config: {e}")
+
     def _build_pods(self) -> List[List[str]]:
         """Build pod structure (pairs of hosts per ToR)."""
         pods = []
@@ -470,10 +531,16 @@ class TrafficManager:
     
     def stop_traffic(self):
         """Stop all traffic processes using pkill."""
+        # Stop health monitoring first to prevent auto-restart during stop
+        self._traffic_active = False
+        self._stop_health_monitor()
+        self._stop_log_cleanup_thread()
         log.info("Stopping all traffic processes...")
         try:
-            # Kill iperf3 processes on our ports (61xx, 62xx)
-            subprocess.run(['pkill', '-9', '-f', 'iperf3.*-p 6[12]'], capture_output=True)
+            # Kill iperf3 processes on our ports (6xxx range: 6100-6657)
+            # Port scheme: 6000 + flow_id*10 + qid, where flow_id in 10-65, qid in 0,1,7
+            # This matches ports 6100-6657
+            subprocess.run(['pkill', '-9', '-f', 'iperf3.*-p 6[1-6][0-9][0-9]'], capture_output=True)
             # Kill bash wrapper loops with our tag
             result = subprocess.run(
                 ['pkill', '-9', '-f', f'bash.*{self.TRAFFIC_TAG}'],
@@ -485,8 +552,230 @@ class TrafficManager:
                 log.info("No traffic processes to kill")
         except Exception as e:
             log.warning(f"Failed to kill traffic: {e}")
+
+        # Log traffic stop event
+        self._log_traffic_config(event="stop")
         time.sleep(0.5)
-    
+
+    def _start_log_cleanup_thread(self):
+        """Start background thread to trim iperf logs (CPU-efficient)."""
+        if self._log_cleanup_thread is not None:
+            return  # Already running
+        self._log_cleanup_stop.clear()
+        self._log_cleanup_thread = threading.Thread(
+            target=self._log_cleanup_loop,
+            daemon=True,
+            name="iperf-log-cleanup"
+        )
+        self._log_cleanup_thread.start()
+
+    def _stop_log_cleanup_thread(self):
+        """Stop the log cleanup thread."""
+        if self._log_cleanup_thread is None:
+            return
+        self._log_cleanup_stop.set()
+        self._log_cleanup_thread.join(timeout=2)
+        self._log_cleanup_thread = None
+
+    def _log_cleanup_loop(self):
+        """Periodically trim iperf log files (every 120s for low CPU usage)."""
+        while not self._log_cleanup_stop.wait(timeout=120):
+            self._trim_iperf_logs()
+
+    def _trim_iperf_logs(self):
+        """Trim iperf log files to ~10 min of data (size-based, CPU-efficient)."""
+        max_size = 5 * 1024 * 1024   # 5 MB threshold
+        keep_size = 4 * 1024 * 1024  # Keep last 4 MB
+
+        for log_path in glob.glob("/tmp/*_iperf3_*.log"):
+            try:
+                # Only check size (cheap stat call), skip if under threshold
+                if os.path.getsize(log_path) <= max_size:
+                    continue
+                # Only read/write when trimming is needed
+                with open(log_path, 'rb') as f:
+                    f.seek(-keep_size, 2)
+                    f.readline()  # Skip partial line
+                    data = f.read()
+                with open(log_path, 'wb') as f:
+                    f.write(data)
+                log.debug(f"Trimmed iperf log: {log_path}")
+            except Exception:
+                pass  # Ignore errors (file may be in use)
+
+    def _start_health_monitor(self):
+        """Start background thread to monitor and restart crashed iperf processes."""
+        if self._health_monitor_thread is not None:
+            return  # Already running
+        self._health_monitor_stop.clear()
+        self._health_monitor_thread = threading.Thread(
+            target=self._health_monitor_loop,
+            daemon=True,
+            name="iperf-health-monitor"
+        )
+        self._health_monitor_thread.start()
+        log.debug("[Health Monitor] Started")
+
+    def _stop_health_monitor(self):
+        """Stop the health monitor thread."""
+        if self._health_monitor_thread is None:
+            return
+        self._health_monitor_stop.set()
+        self._health_monitor_thread.join(timeout=2)
+        self._health_monitor_thread = None
+        log.debug("[Health Monitor] Stopped")
+
+    def _health_monitor_loop(self):
+        """Periodically check and restart missing iperf processes."""
+        while not self._health_monitor_stop.wait(timeout=self._health_check_interval):
+            if not self._traffic_active:
+                continue
+            try:
+                self._check_and_restart_traffic()
+            except Exception as e:
+                log.warning(f"[Health Monitor] Error: {e}")
+
+    def _get_expected_ports(self) -> Dict[str, set]:
+        """Get expected iperf ports per host.
+
+        Returns:
+            Dict mapping hostname to set of expected ports
+        """
+        expected = {}
+
+        # Servers: receivers need server ports
+        for _, receiver, flow_id in self.traffic_pairs:
+            if receiver not in expected:
+                expected[receiver] = {'servers': set(), 'clients': set()}
+            for qid in ALL_QUEUES:
+                port = _traffic_dst_port(flow_id, qid)
+                expected[receiver]['servers'].add(port)
+
+        # Clients: senders need client connections
+        for sender, _, flow_id in self.traffic_pairs:
+            if sender not in expected:
+                expected[sender] = {'servers': set(), 'clients': set()}
+            for qid in ALL_QUEUES:
+                port = _traffic_dst_port(flow_id, qid)
+                expected[sender]['clients'].add(port)
+
+        return expected
+
+    def _get_running_iperf_ports(self) -> Dict[str, Dict[str, set]]:
+        """Get currently running iperf ports per host.
+
+        Returns:
+            Dict mapping hostname to {'servers': set, 'clients': set} of ports
+        """
+        running = {}
+        try:
+            # Get all iperf3 processes with their arguments
+            result = subprocess.run(
+                ['pgrep', '-a', 'iperf3'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                return running  # No iperf processes
+
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                # Parse: "12345 iperf3 -s -p 6100 ..." or "12345 iperf3 -c 10.x.x.x -p 6100 ..."
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+
+                # Find port
+                port = None
+                is_server = '-s' in parts
+                for i, part in enumerate(parts):
+                    if part == '-p' and i + 1 < len(parts):
+                        try:
+                            port = int(parts[i + 1])
+                        except ValueError:
+                            pass
+                        break
+
+                if port is None:
+                    continue
+
+                # Match to host by port pattern
+                # Port scheme: 6000 + flow_id*10 + qid
+                for host, ip in self.hosts_ips.items():
+                    if host not in running:
+                        running[host] = {'servers': set(), 'clients': set()}
+
+                # For simplicity, track globally - we'll check counts
+                for host in running:
+                    if is_server:
+                        running[host]['servers'].add(port)
+                    else:
+                        running[host]['clients'].add(port)
+
+        except Exception as e:
+            log.debug(f"[Health Monitor] Error getting running ports: {e}")
+
+        return running
+
+    def _check_and_restart_traffic(self):
+        """Check if any iperf processes are missing and restart them."""
+        expected = self._get_expected_ports()
+
+        # Count expected total processes
+        expected_servers = sum(len(v['servers']) for v in expected.values())
+        expected_clients = sum(len(v['clients']) for v in expected.values())
+        expected_total = expected_servers + expected_clients
+
+        # Count running processes (quick pgrep count)
+        try:
+            result = subprocess.run(
+                ['pgrep', '-c', 'iperf3'],
+                capture_output=True, text=True, timeout=5
+            )
+            running_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+        except Exception:
+            running_count = 0
+
+        # If significantly fewer processes running, restart
+        # Allow some slack (90% threshold) since processes might be briefly restarting
+        threshold = int(expected_total * 0.7)  # 70% threshold
+
+        if running_count < threshold:
+            self._restart_count += 1
+            log.warning(f"[Health Monitor] Only {running_count}/{expected_total} iperf processes running "
+                       f"(threshold: {threshold}). Restarting traffic... (restart #{self._restart_count})")
+
+            # Mark transition for telemetry stability
+            self._in_transition = True
+            self._transition_start_time = time.monotonic()
+
+            # Restart all traffic (stop then start)
+            self._stop_all_iperf()
+            time.sleep(0.5)
+            self._start_servers()
+            time.sleep(1.0)
+            self._start_clients(self._last_packet_len)
+
+            # Log restart event
+            self._log_traffic_config(event="restart", extra_info={
+                'reason': 'health_monitor',
+                'running_count': running_count,
+                'expected_total': expected_total,
+                'restart_count': self._restart_count
+            })
+            log.info(f"[Health Monitor] Traffic restarted with profile '{self.current_profile_name}'")
+        else:
+            # Log health status periodically at debug level
+            log.debug(f"[Health Monitor] OK: {running_count}/{expected_total} iperf processes running")
+
+    def _stop_all_iperf(self):
+        """Stop all iperf processes without clearing traffic state."""
+        try:
+            subprocess.run(['pkill', '-9', '-f', 'iperf3.*-p 6[1-6][0-9][0-9]'], capture_output=True)
+            subprocess.run(['pkill', '-9', '-f', f'bash.*{self.TRAFFIC_TAG}'], capture_output=True)
+        except Exception as e:
+            log.debug(f"Error stopping iperf: {e}")
+
     def start_traffic(self, packet_len: int = 1250,
                        category_weights: Dict[str, float] = None,
                        profile_name: str = None) -> Dict[str, any]:
@@ -505,6 +794,7 @@ class TrafficManager:
         """
         self.stop_traffic()
         time.sleep(0.3)
+        self._start_log_cleanup_thread()
 
         # Mark traffic as transitioning - telemetry will be unstable during ramp-up
         self._in_transition = True
@@ -615,12 +905,22 @@ class TrafficManager:
         
         log.info(f"Starting profile '{self.current_profile_name}' ({self.current_profile_category})")
         log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
-        
+
+        # Track state for health monitoring
+        self._last_packet_len = packet_len
+        self._traffic_active = True
+
         # Start servers then clients
         self._start_servers()
         time.sleep(1.0)
         self._start_clients(packet_len)
-        
+
+        # Start health monitoring to auto-restart crashed processes
+        self._start_health_monitor()
+
+        # Log traffic configuration to CSV
+        self._log_traffic_config(event="start", extra_info={'packet_len': packet_len})
+
         log.info("Traffic generation started")
         return {
             'profile_name': self.current_profile_name,
@@ -740,6 +1040,12 @@ class TrafficManager:
             # Return to baseline with original loads
             baseline = self._step_burst_baseline or 'medium_1'
             self._restore_baseline_traffic(baseline)
+            # Log burst end event
+            self._log_traffic_config(event="burst_end", extra_info={
+                'bursty_profile': bursty_profile,
+                'actual_duration_steps': actual_duration,
+                'baseline_profile': baseline
+            })
             log.info(f"[BURST END] Ended after {actual_duration} steps. Returning to {baseline}.")
             result = "BURST ENDED"
         
@@ -751,6 +1057,13 @@ class TrafficManager:
             # Switch to burst profile
             self.start_traffic(profile_name=cfg['burst_profile'])
             remaining = self._step_burst_end_step - current_step
+            # Log burst start event (note: start_traffic already logs "start", this adds burst context)
+            self._log_traffic_config(event="burst_start", extra_info={
+                'bursty_profile': bursty_profile,
+                'burst_profile': cfg['burst_profile'],
+                'duration_steps': remaining,
+                'current_step': current_step
+            })
             log.info(f"[BURST START] Profile={cfg['burst_profile']}, "
                      f"duration={remaining} steps (ends at step {self._step_burst_end_step})")
             result = f"BURST STARTED: {cfg['burst_profile']} for {remaining} steps"

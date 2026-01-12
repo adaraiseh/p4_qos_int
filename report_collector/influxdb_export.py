@@ -156,7 +156,7 @@ def main():
     c = Collector(
         influx_client, args.influx_org, args.influx_bucket,
         write_async=True, flush_interval_ms=50, batch_size=1000,
-        use_device_time=False,
+        use_device_time=False,  # P4 device timestamps are NOT Unix epoch - must use system time
         aggregate_enabled=False
     )
 

@@ -67,11 +67,9 @@ rl_agent_4.DELAY_NO_ACTION = DELAY_NO_ACTION
 # =============================================================================
 #                              LOGGING SETUP
 # =============================================================================
-# =============================================================================
-#                              LOGGING SETUP
-# =============================================================================
-# Logging is configured via setup_logging imported from rl_agent_4
-log = logging.getLogger(__name__)
+# Use 'rl_agent_4' logger name to match training - this logger is configured
+# by setup_logging() with proper console and file handlers
+log = logging.getLogger('rl_agent_4')
 
 
 # =============================================================================
@@ -398,7 +396,7 @@ class ProductionRunner:
         env = QoSRoutingEnv(
             args.influx_bucket, args.influx_token,
             args.influx_org, args.influx_url,
-            verbose=args.verbose,
+            verbose=False,  # Controller verbosity disabled (logs go to file)
             reset_network=True,  # Reset network at start for clean baseline
             production_mode=True,  # Production: continuous operation
             topology_builder=topology_builder,
@@ -433,14 +431,14 @@ class ProductionRunner:
         # Traffic generation (optional) - fixed profile for entire run
         traffic_manager = None
         if args.generate_traffic:
-            traffic_manager = TrafficManager()
+            traffic_manager = TrafficManager(config_path=args.config)
             log.info(f"Traffic generation enabled with profile: {args.traffic_profile}")
             
             # Start traffic with fixed profile
             profile_info = traffic_manager.start_traffic(profile_name=args.traffic_profile)
             log.info(f"Started traffic: {profile_info['profile_name']} ({profile_info['profile_category']})")
-            log.info("Waiting 15s for traffic to stabilize...")
-            time.sleep(15.0)
+            log.info("Waiting 5s for traffic to stabilize...")
+            time.sleep(5.0)
         
         # CSV logging
         os.makedirs('data', exist_ok=True)
@@ -494,11 +492,8 @@ class ProductionRunner:
                 
                 # Take step
                 next_state, reward, terminated, truncated, info = env.step(action)
-                
-                # Write metrics to InfluxDB
-                metrics.write_metrics(self.step, action, reward, info, q_stats)
-                
-                # Action name mapping (8 actions)
+
+                # Console logging (matches training format) - placed immediately after env.step
                 action_names = {
                     0: "noop",
                     1: "vo-alt0", 2: "vo-alt1",           # Voice
@@ -507,17 +502,10 @@ class ProductionRunner:
                     7: "multi",                            # Multi-queue
                 }
                 action_name = action_names.get(action, str(action))
-                
-                # Console logging
-                if self.step % args.log_every == 0:
-                    log.info(
-                        f"[Step {self.step:5d}] "
-                        f"action={action_name:8s} "
-                        f"reward={reward:+.2f} "
-                        f"Q_max={q_stats['q_max']:+.2f} "
-                        f"sla={len(info['sla_met'])}/3 "
-                        f"streak={info['sla_streak']}"
-                    )
+                log.info(f"[Step {self.step}] action={action_name:8s} reward={reward:+.2f} sla={len(info['sla_met'])}/3 streak={info['sla_streak']}")
+
+                # Write metrics to InfluxDB
+                metrics.write_metrics(self.step, action, reward, info, q_stats)
                 
                 # CSV logging
                 csv_writer.writerow([
@@ -590,9 +578,10 @@ def main():
     parser.add_argument('--influx-token', default=os.environ.get('INFLUX_TOKEN'),
                         help='InfluxDB token (or set INFLUX_TOKEN env var)')
     
-    # Controller
-    parser.add_argument('--verbose', action='store_true',
-                        help='Show verbose P4 controller output')
+    # Logging
+    parser.add_argument('--log-level', type=str, default='info',
+                        choices=['debug', 'info', 'warning', 'error'],
+                        help='Console log level (file always logs DEBUG)')
 
     # Topology configuration
     parser.add_argument('--config', '-c', type=str, default=None,
@@ -612,7 +601,8 @@ def main():
     
     args = parser.parse_args()
 
-    setup_logging(args.verbose)
+    # Setup logging (matches training: INFO console, DEBUG file with 50MB rotation)
+    setup_logging(log_level=args.log_level)
 
     if not args.influx_token:
         log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
