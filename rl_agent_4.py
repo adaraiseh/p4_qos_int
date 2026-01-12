@@ -723,17 +723,13 @@ class DQNAgent:
         log.info(f"Model loaded from {path}")
     
     def get_stats(self) -> Dict:
-        """Get agent statistics."""
+        """Get agent statistics for logging and metrics."""
         return {
             'eps': self.eps,
-            'beta': self.beta,
-            'step_count': self.step_count,
             'buffer_size': len(self.replay_buffer),
             'avg_loss': np.mean(self.losses) if self.losses else 0.0,
-            'avg_reward': np.mean(self.rewards) if self.rewards else 0.0,
             'last_loss': self.last_loss,
             'q_max': np.mean(self.q_values_max) if self.q_values_max else 0.0,
-            'q_mean': np.mean(self.q_values_mean) if self.q_values_mean else 0.0,
         }
 
     # =========================================================================
@@ -954,7 +950,8 @@ class QoSRoutingEnv:
 
         # CPU Optimization: Persistent ThreadPoolExecutor for parallel InfluxDB queries
         # Avoids thread creation/destruction overhead on every _collect_snapshot() call
-        self._query_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="influx_query")
+        # 5 workers: 2 main queries + up to 3 parallel retries (lat, drop, util)
+        self._query_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="influx_query")
 
     def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
         """Reset episode and return initial stacked state.
@@ -1159,41 +1156,62 @@ class QoSRoutingEnv:
                     except (ValueError, TypeError):
                         continue
 
-        # Check if any queue is missing metrics and trigger retry for each type
+        # Check if any queue is missing metrics and trigger retries IN PARALLEL
         result['recovered_via_retry'] = set()  # Track queues recovered via retry
 
-        # Retry flow_latency (lat)
         missing_lat_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['lat']]
+        missing_drop_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['drop']]
+        missing_util_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['util']]
+
+        # Submit all retries in parallel (if needed)
+        retry_futures = {}
         if missing_lat_queues:
             log.warning(f"[Query S{step}] flow_latency missing for Q{missing_lat_queues}, triggering retry")
-            recovered = self._retry_metric_query(start, stop, missing_lat_queues, "flow_latency", "flow_latency", step)
-            for qid, value in recovered.items():
-                result['metrics'][qid]['lat_p95'] = value
-                result['metrics_received'][qid]['lat'] = True
-                result['recovered_via_retry'].add(qid)
-                log.info(f"[Query S{step}] Recovered lat_p95={value:.2f}ms for Q{qid}")
-
-        # Retry drop rate
-        missing_drop_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['drop']]
+            retry_futures['lat'] = self._query_executor.submit(
+                self._retry_metric_query, start, stop, missing_lat_queues, "flow_latency", "flow_latency", step)
         if missing_drop_queues:
             log.warning(f"[Query S{step}] drop_rate missing for Q{missing_drop_queues}, triggering retry")
-            recovered = self._retry_metric_query(start, stop, missing_drop_queues, "q_drop_rate_100ms", "drop", step)
-            for qid, value in recovered.items():
-                result['metrics'][qid]['drop_p95'] = value
-                result['metrics_received'][qid]['drop'] = True
-                result['recovered_via_retry'].add(qid)
-                log.info(f"[Query S{step}] Recovered drop_p95={value:.4f} for Q{qid}")
-
-        # Retry utilization
-        missing_util_queues = [qid for qid in QIDS if not result['metrics_received'][qid]['util']]
+            retry_futures['drop'] = self._query_executor.submit(
+                self._retry_metric_query, start, stop, missing_drop_queues, "q_drop_rate_100ms", "drop", step)
         if missing_util_queues:
             log.warning(f"[Query S{step}] util missing for Q{missing_util_queues}, triggering retry")
-            recovered = self._retry_metric_query(start, stop, missing_util_queues, "tx_utilization", "util", step)
-            for qid, value in recovered.items():
-                result['metrics'][qid]['util_p95'] = value
-                result['metrics_received'][qid]['util'] = True
-                result['recovered_via_retry'].add(qid)
-                log.info(f"[Query S{step}] Recovered util_p95={value:.2f}% for Q{qid}")
+            retry_futures['util'] = self._query_executor.submit(
+                self._retry_metric_query, start, stop, missing_util_queues, "tx_utilization", "util", step)
+
+        # Collect results from parallel retries (timeout covers all retries: 5s max + 1s buffer)
+        retry_timeout = 6.0
+        if 'lat' in retry_futures:
+            try:
+                recovered = retry_futures['lat'].result(timeout=retry_timeout)
+                for qid, value in recovered.items():
+                    result['metrics'][qid]['lat_p95'] = value
+                    result['metrics_received'][qid]['lat'] = True
+                    result['recovered_via_retry'].add(qid)
+                    log.info(f"[Query S{step}] Recovered lat_p95={value:.2f}ms for Q{qid}")
+            except Exception as e:
+                log.warning(f"[Query S{step}] lat retry failed: {e}")
+
+        if 'drop' in retry_futures:
+            try:
+                recovered = retry_futures['drop'].result(timeout=retry_timeout)
+                for qid, value in recovered.items():
+                    result['metrics'][qid]['drop_p95'] = value
+                    result['metrics_received'][qid]['drop'] = True
+                    result['recovered_via_retry'].add(qid)
+                    log.info(f"[Query S{step}] Recovered drop_p95={value:.4f} for Q{qid}")
+            except Exception as e:
+                log.warning(f"[Query S{step}] drop retry failed: {e}")
+
+        if 'util' in retry_futures:
+            try:
+                recovered = retry_futures['util'].result(timeout=retry_timeout)
+                for qid, value in recovered.items():
+                    result['metrics'][qid]['util_p95'] = value
+                    result['metrics_received'][qid]['util'] = True
+                    result['recovered_via_retry'].add(qid)
+                    log.info(f"[Query S{step}] Recovered util_p95={value:.2f}% for Q{qid}")
+            except Exception as e:
+                log.warning(f"[Query S{step}] util retry failed: {e}")
 
         return result
 
@@ -1343,13 +1361,16 @@ class QoSRoutingEnv:
         future_hottest = self._query_executor.submit(self._get_all_hottest_demands, step)
 
         # Collect results as they complete
+        # Timeout covers: initial query (~0.5s) + parallel retries (5s max) + buffer (1.5s) = 7s
+        # This ensures retries complete before moving to next step
         try:
-            aggregated_result = future_aggregated.result(timeout=5.0)
+            aggregated_result = future_aggregated.result(timeout=7.0)
         except Exception as e:
             log.warning(f"[Parallel Query] Aggregated metrics query failed: {e}")
 
+        # hot_demands has its own retry loop (5s max) + buffer (1s) = 6s
         try:
-            all_hot_demands = future_hottest.result(timeout=5.0)
+            all_hot_demands = future_hottest.result(timeout=6.0)
         except Exception as e:
             log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
 
@@ -2327,76 +2348,65 @@ class QoSRoutingEnv:
         """Get valid action mask for current state."""
         return self._get_valid_actions(self.last_snapshot)
     
-    def write_training_metrics(self, step: int, agent_stats: Dict, 
-                                reward: float, action: int, prev_action: int, info: Dict,
+    def write_training_metrics(self, step: int, agent_stats: Dict,
+                                reward: float, action: int, info: Dict,
                                 episode: int = 0):
         """
         Write training metrics to InfluxDB for Grafana monitoring.
         Measurement: rl_training
+
+        Minimal fields: step, episode, action, reward, eps, loss, q_max,
+        sla_met_count, data_valid, traffic_profile, queue_X_latency, queue_X_drops
         """
         try:
             p = (
                 Point("rl_training")
                 .field("step", int(step))
                 .field("episode", int(episode))
-                .field("episode_step", int(info.get('episode_step', 0)))
                 .field("action", int(action))
                 .field("reward", float(reward))
                 .field("eps", float(agent_stats['eps']))
-                .field("beta", float(agent_stats.get('beta', 0.4)))
-                .field("loss", float(agent_stats['avg_loss']))  # Renamed from avg_loss
-                .field("step_avg_reward_100", float(agent_stats['avg_reward']))  # Renamed
-                .field("buffer_size", int(agent_stats['buffer_size']))
+                .field("loss", float(agent_stats['avg_loss']))
                 .field("sla_met_count", len(info.get('sla_met', [])))
-                .field("sla_streak", int(info.get('sla_streak', 0)))
-                .field("pressure", float(info.get('pressure', 0.0)))
+                .field("data_valid", int(info.get('data_valid', False)))
                 .time(datetime.utcnow())
             )
-            
-            # Q-value stats from agent
+
+            # Q-value stats from agent (only q_max)
             if 'q_max' in agent_stats:
                 p = p.field("q_max", float(agent_stats['q_max']))
-            if 'q_mean' in agent_stats:
-                p = p.field("q_mean", float(agent_stats['q_mean']))
-            
-            # Optional fields (useful only)
-            if info.get('alt_idx') is not None:
-                p = p.field("alt_idx", int(info['alt_idx']))
-            
-            # Per-queue latencies only (removed redundant sla_met flags)
+
+            # Per-queue latencies and drops
             per_queue = info.get('per_queue', {})
             for qid in QIDS:
                 if qid in per_queue:
                     q_lat = per_queue[qid].get('lat', 0.0)
+                    q_drop = per_queue[qid].get('drop', 0.0)
                     p = p.field(f"queue_{qid}_latency", float(q_lat))
-            
-            # Data validity metrics (keep for debugging)
-            p = p.field("data_valid", int(info.get('data_valid', False)))
-            
-            # Traffic profile as FIELDS
+                    p = p.field(f"queue_{qid}_drops", float(q_drop))
+
+            # Traffic profile
             if info.get('traffic_profile'):
                 p = p.field("traffic_profile", str(info['traffic_profile']))
-            if info.get('traffic_category'):
-                p = p.field("traffic_category", str(info['traffic_category']))
-            
+
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
         except Exception as e:
             log.debug(f"Failed to write training metrics: {e}")
     
-    def write_episode_metrics(self, episode: int, episode_steps: int, episode_reward: float,
-                               rolling_avg_100: float, traffic_profile: str, traffic_category: str):
+    def write_episode_metrics(self, episode: int, episode_reward: float,
+                               rolling_avg_100: float, traffic_profile: str):
         """Write episode summary metrics to InfluxDB.
         Measurement: rl_training (same as steps for unified visualization)
+
+        Minimal fields: episode, episode_reward, reward_rolling_avg, traffic_profile
         """
         try:
             p = (
                 Point("rl_training")
                 .field("episode", int(episode))
-                .field("episode_steps", int(episode_steps))
                 .field("episode_reward", float(episode_reward))
-                .field("reward_rolling_avg", float(rolling_avg_100))  # User requested renaming to keep this clear
-                .field("traffic_profile", str(traffic_profile))    # FIELD not tag
-                .field("traffic_category", str(traffic_category))  # FIELD not tag
+                .field("reward_rolling_avg", float(rolling_avg_100))
+                .field("traffic_profile", str(traffic_profile))
                 .time(datetime.utcnow())
             )
             self.write_api.write(bucket=self.bucket, org=self.org, record=[p])
@@ -2603,7 +2613,6 @@ def train(args):
             episode_reward = 0.0
             episode_steps = 0
             done = False
-            prev_action = 0  # Track previous action for churn metrics
             
             reset_type = "BASELINE" if do_reset else "WARM"
             log.info(f"\n{'='*50}")
@@ -2653,12 +2662,9 @@ def train(args):
                         f"streak={info['sla_streak']}"
                     )
                 
-                # Write metrics to InfluxDB (includes action churn tracking)
-                # Inject traffic profile into info dict for logging
+                # Write metrics to InfluxDB
                 info['traffic_profile'] = env.current_traffic_profile
-                info['traffic_category'] = env.current_traffic_category
-                env.write_training_metrics(total_steps, stats, reward, action, prev_action, info)
-                prev_action = action  # Update for next step's churn calculation
+                env.write_training_metrics(total_steps, stats, reward, action, info)
 
                 # Save checkpoints
                 if total_steps in checkpoint_steps:
@@ -2684,9 +2690,7 @@ def train(args):
             
             # Write episode metrics to InfluxDB
             env.write_episode_metrics(
-                episode, episode_steps, ep_reward,
-                rolling_100,
-                env.current_traffic_profile, env.current_traffic_category
+                episode, ep_reward, rolling_100, env.current_traffic_profile
             )
             
             # Track best model (based on rolling 100-episode average)

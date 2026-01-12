@@ -194,12 +194,10 @@ class ProductionMetricsWriter:
         self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
 
-        # Rolling statistics
+        # Rolling statistics (for get_summary)
         self.rewards = deque(maxlen=100)
-        self.sla_met_history = deque(maxlen=100)
-        self.action_history = deque(maxlen=100)
 
-        # Cumulative tracking
+        # Cumulative tracking (for get_summary)
         self.cumulative_reward = 0.0
         self.total_sla_checks = 0
         self.total_sla_met = 0
@@ -211,91 +209,44 @@ class ProductionMetricsWriter:
         self.max_consecutive_failures = 3
         self.circuit_open = False
     
-    def write_metrics(self, step: int, action: int, reward: float, 
+    def write_metrics(self, step: int, action: int, reward: float,
                       info: Dict, q_stats: Dict):
         """
-        Write comprehensive production metrics to InfluxDB.
-        
+        Write production metrics to InfluxDB.
+
         Measurement: rl_production
+
+        Minimal fields: step, action, reward, q_values_max,
+        sla_met_count, data_valid, pressure, queue_X_latency, queue_X_drops
         """
 
-        # Update rolling stats
+        # Update stats for get_summary
         self.total_steps += 1
         self.rewards.append(reward)
         sla_met_count = len(info.get('sla_met', []))
-        self.sla_met_history.append(sla_met_count == len(QIDS))
-        self.action_history.append(action)
-        
-        # Update cumulative
         self.cumulative_reward += reward
         self.total_sla_checks += len(QIDS)
         self.total_sla_met += sla_met_count
-        
-        # Calculate derived metrics
-        avg_reward_100 = np.mean(self.rewards) if self.rewards else 0.0
-        sla_compliance_rate = (sum(self.sla_met_history) / len(self.sla_met_history) * 100) if self.sla_met_history else 0.0
-        action_rate = sum(1 for a in self.action_history if a != 0) / len(self.action_history) if self.action_history else 0.0
-        uptime_seconds = time.time() - self.start_time
-        
-        # Action name mapping (8 actions)
-        action_names = {
-            0: "noop",
-            1: "vo-alt0", 2: "vo-alt1",           # Voice
-            3: "vi-alt0", 4: "vi-alt1",           # Video
-            5: "be-alt0", 6: "be-alt1",           # BE
-            7: "multi",                            # Multi-queue
-        }
-        action_name = action_names.get(action, f"unk-{action}")
-        
+
         try:
             p = (
                 Point("rl_production")
-                # Core metrics
                 .field("step", int(step))
                 .field("action", int(action))
-                .field("action_name", action_name)  # Field, not tag - keeps single series
                 .field("reward", float(reward))
-                .field("raw_reward", float(info.get('raw_reward', reward)))
-                
                 .field("q_values_max", float(q_stats['q_max']))
-                .field("q_values_mean", float(q_stats['q_mean']))
-                .field("chosen_q", float(q_stats.get('chosen_q', 0.0)))
-                .field("q_gap", float(q_stats.get('q_gap', 0.0)))
-                
-                # SLA metrics
                 .field("sla_met_count", int(sla_met_count))
-                .field("sla_streak", int(info.get('sla_streak', 0)))
-                .field("sla_compliance_rate", float(sla_compliance_rate))
-                
-                # Action details
-                .field("action_applied", int(info.get('action_applied', False)))
-                .field("action_cost", float(info.get('action_cost', 0.0)))
-                
-                # Network state
-                .field("pressure", float(info.get('pressure', 0.0)))
-                
-                # Rolling/cumulative metrics
-                .field("avg_reward_100", float(avg_reward_100))
-                .field("cumulative_reward", float(self.cumulative_reward))
-                .field("action_rate", float(action_rate))
-                
-                # Operational
-                .field("uptime_seconds", float(uptime_seconds))
                 .field("data_valid", int(info.get('data_valid', False)))
-                
+                .field("pressure", float(info.get('pressure', 0.0)))
                 .time(datetime.utcnow())
             )
-            
-            # Per-queue SLA tags
-            sla_met_list = info.get('sla_met', [])
-            for qid in QIDS:
-                p = p.field(f"queue_{qid}_sla_met", int(qid in sla_met_list))
-            
-            # Per-queue latency (from per_queue info if available)
+
+            # Per-queue latency and drops
             per_queue = info.get('per_queue', {})
             for qid in QIDS:
                 if qid in per_queue:
                     p = p.field(f"queue_{qid}_latency", float(per_queue[qid].get('lat', 0)))
+                    p = p.field(f"queue_{qid}_drops", float(per_queue[qid].get('drop', 0)))
             
             # PHASE 2.2: Circuit breaker pattern for write failures
             if self.circuit_open:
