@@ -537,32 +537,36 @@ Collector aggregation is **disabled** by default (`aggregate_enabled=False`). Th
 
 ### How Flow Latency is Calculated
 
-**Formula:** `flow_latency = (last_hop_egress_time - first_hop_ingress_time) / 1,000,000.0` (result in milliseconds)
+**Formula:** `flow_latency = sum(hop_latencies) / 1000.0` (result in milliseconds)
+
+**Why Sum of Hop Latencies?**
+BMv2 switches have **unsynchronized internal clocks**. The old approach of `(last_hop_egress - first_hop_ingress)` would produce insane values (e.g., 39 seconds) when switch clocks drift. Each `hop_latency` is computed on the SAME switch (`egress_timestamp - ingress_timestamp`), so it's always valid.
+
+**Note:** This approach neglects inter-switch link latency (~0.1-1ms per link in Mininet) but avoids clock sync issues entirely. For RL training, relative latency changes matter more than absolute values.
 
 **INT Metadata Structure:**
 INT metadata is **prepended** by each switch, meaning:
 - Index 0 = **last hop** (most recent metadata, added by the final switch)
 - Index n-1 = **first hop** (oldest metadata, added by the ingress switch)
 
-**Calculation in Code** ([collector.py:615-617](report_collector/collector.py#L615-L617)):
+**Calculation in Code** ([collector.py:624-625](report_collector/collector.py#L624-L625)):
 ```python
-flow_latency = (
-    flow_info.egress_tstamps[0] - flow_info.ingress_tstamps[-1]
-) / 1_000_000.0
+# Sum all hop latencies (each is egress-ingress on same switch)
+flow_latency = sum(flow_info.hop_latencies) / 1000.0  # us -> ms
 ```
 
 Where:
-- `egress_tstamps[0]` = Egress timestamp from **last hop** (when packet left the final switch)
-- `ingress_tstamps[-1]` = Ingress timestamp from **first hop** (when packet entered the network)
-- Division by 1,000,000 converts nanoseconds to milliseconds
+- `hop_latencies` = List of per-switch latencies in microseconds
+- Each hop_latency = `egress_global_timestamp - ingress_global_timestamp` on the SAME switch
+- Division by 1000 converts microseconds to milliseconds
 
-**Note:** Flow latency is independent of `safe_hops` - it only requires at least 1 egress and 1 ingress timestamp.
+**Note:** Flow latency requires at least 1 hop_latency value.
 
 ### Timestamp Consistency with Per-Hop Metrics
 
 **All metrics use the same `report_time`** for InfluxDB timestamp consistency:
 
-1. **report_time selection** ([collector.py:465-476](report_collector/collector.py#L465-L476)):
+1. **report_time selection** ([collector.py:471-482](report_collector/collector.py#L471-L482)):
    - `use_device_time=False` (default): Uses `time.time_ns()` (system time when packet was processed) - **REQUIRED** because P4 device timestamps are NOT Unix epoch timestamps
    - `use_device_time=True`: Uses device timestamp from INT metadata - **DO NOT USE** as P4 timestamps are switch uptime, not Unix epoch
 
@@ -572,7 +576,7 @@ Where:
 
 3. **flow_latency**:
    - Also uses `report_time` as its InfluxDB timestamp
-   - The **value** is calculated from device timestamps, but the **record timestamp** in InfluxDB is `report_time`
+   - The **value** is sum of per-hop latencies, but the **record timestamp** in InfluxDB is `report_time`
 
 ### Queue ID Consistency
 
@@ -639,3 +643,94 @@ Traffic configurations are automatically logged to `log/traffic_log.csv` with th
 2. **Q7 lower data rate**: Best-effort queue typically has fewer flows than voice/video queues, which can cause intermittent "missing_metrics" for Q7.
 
 3. **External InfluxDB latency**: High latency to external InfluxDB (192.168.56.1) can cause query timeouts.
+
+---
+
+## Path Management System
+
+### Overview
+
+The controller maintains two path storage structures for managing network routes:
+
+| Storage | Purpose | Mutability |
+|---------|---------|------------|
+| `path_map` | **Baseline OSPF paths** - Original shortest paths computed during initialization | **Read-only** after init |
+| `paths_per_queue[qid]` | **Per-queue current paths** - May differ from baseline after reroutes | **Read-write** during reroutes |
+
+This separation ensures **queue independence** - rerouting one queue doesn't affect other queues' path lookups.
+
+### Initialization Flow
+
+During `compute_forwarding_entries()`:
+
+```
+1. path_map.clear()
+2. paths_per_queue[0].clear(), paths_per_queue[1].clear(), paths_per_queue[7].clear()
+3. For each (src_host, dst_host) pair:
+   a. Compute OSPF shortest path via NetworkX
+   b. path_map[(src, dst)] = OSPF_path
+   c. paths_per_queue[0][(src, dst)] = OSPF_path  (copy)
+   d. paths_per_queue[1][(src, dst)] = OSPF_path  (copy)
+   e. paths_per_queue[7][(src, dst)] = OSPF_path  (copy)
+```
+
+At initialization, all stores contain the **same OSPF paths** (independent copies).
+
+### Reroute Behavior
+
+When a queue is rerouted (e.g., Q0 for demand h1→h2):
+
+1. **Path lookup** (controller.py:1001-1007):
+   - First checks `paths_per_queue[qid][(src, dst)]`
+   - Falls back to `path_map[(src, dst)]` if not found
+
+2. **Path update** (controller.py:1209-1211):
+   - **Only** updates `paths_per_queue[qid]` with the new path
+   - `path_map` remains **unchanged** (immutable baseline)
+
+3. **Example state after Q0 reroutes from c1→c2:**
+   ```
+   path_map[(h1, h2)]           = [h1, l1, c1, l2, h2]  # Original (unchanged)
+   paths_per_queue[0][(h1, h2)] = [h1, l1, c2, l2, h2]  # Q0's rerouted path
+   paths_per_queue[1][(h1, h2)] = [h1, l1, c1, l2, h2]  # Q1 still uses original
+   paths_per_queue[7][(h1, h2)] = [h1, l1, c1, l2, h2]  # Q7 still uses original
+   ```
+
+### Episode Reset
+
+During episode reset (rl_agent_4.py:974-985):
+
+```python
+controller.clear_all_tables()         # Clears paths_per_queue[*], keeps path_map
+controller.compute_forwarding_entries()  # Repopulates BOTH from fresh OSPF computation
+controller.program_switches()         # Installs baseline rules
+```
+
+After reset, all queues are synchronized back to baseline OSPF paths.
+
+### Fallback Behavior
+
+The fallback to `path_map` is essential for:
+
+| Scenario | `paths_per_queue[qid]` | Result |
+|----------|------------------------|--------|
+| Normal operation | Has current path | Uses queue-specific path |
+| After `clear_all_tables()` | Empty (cleared) | Falls back to `path_map` baseline |
+| First reroute for a demand | Has original (same as baseline) | Uses queue-specific path |
+
+### Key Code Locations
+
+- `controller.py:60` - `path_map` declaration
+- `controller.py:108` - `paths_per_queue` declaration
+- `controller.py:218-286` - `compute_forwarding_entries()`: Initialization
+- `controller.py:321-340` - `clear_all_tables()`: Reset (clears `paths_per_queue`, not `path_map`)
+- `controller.py:1001-1007` - Reroute path lookup (queue-specific first, fallback to `path_map`)
+- `controller.py:1209-1211` - Reroute path update (only `paths_per_queue[qid]`)
+- `controller.py:1258-1283` - `get_path_by_ips_for_queue()`: Public API for path lookup
+
+### Why This Design?
+
+1. **Queue Independence**: Q0's reroute doesn't contaminate Q1's path lookup
+2. **Safe Fallback**: `path_map` always has valid OSPF paths for any (src, dst) pair
+3. **Clean Reset**: Episode reset just calls `compute_forwarding_entries()` to re-sync all stores
+4. **Multi-queue Reroutes**: Action 7 (multi-queue) can reroute Q0, Q1, Q7 independently without interference

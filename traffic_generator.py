@@ -11,12 +11,12 @@ Traffic Profiles (network bottleneck: ToR-Agg at 5 Mbps):
 ┌──────────┬──────────┬─────────────┬─────────────┬─────────────┬───────────────┐
 │ Profile  │ Category │  Voice (Q0) │  Video (Q1) │    BE (Q7)  │ Per-Sender    │
 ├──────────┼──────────┼─────────────┼─────────────┼─────────────┼───────────────┤
-│ light_1  │ light    │ 0.05-0.10   │ 0.05-0.15   │ 0.10-0.20   │ ~0.6-1.4 Mbps │
-│ light_2  │ light    │ 0.08-0.12   │ 0.10-0.18   │ 0.15-0.25   │ ~1.0-1.7 Mbps │ 10%
-│ medium_1 │ medium   │ 0.12-0.20   │ 0.15-0.25   │ 0.25-0.40   │ ~1.6-2.6 Mbps │
-│ medium_2 │ medium   │ 0.15-0.25   │ 0.20-0.30   │ 0.30-0.50   │ ~2.0-3.2 Mbps │ 15%
-│ high_1   │ high     │ 0.25-0.35   │ 0.30-0.45   │ 0.50-0.80   │ ~3.2-4.8 Mbps │
-│ high_2   │ high     │ 0.30-0.45   │ 0.35-0.55   │ 0.70-1.00   │ ~4.0-6.0 Mbps │ 35%
+│ light_1  │ light    │ 0.22-0.34   │ 0.37-0.52   │ 0.39-0.65   │ ~1.0-1.5 Mbps │
+│ light_2  │ light    │ 0.29-0.42   │ 0.47-0.63   │ 0.55-0.82   │ ~1.3-1.9 Mbps │ 10%
+│ medium_1 │ medium   │ 0.38-0.52   │ 0.47-0.65   │ 0.72-1.03   │ ~1.6-2.2 Mbps │
+│ medium_2 │ medium   │ 0.45-0.62   │ 0.56-0.80   │ 0.86-1.16   │ ~1.9-2.6 Mbps │ 15%
+│ high_1   │ high     │ 0.48-0.70   │ 0.61-0.85   │ 0.94-1.26   │ ~2.0-2.8 Mbps │
+│ high_2   │ high     │ 0.54-0.77   │ 0.68-0.97   │ 1.06-1.44   │ ~2.3-3.2 Mbps │ 35%
 └──────────┴──────────┴─────────────┴─────────────┴─────────────┴───────────────┘
 bursty profiles: 40%
 base medium_1 then pump traffic of one the following profiles:
@@ -152,35 +152,35 @@ class TrafficManager:
     # Format: {qid: (min_mbps, max_mbps)} where qid 0=Voice, 1=Video, 7=BE
     # Network: ToR-Agg bottleneck at 5 Mbps, each sender has 3 flows
     TRAFFIC_PROFILES = {
-        # Light traffic (~10% increase)
-        'light_1': {0: (0.18, 0.28), 1: (0.20, 0.35), 7: (0.32, 0.54)},
-        'light_2': {0: (0.24, 0.35), 1: (0.30, 0.46), 7: (0.46, 0.68)},
-        # Medium traffic (~20% increase then -15% reduction = net ~2% increase over original)
-        'medium_1': {0: (0.31, 0.44), 1: (0.39, 0.54), 7: (0.60, 0.85)},
-        'medium_2': {0: (0.37, 0.51), 1: (0.46, 0.66), 7: (0.71, 0.97)},
-        # High traffic (~20% increase then -10% reduction)
-        'high_1': {0: (0.40, 0.58), 1: (0.50, 0.70), 7: (0.79, 1.06)},
-        'high_2': {0: (0.47, 0.67), 1: (0.59, 0.84), 7: (0.92, 1.25)},
+        # Light traffic (+5%)
+        'light_1': {0: (0.22, 0.34), 1: (0.37, 0.52), 7: (0.39, 0.65)},
+        'light_2': {0: (0.29, 0.42), 1: (0.47, 0.63), 7: (0.55, 0.82)},
+        # Medium traffic (+5%)
+        'medium_1': {0: (0.38, 0.52), 1: (0.47, 0.65), 7: (0.72, 1.03)},
+        'medium_2': {0: (0.45, 0.62), 1: (0.56, 0.80), 7: (0.86, 1.16)},
+        # High traffic (high_1 unchanged from baseline, high_2 unchanged)
+        'high_1': {0: (0.48, 0.70), 1: (0.61, 0.85), 7: (0.94, 1.26)},
+        'high_2': {0: (0.54, 0.77), 1: (0.68, 0.97), 7: (1.06, 1.44)},
     }
     
     # TEST profiles for production - NOT used in training
     # These provide varied workload patterns to test agent robustness
     TEST_TRAFFIC_PROFILES = {
-        # === BE-heavy scenarios (high BE, low voice/video) ===
-        'test_be_heavy_1': {0: (0.05, 0.10), 1: (0.10, 0.20), 7: (1.25, 1.75)},
-        'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.50, 2.00)},
-        
-        # === Video-heavy scenarios (high video, low voice/BE) ===
-        'test_video_heavy_1': {0: (0.08, 0.15), 1: (1.25, 1.75), 7: (0.20, 0.35)},
-        'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.50, 2.00), 7: (0.25, 0.40)},
-        
-        # === Voice-heavy scenarios (high voice, low video/BE) ===
-        'test_voice_heavy_1': {0: (1.25, 1.75), 1: (0.10, 0.20), 7: (0.20, 0.35)},
-        'test_voice_heavy_2': {0: (1.50, 2.00), 1: (0.15, 0.25), 7: (0.25, 0.40)},
-        
-        # === Minimal load (near idle) ===
-        'test_idle_1': {0: (0.02, 0.05), 1: (0.03, 0.08), 7: (0.05, 0.12)},
-        'test_idle_2': {0: (0.05, 0.10), 1: (0.08, 0.15), 7: (0.10, 0.20)},
+        # === BE-heavy scenarios (high BE, low voice/video) (+25% from previous) ===
+        'test_be_heavy_1': {0: (0.09, 0.20), 1: (0.20, 0.40), 7: (2.41, 3.39)},
+        'test_be_heavy_2': {0: (0.16, 0.29), 1: (0.29, 0.49), 7: (2.91, 3.89)},
+
+        # === Video-heavy scenarios (high video, low voice/BE) (+15% from previous) ===
+        'test_video_heavy_1': {0: (0.13, 0.23), 1: (1.93, 2.71), 7: (0.32, 0.55)},
+        'test_video_heavy_2': {0: (0.16, 0.29), 1: (2.33, 3.11), 7: (0.39, 0.62)},
+
+        # === Voice-heavy scenarios (high voice, low video/BE) (+15% from previous) ===
+        'test_voice_heavy_1': {0: (1.93, 2.71), 1: (0.16, 0.32), 7: (0.32, 0.55)},
+        'test_voice_heavy_2': {0: (2.33, 3.11), 1: (0.23, 0.39), 7: (0.39, 0.62)},
+
+        # === Minimal load (near idle) (+15% from previous) ===
+        'test_idle_1': {0: (0.05, 0.07), 1: (0.06, 0.13), 7: (0.07, 0.20)},
+        'test_idle_2': {0: (0.07, 0.16), 1: (0.13, 0.23), 7: (0.16, 0.32)},
     }
     
     # Bursty training profiles - step-based bursts during training
@@ -511,24 +511,121 @@ class TrafficManager:
             return "0.0.0.0"
         return ip
     
-    def _send_task(self, hostname: str, cmd: str, delay: float = 0.0) -> bool:
-        """Send a task to the host's TaskServer."""
+    def _send_task(self, hostname: str, cmd: str, delay: float = 0.0,
+                   max_retries: int = 3) -> bool:
+        """Send a task to the host's TaskServer with retry.
+
+        Args:
+            hostname: Target host name
+            cmd: Command to execute
+            delay: Delay before task starts (seconds)
+            max_retries: Maximum retry attempts on failure
+
+        Returns:
+            True if task was sent successfully, False otherwise
+        """
         socket_path = f"/tmp/{hostname}_socket"
         if not os.path.exists(socket_path):
-            log.warning(f"TaskServer socket not found: {socket_path}")
+            log.warning(f"[TaskSend] Socket not found: {socket_path}")
             return False
-        try:
-            client = TaskClient(socket_path)
-            task = Task(cmd, start=time.time() + delay, duration=0)
-            client.send([task], retry=False)
+
+        for attempt in range(max_retries):
+            try:
+                t0 = time.monotonic()
+                client = TaskClient(socket_path)
+                task = Task(cmd, start=time.time() + delay, duration=0)
+                client.send([task], retry=False)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                if elapsed_ms > 100:  # Log slow sends
+                    log.debug(f"[TaskSend] {hostname} slow: {elapsed_ms:.0f}ms")
+                return True
+            except PermissionError:
+                log.error(f"[TaskSend] Permission denied for {hostname}. Run with sudo!")
+                return False
+            except BrokenPipeError as e:
+                log.warning(f"[TaskSend] {hostname} broken pipe (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (2 ** attempt)
+                    time.sleep(backoff)
+                else:
+                    return False
+            except ConnectionRefusedError as e:
+                log.warning(f"[TaskSend] {hostname} connection refused (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (2 ** attempt)
+                    time.sleep(backoff)
+                else:
+                    return False
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (2 ** attempt)  # 0.1s, 0.2s, 0.4s
+                    log.debug(f"[TaskSend] {hostname} retry {attempt+1}/{max_retries}: {e}")
+                    time.sleep(backoff)
+                else:
+                    log.warning(f"[TaskSend] {hostname} failed after {max_retries} attempts: {e}")
+                    return False
+        return False
+
+    def _send_tasks_batched(self, hostname: str, tasks: List[Task], max_retries: int = 3) -> bool:
+        """Send multiple tasks to a host's TaskServer in a single connection.
+
+        This reduces connection overhead from N connections to 1 connection per host,
+        significantly reducing thread accumulation in TaskServer over long runs.
+
+        Args:
+            hostname: Target host name
+            tasks: List of Task objects to send
+            max_retries: Maximum retry attempts on failure
+
+        Returns:
+            True if tasks were sent successfully, False otherwise
+        """
+        if not tasks:
             return True
-        except PermissionError:
-            log.error(f"Permission denied for {hostname}. Run with sudo!")
+
+        socket_path = f"/tmp/{hostname}_socket"
+        if not os.path.exists(socket_path):
+            log.warning(f"[TaskSend] Socket not found for batch: {socket_path}")
             return False
-        except Exception as e:
-            log.warning(f"Failed to send task to {hostname}: {e}")
-            return False
-    
+
+        for attempt in range(max_retries):
+            try:
+                t0 = time.monotonic()
+                client = TaskClient(socket_path)
+                client.send(tasks, retry=False)
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                if elapsed_ms > 200:  # Log slow batch sends
+                    log.warning(f"[TaskSend] {hostname} batch slow: {len(tasks)} tasks in {elapsed_ms:.0f}ms")
+                else:
+                    log.debug(f"[TaskSend] {hostname} batch: {len(tasks)} tasks in {elapsed_ms:.0f}ms")
+                return True
+            except PermissionError:
+                log.error(f"[TaskSend] Permission denied for {hostname}. Run with sudo!")
+                return False
+            except BrokenPipeError as e:
+                log.warning(f"[TaskSend] {hostname} batch broken pipe (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (2 ** attempt)
+                    time.sleep(backoff)
+                else:
+                    return False
+            except ConnectionRefusedError as e:
+                log.warning(f"[TaskSend] {hostname} batch connection refused (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (2 ** attempt)
+                    time.sleep(backoff)
+                else:
+                    return False
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    backoff = 0.1 * (2 ** attempt)
+                    log.debug(f"[TaskSend] {hostname} batch retry {attempt+1}/{max_retries}: {e}")
+                    time.sleep(backoff)
+                else:
+                    log.warning(f"[TaskSend] {hostname} batch failed after {max_retries} attempts: {e}")
+                    return False
+        return False
+
     def stop_traffic(self):
         """Stop all traffic processes using pkill."""
         # Stop health monitoring first to prevent auto-restart during stop
@@ -555,7 +652,32 @@ class TrafficManager:
 
         # Log traffic stop event
         self._log_traffic_config(event="stop")
+
+        # Clean up zombie processes to prevent process table exhaustion
+        self._cleanup_zombie_processes()
         time.sleep(0.5)
+
+    def _cleanup_zombie_processes(self):
+        """Reap zombie child processes to prevent process table exhaustion.
+
+        After many start/stop cycles, zombie bash wrapper processes can accumulate
+        if the parent process doesn't wait() for them. This method reaps any
+        zombie children.
+        """
+        reaped = 0
+        try:
+            while True:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break  # No more zombies to reap
+                reaped += 1
+        except ChildProcessError:
+            pass  # No children to reap (normal case)
+        except Exception as e:
+            log.debug(f"[Cleanup] Error reaping zombies: {e}")
+
+        if reaped > 0:
+            log.debug(f"[Cleanup] Reaped {reaped} zombie processes")
 
     def _start_log_cleanup_thread(self):
         """Start background thread to trim iperf logs (CPU-efficient)."""
@@ -661,64 +783,15 @@ class TrafficManager:
 
         return expected
 
-    def _get_running_iperf_ports(self) -> Dict[str, Dict[str, set]]:
-        """Get currently running iperf ports per host.
-
-        Returns:
-            Dict mapping hostname to {'servers': set, 'clients': set} of ports
-        """
-        running = {}
-        try:
-            # Get all iperf3 processes with their arguments
-            result = subprocess.run(
-                ['pgrep', '-a', 'iperf3'],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode != 0:
-                return running  # No iperf processes
-
-            for line in result.stdout.strip().split('\n'):
-                if not line:
-                    continue
-                # Parse: "12345 iperf3 -s -p 6100 ..." or "12345 iperf3 -c 10.x.x.x -p 6100 ..."
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-
-                # Find port
-                port = None
-                is_server = '-s' in parts
-                for i, part in enumerate(parts):
-                    if part == '-p' and i + 1 < len(parts):
-                        try:
-                            port = int(parts[i + 1])
-                        except ValueError:
-                            pass
-                        break
-
-                if port is None:
-                    continue
-
-                # Match to host by port pattern
-                # Port scheme: 6000 + flow_id*10 + qid
-                for host, ip in self.hosts_ips.items():
-                    if host not in running:
-                        running[host] = {'servers': set(), 'clients': set()}
-
-                # For simplicity, track globally - we'll check counts
-                for host in running:
-                    if is_server:
-                        running[host]['servers'].add(port)
-                    else:
-                        running[host]['clients'].add(port)
-
-        except Exception as e:
-            log.debug(f"[Health Monitor] Error getting running ports: {e}")
-
-        return running
-
     def _check_and_restart_traffic(self):
-        """Check if any iperf processes are missing and restart them."""
+        """Check if any iperf processes are missing and restart them.
+
+        Performs both aggregate and per-queue checks:
+        - Aggregate check: Total processes below 70% triggers restart
+        - Per-queue check: Any single queue below 50% triggers restart
+
+        This ensures Q1-specific failures are detected even if aggregate is OK.
+        """
         expected = self._get_expected_ports()
 
         # Count expected total processes
@@ -730,43 +803,201 @@ class TrafficManager:
         try:
             result = subprocess.run(
                 ['pgrep', '-c', 'iperf3'],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=10
             )
             running_count = int(result.stdout.strip()) if result.returncode == 0 else 0
-        except Exception:
+        except Exception as e:
+            log.debug(f"[Health Monitor] pgrep error: {e}")
             running_count = 0
 
-        # If significantly fewer processes running, restart
-        # Allow some slack (90% threshold) since processes might be briefly restarting
-        threshold = int(expected_total * 0.7)  # 70% threshold
+        # Check 1: Aggregate threshold (70%)
+        threshold = int(expected_total * 0.7)
+        aggregate_failed = running_count < threshold
 
-        if running_count < threshold:
+        # Check 2: Per-queue threshold (50%) - detect queue-specific failures
+        expected_per_queue = len(self.traffic_pairs) * 2  # servers + clients per queue
+        per_queue_threshold = int(expected_per_queue * 0.5)
+        per_queue_failed = False
+        failed_queues = []
+
+        for qid in ALL_QUEUES:
+            port_pattern = f'iperf3.*-p 6[1-6][0-9]{qid}'
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-c', '-f', port_pattern],
+                    capture_output=True, text=True, timeout=10
+                )
+                queue_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            except Exception:
+                queue_count = 0
+
+            if queue_count < per_queue_threshold:
+                per_queue_failed = True
+                failed_queues.append((qid, queue_count, expected_per_queue))
+
+        # Restart if either check fails
+        if aggregate_failed or per_queue_failed:
+            if per_queue_failed and not aggregate_failed:
+                # Queue-specific failure with aggregate OK - this is the Q1 bug scenario
+                log.warning(f"[Health Monitor] Per-queue failure detected (aggregate OK): "
+                           f"queues {[(f'Q{q}:{c}/{e}') for q, c, e in failed_queues]}")
+            elif aggregate_failed:
+                log.warning(f"[Health Monitor] Aggregate failure: {running_count}/{expected_total} "
+                           f"(threshold: {threshold})")
+
+        if aggregate_failed or per_queue_failed:
             self._restart_count += 1
             log.warning(f"[Health Monitor] Only {running_count}/{expected_total} iperf processes running "
                        f"(threshold: {threshold}). Restarting traffic... (restart #{self._restart_count})")
+
+            # Check TaskServer socket health before restart
+            missing_sockets = []
+            for host in self.traffic_hosts:
+                socket_path = f"/tmp/{host}_socket"
+                if not os.path.exists(socket_path):
+                    missing_sockets.append(host)
+            if missing_sockets:
+                log.error(f"[Health Monitor] Missing TaskServer sockets: {missing_sockets}")
 
             # Mark transition for telemetry stability
             self._in_transition = True
             self._transition_start_time = time.monotonic()
 
             # Restart all traffic (stop then start)
+            t0 = time.monotonic()
             self._stop_all_iperf()
             time.sleep(0.5)
             self._start_servers()
             time.sleep(1.0)
             self._start_clients(self._last_packet_len)
+            restart_ms = (time.monotonic() - t0) * 1000
 
-            # Log restart event
+            # Verify restart success
+            time.sleep(2.0)  # Wait for processes to start
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-c', 'iperf3'],
+                    capture_output=True, text=True, timeout=10
+                )
+                new_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            except Exception:
+                new_count = 0
+
+            # Log restart event with verification
             self._log_traffic_config(event="restart", extra_info={
                 'reason': 'health_monitor',
-                'running_count': running_count,
+                'running_count_before': running_count,
+                'running_count_after': new_count,
                 'expected_total': expected_total,
-                'restart_count': self._restart_count
+                'restart_count': self._restart_count,
+                'restart_ms': restart_ms,
+                'missing_sockets': missing_sockets
             })
-            log.info(f"[Health Monitor] Traffic restarted with profile '{self.current_profile_name}'")
+
+            if new_count >= threshold:
+                log.info(f"[Health Monitor] Restart OK: {new_count}/{expected_total} processes "
+                        f"(was {running_count}, took {restart_ms:.0f}ms)")
+                # Also verify per-queue status after restart
+                self._log_per_queue_status()
+            else:
+                log.error(f"[Health Monitor] Restart FAILED: only {new_count}/{expected_total} processes "
+                         f"after restart (was {running_count})")
+
+                # If restart failed, TaskServer may be unresponsive - try restarting TaskServers
+                log.warning("[Health Monitor] Attempting TaskServer restart due to failed traffic restart...")
+                if self._restart_all_taskservers():
+                    time.sleep(1.0)
+                    self._start_servers()
+                    time.sleep(1.0)
+                    self._start_clients(self._last_packet_len)
+
+                    # Verify TaskServer restart helped
+                    time.sleep(2.0)
+                    try:
+                        result = subprocess.run(
+                            ['pgrep', '-c', 'iperf3'],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        final_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+                    except Exception:
+                        final_count = 0
+
+                    if final_count >= threshold:
+                        log.info(f"[Health Monitor] TaskServer restart SUCCESS: {final_count}/{expected_total} processes")
+                    else:
+                        log.error(f"[Health Monitor] TaskServer restart FAILED: still only {final_count}/{expected_total} processes")
+                else:
+                    log.error("[Health Monitor] TaskServer restart failed!")
         else:
             # Log health status periodically at debug level
             log.debug(f"[Health Monitor] OK: {running_count}/{expected_total} iperf processes running")
+
+    def _log_per_queue_status(self) -> Dict[int, int]:
+        """Log process counts per queue for debugging.
+
+        Returns:
+            Dict mapping qid to running process count
+        """
+        expected = len(self.traffic_pairs) * 2  # servers + clients per queue
+        queue_counts = {}
+        status_parts = []
+
+        for qid in ALL_QUEUES:
+            # Pattern matches ports ending in qid digit (6101, 6111, ... for Q1)
+            port_pattern = f'iperf3.*-p 6[1-6][0-9]{qid}'
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-c', '-f', port_pattern],
+                    capture_output=True, text=True, timeout=5
+                )
+                count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            except Exception:
+                count = 0
+            queue_counts[qid] = count
+            status_parts.append(f"Q{qid}:{count}/{expected}")
+
+        log.info(f"[Traffic] Per-queue status: {', '.join(status_parts)}")
+        return queue_counts
+
+    def _verify_per_queue(self, min_pct: float = 0.7) -> Tuple[bool, Dict[int, int]]:
+        """Verify iperf processes per queue, not just aggregate.
+
+        Args:
+            min_pct: Minimum percentage of expected processes required per queue
+
+        Returns:
+            Tuple of (all_ok, counts_dict) where counts_dict[qid] = running_count
+        """
+        expected_per_queue = len(self.traffic_pairs) * 2  # servers + clients
+        threshold_per_queue = int(expected_per_queue * min_pct)
+
+        queue_counts = {}
+        all_ok = True
+        failed_queues = []
+
+        for qid in ALL_QUEUES:
+            # Pattern matches ports ending in qid digit (6101, 6111, ... for Q1)
+            port_pattern = f'iperf3.*-p 6[1-6][0-9]{qid}'
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-c', '-f', port_pattern],
+                    capture_output=True, text=True, timeout=10
+                )
+                running = int(result.stdout.strip()) if result.returncode == 0 else 0
+            except Exception:
+                running = 0
+
+            queue_counts[qid] = running
+
+            if running < threshold_per_queue:
+                log.warning(f"[Traffic] Q{qid} only has {running}/{expected_per_queue} processes (need {threshold_per_queue})!")
+                all_ok = False
+                failed_queues.append(qid)
+
+        if failed_queues:
+            log.warning(f"[Traffic] Per-queue verification FAILED for queues: {failed_queues}")
+
+        return all_ok, queue_counts
 
     def _stop_all_iperf(self):
         """Stop all iperf processes without clearing traffic state."""
@@ -914,6 +1145,31 @@ class TrafficManager:
         self._start_servers()
         time.sleep(1.0)
         self._start_clients(packet_len)
+
+        # Verify traffic actually started (detects unresponsive TaskServer)
+        if not self._verify_traffic_started():
+            log.warning("[Traffic] Startup verification failed, restarting TaskServers...")
+
+            # Attempt TaskServer restart and retry traffic
+            if self._restart_all_taskservers():
+                time.sleep(1.0)
+                self._start_servers()
+                time.sleep(1.0)
+                self._start_clients(packet_len)
+
+                if not self._verify_traffic_started():
+                    log.error("[Traffic] Startup failed even after TaskServer restart!")
+                    # Log failure but continue - health monitor may recover later
+                    self._log_traffic_config(event="start_failed", extra_info={
+                        'packet_len': packet_len,
+                        'reason': 'verification_failed_after_taskserver_restart'
+                    })
+            else:
+                log.error("[Traffic] TaskServer restart failed!")
+                self._log_traffic_config(event="start_failed", extra_info={
+                    'packet_len': packet_len,
+                    'reason': 'taskserver_restart_failed'
+                })
 
         # Start health monitoring to auto-restart crashed processes
         self._start_health_monitor()
@@ -1111,29 +1367,120 @@ class TrafficManager:
         
         log.info(f"Restoring profile '{baseline_profile}' ({self.current_profile_category})")
         log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
-        
+
+        # Track state for health monitoring
+        self._last_packet_len = 1250
+        self._traffic_active = True
+
         self._start_servers()
         time.sleep(1.0)
         self._start_clients(packet_len=1250)
+
+        # Verify traffic actually started (matches start_traffic behavior)
+        if not self._verify_traffic_started():
+            log.warning("[Traffic] Baseline restore verification failed, restarting TaskServers...")
+
+            if self._restart_all_taskservers():
+                time.sleep(1.0)
+                self._start_servers()
+                time.sleep(1.0)
+                self._start_clients(packet_len=1250)
+
+                if not self._verify_traffic_started():
+                    log.error("[Traffic] Baseline restore failed even after TaskServer restart!")
+            else:
+                log.error("[Traffic] TaskServer restart failed during baseline restore!")
+
+        # Start health monitoring (was missing - caused step 474 failure)
+        self._start_health_monitor()
+
+        # Wait for traffic to stabilize before returning
+        # This ensures InfluxDB has fresh data when RL agent queries after burst transitions
+        stabilization_wait = 3.0
+        log.info(f"[Traffic] Waiting {stabilization_wait}s for traffic to stabilize...")
+        time.sleep(stabilization_wait)
+
         log.info("Traffic generation started")
     
     def _start_servers(self):
-        """Start iperf3 servers on receiver hosts."""
+        """Start iperf3 servers on receiver hosts with batched task sending.
+
+        Uses batched sending to reduce socket connections from N tasks to N hosts,
+        significantly reducing thread accumulation in TaskServer over long runs.
+        """
+        t0 = time.monotonic()
+
+        # Group tasks by host for batched sending
+        host_tasks: Dict[str, List[Task]] = {}
+        total_tasks = 0
+
         for _, receiver, flow_id in self.traffic_pairs:
-            for qid in ALL_QUEUES:
+            if receiver not in host_tasks:
+                host_tasks[receiver] = []
+
+            for idx, qid in enumerate(ALL_QUEUES):
                 port = _traffic_dst_port(flow_id, qid)
                 cmd = (
                     f"bash -lc '{self.TRAFFIC_TAG}=1; "
                     f"while true; do iperf3 -s -p {port} -i 1 "
                     f"--logfile /tmp/{receiver}_iperf3_s_{port}.log; sleep 1; done'"
                 )
-                self._send_task(receiver, cmd)
+                # Start all servers immediately (no stagger) - iperf3 handles concurrent starts
+                # NOTE: Previously used stagger (Q0=0.0s, Q1=0.2s, Q7=0.4s) which caused race
+                # conditions where Q1's 0.2s delay was in the "collision zone" after batched
+                # task transmission delays (50-200ms).
+                task = Task(cmd, start=0, duration=0)
+                host_tasks[receiver].append(task)
+                total_tasks += 1
+
+        # Send batched tasks to each host (one connection per host)
+        failed_hosts = []
+        for hostname, tasks in host_tasks.items():
+            if not self._send_tasks_batched(hostname, tasks):
+                failed_hosts.append(hostname)
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+
+        # Retry failed hosts after a brief pause
+        if failed_hosts:
+            log.warning(f"[Traffic] Server batch failed for {len(failed_hosts)} hosts: {failed_hosts}")
+            time.sleep(0.5)
+            retry_failed = []
+            for hostname in failed_hosts:
+                if not self._send_tasks_batched(hostname, host_tasks[hostname]):
+                    retry_failed.append(hostname)
+            if retry_failed:
+                log.error(f"[Traffic] Server retry failed for hosts: {retry_failed}")
+            else:
+                log.info(f"[Traffic] Server retry succeeded for all {len(failed_hosts)} hosts")
+
+        # Log summary
+        num_hosts = len(host_tasks)
+        final_failed = len(retry_failed) if failed_hosts else 0
+        if final_failed > 0:
+            log.warning(f"[Traffic] Servers: {num_hosts - final_failed}/{num_hosts} hosts "
+                       f"({total_tasks} tasks) in {elapsed_ms:.0f}ms")
+        else:
+            log.debug(f"[Traffic] Servers: {num_hosts} hosts ({total_tasks} tasks) in {elapsed_ms:.0f}ms")
     
     def _start_clients(self, packet_len: int):
-        """Start iperf3 clients on sender hosts."""
+        """Start iperf3 clients on sender hosts with batched task sending.
+
+        Uses batched sending to reduce socket connections from N tasks to N hosts,
+        significantly reducing thread accumulation in TaskServer over long runs.
+        """
+        t0 = time.monotonic()
+
+        # Group tasks by host for batched sending
+        host_tasks: Dict[str, List[Task]] = {}
+        total_tasks = 0
+
         for sender, receiver, flow_id in self.traffic_pairs:
+            if sender not in host_tasks:
+                host_tasks[sender] = []
+
             dst_ip = self._host_to_ip(receiver)
-            for qid in ALL_QUEUES:
+            for idx, qid in enumerate(ALL_QUEUES):
                 port = _traffic_dst_port(flow_id, qid)
                 tos = QID_TOS.get(qid, 0)
                 bw = self.current_load.get(qid, 0.2)
@@ -1144,7 +1491,203 @@ class TrafficManager:
                     f"--connect-timeout 5000 >> /tmp/{sender}_iperf3_c_{port}.log 2>&1; "
                     f"sleep 1; done'"
                 )
-                self._send_task(sender, cmd, delay=0.5)
+                # Start all clients immediately (no per-queue stagger)
+                # NOTE: Previously used stagger (Q0=0.5s, Q1=0.6s, Q7=0.7s) which caused timing
+                # race conditions. Clients rely on the bash loop's retry mechanism if server
+                # isn't ready yet. The 1-second sleep between iperf3 attempts handles this.
+                task = Task(cmd, start=0, duration=0)
+                host_tasks[sender].append(task)
+                total_tasks += 1
+
+        # Send batched tasks to each host (one connection per host)
+        failed_hosts = []
+        for hostname, tasks in host_tasks.items():
+            if not self._send_tasks_batched(hostname, tasks):
+                failed_hosts.append(hostname)
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+
+        # Retry failed hosts after a brief pause
+        if failed_hosts:
+            log.warning(f"[Traffic] Client batch failed for {len(failed_hosts)} hosts: {failed_hosts}")
+            time.sleep(1.0)
+            retry_failed = []
+            for hostname in failed_hosts:
+                if not self._send_tasks_batched(hostname, host_tasks[hostname]):
+                    retry_failed.append(hostname)
+            if retry_failed:
+                log.error(f"[Traffic] Client retry failed for hosts: {retry_failed}")
+            else:
+                log.info(f"[Traffic] Client retry succeeded for all {len(failed_hosts)} hosts")
+
+        # Log summary
+        num_hosts = len(host_tasks)
+        final_failed = len(retry_failed) if failed_hosts else 0
+        if final_failed > 0:
+            log.warning(f"[Traffic] Clients: {num_hosts - final_failed}/{num_hosts} hosts "
+                       f"({total_tasks} tasks) in {elapsed_ms:.0f}ms")
+        else:
+            log.debug(f"[Traffic] Clients: {num_hosts} hosts ({total_tasks} tasks) in {elapsed_ms:.0f}ms")
+
+    def _verify_traffic_started(self, timeout: float = 8.0, min_pct: float = 0.7) -> bool:
+        """Verify iperf processes actually started after traffic commands sent.
+
+        This detects when TaskServer becomes unresponsive (tasks are received but
+        never executed). If verification fails, caller should restart TaskServers.
+
+        Also performs per-queue verification to detect queue-specific failures
+        (e.g., Q1 failing while Q0/Q7 succeed).
+
+        Args:
+            timeout: Max time to wait for processes to appear
+            min_pct: Minimum percentage of expected processes required (0.0-1.0)
+
+        Returns:
+            True if sufficient processes started, False otherwise
+        """
+        expected = len(self.traffic_pairs) * len(ALL_QUEUES) * 2  # servers + clients
+        threshold = int(expected * min_pct)
+
+        start_time = time.monotonic()
+        last_count = 0
+
+        while time.monotonic() - start_time < timeout:
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-c', 'iperf3'],
+                    capture_output=True, text=True, timeout=10
+                )
+                running = int(result.stdout.strip()) if result.returncode == 0 else 0
+
+                if running >= threshold:
+                    log.info(f"[Traffic] Verified {running}/{expected} processes started")
+                    # Also log per-queue status for diagnostics
+                    self._log_per_queue_status()
+                    # Check per-queue verification (warn but don't fail aggregate check)
+                    per_queue_ok, queue_counts = self._verify_per_queue(min_pct)
+                    if not per_queue_ok:
+                        log.warning(f"[Traffic] Per-queue verification failed despite aggregate OK - some queues may have issues")
+                    return True
+
+                if running != last_count:
+                    log.debug(f"[Traffic] Waiting for processes: {running}/{expected} (need {threshold})")
+                    last_count = running
+
+                time.sleep(0.5)
+            except Exception as e:
+                log.warning(f"[Traffic] Verification error: {e}")
+                time.sleep(1.0)  # Longer sleep on error to let system recover
+
+        # Log per-queue status on failure for debugging
+        self._log_per_queue_status()
+        log.error(f"[Traffic] Only {last_count}/{expected} processes after {timeout}s - startup failed!")
+        return False
+
+    def _get_host_pid(self, hostname: str) -> Optional[int]:
+        """Get the PID of a Mininet host's bash process.
+
+        Used for running commands in host namespace via mnexec.
+
+        Args:
+            hostname: Host name (e.g., 'h1')
+
+        Returns:
+            PID of the host's bash process, or None if not found
+        """
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', f'mininet:{hostname}$'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pid = int(result.stdout.strip().split('\n')[0])
+                return pid
+        except Exception as e:
+            log.warning(f"[TaskServer] Error finding PID for {hostname}: {e}")
+        return None
+
+    def _restart_taskserver(self, hostname: str, timeout: float = 10.0) -> bool:
+        """Restart TaskServer on a specific host using mnexec.
+
+        Kills any existing TaskServer for the host and starts a new one.
+
+        Args:
+            hostname: Host name (e.g., 'h1')
+            timeout: Max time to wait for socket to appear
+
+        Returns:
+            True if TaskServer restarted successfully, False otherwise
+        """
+        socket_path = f"/tmp/{hostname}_socket"
+
+        host_pid = self._get_host_pid(hostname)
+        if host_pid is None:
+            log.error(f"[TaskServer] Cannot find PID for host {hostname}")
+            return False
+
+        # Kill existing TaskServer
+        try:
+            subprocess.run(
+                ['pkill', '-9', '-f', f'task_scheduler.*{hostname}_socket'],
+                capture_output=True, timeout=10
+            )
+            if os.path.exists(socket_path):
+                os.remove(socket_path)
+            time.sleep(0.5)
+        except Exception as e:
+            log.warning(f"[TaskServer] Error killing old TaskServer for {hostname}: {e}")
+
+        # Start new TaskServer using mnexec
+        try:
+            subprocess.Popen(
+                ['mnexec', '-a', str(host_pid), 'python3', '-m', 'p4utils.utils.task_scheduler', socket_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+            )
+
+            # Wait for socket to appear
+            start_time = time.monotonic()
+            while time.monotonic() - start_time < timeout:
+                if os.path.exists(socket_path):
+                    time.sleep(0.2)  # Brief delay for socket to be ready
+                    log.info(f"[TaskServer] Restarted TaskServer for {hostname}")
+                    return True
+                time.sleep(0.2)
+
+            log.error(f"[TaskServer] Timeout waiting for {hostname} socket")
+            return False
+        except Exception as e:
+            log.error(f"[TaskServer] Failed to restart TaskServer for {hostname}: {e}")
+            return False
+
+    def _restart_all_taskservers(self) -> bool:
+        """Restart TaskServers on all traffic hosts.
+
+        Used as a recovery mechanism when traffic fails to start due to
+        TaskServer becoming unresponsive from thread accumulation.
+
+        Returns:
+            True if all TaskServers restarted successfully, False if any failed
+        """
+        log.warning("[TaskServer] Restarting all TaskServers...")
+
+        # Get unique hosts from traffic pairs
+        hosts = set()
+        for sender, receiver, _ in self.traffic_pairs:
+            hosts.add(sender)
+            hosts.add(receiver)
+
+        # Restart each host's TaskServer
+        failed = []
+        for hostname in sorted(hosts):
+            if not self._restart_taskserver(hostname):
+                failed.append(hostname)
+
+        if failed:
+            log.error(f"[TaskServer] Failed to restart: {failed}")
+            return False
+
+        log.info(f"[TaskServer] All {len(hosts)} TaskServers restarted successfully")
+        return True
 
     def is_traffic_stable(self) -> bool:
         """Check if traffic has had time to stabilize after a transition.

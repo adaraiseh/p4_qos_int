@@ -468,8 +468,9 @@ class Collector:
             if safe_hops <= 0:
                 return
 
-            # Choose a unified timestamp in ns
-            # Use first hop (index -1) timestamp for consistency with flow_latency calculation
+            # Choose a unified timestamp in ns for InfluxDB record time
+            # Note: use_device_time=False is strongly recommended (default) because
+            # P4 device timestamps are switch uptime, not Unix epoch.
             if self.use_device_time:
                  # Prefer egress ts from first hop, fallback to ingress, fallback to now()
                  if len(flow_info.egress_tstamps) >= 1:

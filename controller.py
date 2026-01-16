@@ -771,6 +771,9 @@ class Controller:
         if not change:
             return False
 
+        # Get qid from change record for queue-specific path restoration
+        qid = change.get("qid")
+
         def _revert_overlay(side):
             if not side:
                 return
@@ -792,12 +795,19 @@ class Controller:
                         pass
             old_path = side.get("old_path")
             new_path = side.get("new_path")
-            if old_path and new_path:
+            if old_path and new_path and qid is not None:
                 src_h = old_path[0]
                 dst_h = old_path[-1]
-                cur = self.path_map.get((src_h, dst_h))
+                # Restore to queue-specific paths (not global path_map)
+                queue_paths = self.paths_per_queue.get(int(qid), {})
+                cur = queue_paths.get((src_h, dst_h))
                 if cur and cur == new_path:
-                    self.path_map[(src_h, dst_h)] = old_path
+                    self.paths_per_queue[int(qid)][(src_h, dst_h)] = old_path
+                    log.debug(f"[Revert] Restored paths_per_queue[{qid}][({src_h}, {dst_h})] to original")
+                elif cur:
+                    log.warning(f"[Revert] paths_per_queue[{qid}][({src_h}, {dst_h})] changed since reroute, skipping restoration")
+            elif not old_path:
+                log.debug(f"[Revert] No old_path stored, skipping path restoration")
 
         def _revert_legacy(side):
             if not side:
@@ -832,12 +842,14 @@ class Controller:
 
             old_path = side.get("old_path")
             new_path = side.get("new_path")
-            if old_path and new_path:
+            if old_path and new_path and qid is not None:
                 src_h = old_path[0]
                 dst_h = old_path[-1]
-                cur = self.path_map.get((src_h, dst_h))
+                # Restore to queue-specific paths (not global path_map)
+                queue_paths = self.paths_per_queue.get(int(qid), {})
+                cur = queue_paths.get((src_h, dst_h))
                 if cur and cur == new_path:
-                    self.path_map[(src_h, dst_h)] = old_path
+                    self.paths_per_queue[int(qid)][(src_h, dst_h)] = old_path
 
         def _revert_side(side):
             if side and "overlays" in side:
@@ -1070,15 +1082,24 @@ class Controller:
         # 3. Enforce Symmetry for Reverse Path
         # The return path should be the exact reverse of the new forward path
         rev_new_path = list(reversed(fwd_new_path))
-        path_rev_orig = self.path_map.get((dst_host, src_host))
+
+        # Get reverse path from queue-specific storage first (consistent with forward path lookup)
+        queue_paths_rev = self.paths_per_queue.get(int(qid), {})
+        path_rev_orig = queue_paths_rev.get((dst_host, src_host))
         if not path_rev_orig:
-             # If we don't have a stored rev path, we can't revert well, but we can try to proceed
-             path_rev_orig = [] 
+            # Fallback to global path_map (baseline OSPF path)
+            path_rev_orig = self.path_map.get((dst_host, src_host))
+        if not path_rev_orig:
+             # If we don't have a stored rev path, we can't revert properly
+             # Use None (not []) so revert logic knows there's nothing to restore
+             log.warning(f"[Reroute] No stored reverse path for ({dst_host}, {src_host}) - revert will not restore paths_per_queue")
+             path_rev_orig = None 
 
         # --- INSTALL OVERLAYS ---
 
         def _install_overlay_along_path(path: list[str], dst_h: str, dst_ip_: str):
             if not path or len(path) < 3:
+                log.warning(f"[Reroute] Path too short for overlay: path={path}, len={len(path) if path else 0}, dst={dst_ip_}")
                 return None
             dst_prefix = f"{dst_ip_}/32"
             changes = []
@@ -1101,6 +1122,7 @@ class Controller:
                 if before != (nh_ip, eport):
                     ok = self._upsert_lpm(sw, dst_prefix, dscp, nh_ip, eport)
                     if not ok:
+                        log.warning(f"[Reroute] LPM upsert failed at sw={sw}, rolling back {len(changes)} changes")
                         # Rollback this path's changes on failure
                         for ent in reversed(changes):
                             b = ent["before"]
@@ -1121,45 +1143,86 @@ class Controller:
                                     pass
                         return None
 
-                changes.append({
-                    "sw": sw,
-                    "dst_prefix": dst_prefix,
-                    "dscp": dscp,
-                    "before": before,
-                    "after": (nh_ip, eport),
-                })
+                    # Only record change if upsert was actually performed
+                    changes.append({
+                        "sw": sw,
+                        "dst_prefix": dst_prefix,
+                        "dscp": dscp,
+                        "before": before,
+                        "after": (nh_ip, eport),
+                    })
             return changes
 
+        log.debug(f"[Reroute] Installing overlays: fwd_path={' -> '.join(fwd_new_path)}, rev_path={' -> '.join(rev_new_path)}")
         fwd_changes = _install_overlay_along_path(fwd_new_path, dst_host, dst_ip)
         rev_changes = _install_overlay_along_path(rev_new_path, src_host, src_ip)
 
-        if fwd_changes is None and rev_changes is None:
-             # Note: It's possible for one direction to fail installation if no changes were needed, 
-             # but here None usually means installation error.
-             # If both failed or one critical failed, we should conceptually rollback.
-             # For now, simplistic check.
-             if not fwd_changes and not rev_changes:
-                return False, "failed to install overlays"
+        # CRITICAL: If EITHER direction fails, we must rollback and fail the entire operation
+        # to prevent asymmetric routing (packets going one way but not returning correctly)
+        if fwd_changes is None or rev_changes is None:
+            fwd_status = "ok" if fwd_changes is not None else "FAILED"
+            rev_status = "ok" if rev_changes is not None else "FAILED"
+            log.warning(f"[Reroute] Asymmetric failure detected: fwd={fwd_status}, rev={rev_status}")
 
-        # Update Path Maps (atomic transaction with rollback on failure)
-        # Save old values for potential rollback
-        old_path_map_fwd = self.path_map.get((src_host, dst_host))
-        old_path_map_rev = self.path_map.get((dst_host, src_host))
+            # Rollback successful direction to maintain consistency
+            if fwd_changes is not None:
+                log.warning(f"[Reroute] Rolling back {len(fwd_changes)} forward path changes")
+                for ent in reversed(fwd_changes):
+                    b = ent["before"]
+                    if b is not None:
+                        self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
+                    else:
+                        try:
+                            self._call(
+                                self.controllers[ent["sw"]].table_delete_match,
+                                "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
+                            )
+                            try:
+                                del self.forwarding_entries[ent["sw"]]['lpm'][(ent["dst_prefix"], ent["dscp"])]
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+            if rev_changes is not None:
+                log.warning(f"[Reroute] Rolling back {len(rev_changes)} reverse path changes")
+                for ent in reversed(rev_changes):
+                    b = ent["before"]
+                    if b is not None:
+                        self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
+                    else:
+                        try:
+                            self._call(
+                                self.controllers[ent["sw"]].table_delete_match,
+                                "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
+                            )
+                            try:
+                                del self.forwarding_entries[ent["sw"]]['lpm'][(ent["dst_prefix"], ent["dscp"])]
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+            return False, f"failed to install overlays (fwd={fwd_status}, rev={rev_status})"
+
+        # Both directions succeeded - also check for empty changes (no-op case)
+        if not fwd_changes and not rev_changes:
+            # No changes were needed in either direction - this is OK, not a failure
+            pass
+
+        # Update Queue-Specific Path Maps (atomic transaction with rollback on failure)
+        # NOTE: We only update paths_per_queue[qid], NOT the global path_map.
+        # path_map stores the immutable baseline OSPF paths and is used as fallback.
+        # This ensures queue independence - Q0's reroute doesn't affect Q1's path lookup.
         old_queue_path_fwd = self.paths_per_queue[int(qid)].get((src_host, dst_host))
         old_queue_path_rev = self.paths_per_queue[int(qid)].get((dst_host, src_host))
 
         try:
-            # Apply all updates atomically
-            self.path_map[(src_host, dst_host)] = fwd_new_path
-            self.path_map[(dst_host, src_host)] = rev_new_path
+            # Apply queue-specific updates only (path_map remains immutable)
             self.paths_per_queue[int(qid)][(src_host, dst_host)] = fwd_new_path
             self.paths_per_queue[int(qid)][(dst_host, src_host)] = rev_new_path
         except Exception as e:
-            # Rollback on any exception
-            if old_path_map_fwd is not None:
-                self.path_map[(src_host, dst_host)] = old_path_map_fwd
-            if old_path_map_rev is not None:
-                self.path_map[(dst_host, src_host)] = old_path_map_rev
+            # Rollback queue-specific paths on any exception
             if old_queue_path_fwd is not None:
                 self.paths_per_queue[int(qid)][(src_host, dst_host)] = old_queue_path_fwd
             if old_queue_path_rev is not None:

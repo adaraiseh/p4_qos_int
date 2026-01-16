@@ -38,6 +38,7 @@ import logging
 import argparse
 import math
 import glob
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from collections import deque
@@ -2049,7 +2050,47 @@ class QoSRoutingEnv:
             return True, f"multi:{len(rerouted)}", len(rerouted)
         else:
             return False, None, 0
-    
+
+    def _verify_queue_traffic_flowing(self, qid: int, window_seconds: float = 1.5) -> bool:
+        """
+        Verify that traffic is flowing for a specific queue by checking InfluxDB.
+
+        This is a lightweight check to detect if a reroute broke traffic flow.
+        Returns True if data exists, False if no data found.
+
+        Args:
+            qid: Queue ID to verify
+            window_seconds: Time window to check for data
+        """
+        try:
+            stop_dt = datetime.utcnow()
+            start_dt = stop_dt - timedelta(seconds=window_seconds)
+            start = start_dt.isoformat() + 'Z'
+            stop = stop_dt.isoformat() + 'Z'
+
+            # Simple count query for the specific queue
+            flux = f'''
+            from(bucket:"{self.bucket}")
+                |> range(start:{start}, stop:{stop})
+                |> filter(fn: (r) => r._measurement == "flow_latency")
+                |> filter(fn: (r) => r.queue_id == "{qid}")
+                |> count()
+            '''
+
+            tables = self._influx_query_with_retry(flux)
+
+            # Check if we got any data
+            count = 0
+            for table in tables:
+                for record in table.records:
+                    count += record.get_value() or 0
+
+            return count > 0
+
+        except Exception as e:
+            log.debug(f"[Verify] Traffic check for Q{qid} failed: {e}")
+            return True  # Assume OK on error to avoid false alarms
+
     def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str], Optional[int]]:
         """
         Apply routing action based on explicit alternative selection.
@@ -2146,12 +2187,34 @@ class QoSRoutingEnv:
         delay = DELAY_AFTER_ACTION if action_applied else DELAY_NO_ACTION
         time.sleep(delay)
 
+        # Post-reroute traffic verification: check if traffic is still flowing
+        # This detects cases where a reroute broke packet forwarding
+        if action_applied and action != 0:
+            # Get the queue ID that was rerouted
+            mapping = self.ACTION_MAP.get(action)
+            if mapping and mapping != 'multi':
+                rerouted_qid = mapping[0]
+                if not self._verify_queue_traffic_flowing(rerouted_qid):
+                    log.warning(f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
+                               f"No traffic data for Q{rerouted_qid} after reroute to {alt_name}")
+                    # Log additional context for debugging
+                    log.warning(f"[Step {self.episode_step}] Reroute details: action={action}, "
+                               f"qid={rerouted_qid}, alt={alt_name}, bn={current_snapshot[rerouted_qid].get('bottleneck_sid')}")
+            elif mapping == 'multi':
+                # For multi-queue action, check all queues
+                for qid in QIDS:
+                    if not self._verify_queue_traffic_flowing(qid):
+                        log.warning(f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
+                                   f"No traffic data for Q{qid} after multi-queue reroute")
+
         # Check if traffic is stable before collecting metrics
         # During traffic transitions (burst start/end), telemetry is unreliable
         if self.traffic_manager and not self.traffic_manager.is_traffic_stable():
             elapsed = self.traffic_manager.get_transition_elapsed()
             log.info(f"[Step {self.episode_step}] Traffic transitioning ({elapsed:.1f}s elapsed), using last snapshot")
-            next_snapshot = self.last_snapshot.copy() if self.last_snapshot else self._collect_snapshot()
+            # Use deepcopy to avoid modifying last_snapshot's nested dicts
+            # A shallow copy would cause 'transitioning' flag to persist in last_snapshot
+            next_snapshot = copy.deepcopy(self.last_snapshot) if self.last_snapshot else self._collect_snapshot()
             # Mark as transitioning for reward calculation
             for qid in QIDS:
                 next_snapshot[qid]['transitioning'] = True

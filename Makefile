@@ -135,6 +135,31 @@ test_traffic:
 		--steps 999999 --max-episode-steps 999999 --no-warm-start \
 		--traffic-profile $(profile)
 
+# =============================================
+# Traffic Stress Testing
+# =============================================
+
+# Quick stress test: 100 cycles, 5s each (~10 min)
+traffic_stress_test_quick:
+	@echo "Running quick traffic stress test (100 cycles, 5s each)"
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	$(SUDO_PYTHON) test/stress_test_traffic.py --quick --config $(DETECT_TOPOLOGY)
+
+# Full stress test: 3600 cycles, 10s each (~1 hour)
+traffic_stress_test:
+	@echo "Running full traffic stress test (3600 cycles, 10s each = ~1 hour)"
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	$(SUDO_PYTHON) test/stress_test_traffic.py --config $(DETECT_TOPOLOGY)
+
+# Custom stress test: use CYCLES and DURATION variables
+# Example: make traffic_stress_test_custom CYCLES=500 DURATION=5
+CYCLES   ?= 3600
+DURATION ?= 10
+traffic_stress_test_custom:
+	@echo "Running custom traffic stress test ($(CYCLES) cycles, $(DURATION)s each)"
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	$(SUDO_PYTHON) test/stress_test_traffic.py --cycles $(CYCLES) --duration $(DURATION) --config $(DETECT_TOPOLOGY)
+
 
 # =============================================
 # Production Mode
@@ -184,6 +209,11 @@ help:
 	@echo "  Profiles: light_{1,2}, medium_{1,2}, high_{1,2},"
 	@echo "            bursty_{vo,vi,be}_{1,2}"
 	@echo ""
+	@echo "Traffic Stress Testing:"
+	@echo "  make traffic_stress_test_quick     Quick test (100 cycles, ~10 min)"
+	@echo "  make traffic_stress_test           Full test (3600 cycles, ~1 hour)"
+	@echo "  make traffic_stress_test_custom CYCLES=500 DURATION=5"
+	@echo ""
 	@echo "Production Mode:"
 	@echo "  make production profile=<name>     Run with best model"
 	@echo "  make production_final profile=<name>"
@@ -207,4 +237,5 @@ help:
 
 .PHONY: all validate rules run stop clean collect monitor visualize \
         train train_test resume test test_best test_traffic \
+        traffic_stress_test traffic_stress_test_quick traffic_stress_test_custom \
         production production_best production_final production_75pct help
