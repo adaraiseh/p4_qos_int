@@ -206,6 +206,18 @@ class Controller:
         nodes = p4switches + hosts
         self.net_graph.add_nodes_from(nodes)
 
+        # Use one common OSPF-style dimensionless cost model for the RL reset
+        # baseline and for alternate-path calculations. Cost is inversely
+        # proportional to configured bandwidth and normalized so the fastest
+        # link has cost 100. Equal-bandwidth topologies remain unchanged.
+        configured_costs = {}
+        if self._topology_builder is not None and self._topology_builder.links:
+            max_bw = max(float(link.bw) for link in self._topology_builder.links)
+            for link in self._topology_builder.links:
+                bandwidth = max(float(link.bw), 1e-9)
+                cost = max(1, int(round(100.0 * max_bw / bandwidth)))
+                configured_costs[frozenset((link.node1, link.node2))] = cost
+
         for node in nodes:
             neighbors = self.topo.get_neighbors(node)
             for neighbor in neighbors:
@@ -213,7 +225,11 @@ class Controller:
                 if neighbor not in nodes:
                     continue
                 if not self.net_graph.has_edge(node, neighbor):
-                    self.net_graph.add_edge(node, neighbor, weight=1)
+                    weight = configured_costs.get(
+                        frozenset((node, neighbor)),
+                        1,
+                    )
+                    self.net_graph.add_edge(node, neighbor, weight=weight)
 
     def compute_forwarding_entries(self):
         hosts = list(self.topo.get_hosts().keys())
@@ -288,6 +304,62 @@ class Controller:
         with self._lock:
             self._program_switches_unlocked()
 
+    def verify_forwarding_tables(self, raise_on_error: bool = True) -> Dict:
+        """Read back baseline forwarding-table counts from every switch.
+
+        P4Utils' Thrift helpers print several table-operation errors and return
+        ``None`` instead of raising them.  Counting entries after a clean
+        program operation gives benchmark runners an explicit treatment-
+        integrity check instead of trusting attempted writes.
+        """
+        table_map = {
+            'lpm': "l3_forward.ipv4_lpm",
+            'switching': "port_forward.switching_table",
+            'mac': "port_forward.mac_rewriting_table",
+        }
+        per_switch = {}
+        errors = []
+
+        with self._lock:
+            for sw_name, thrift in self.controllers.items():
+                expected_tables = self.forwarding_entries.get(
+                    sw_name,
+                    {'lpm': {}, 'switching': {}, 'mac': {}},
+                )
+                switch_report = {}
+                for cache_name, table_name in table_map.items():
+                    expected = len(expected_tables.get(cache_name, {}))
+                    observed = self._call(thrift.table_num_entries, table_name)
+                    if observed is None:
+                        observed_value = None
+                        errors.append(
+                            f"{sw_name}:{table_name} count unavailable"
+                        )
+                    else:
+                        observed_value = int(observed)
+                        if observed_value != expected:
+                            errors.append(
+                                f"{sw_name}:{table_name} expected {expected}, "
+                                f"observed {observed_value}"
+                            )
+                    switch_report[table_name] = {
+                        'expected': expected,
+                        'observed': observed_value,
+                    }
+                per_switch[sw_name] = switch_report
+
+        report = {
+            'verified': not errors,
+            'errors': errors,
+            'per_switch': per_switch,
+        }
+        if errors and raise_on_error:
+            raise RuntimeError(
+                "Baseline forwarding-table verification failed: "
+                + "; ".join(errors[:5])
+            )
+        return report
+
     def _program_switches_unlocked(self):
         """Internal implementation without locking (for use within locked contexts)."""
         for sw_name, tables in self.forwarding_entries.items():
@@ -318,16 +390,45 @@ class Controller:
                     [next_hop_ip, str(egress_port)]
                 )
 
-    def clear_all_tables(self):
-        """Clear all P4 tables on all switches and reset internal state."""
+    def clear_all_tables(self, verify: bool = False):
+        """Clear all P4 tables on all switches and reset internal state.
+
+        When ``verify`` is true, read every table back and fail if any entries
+        remain. This is required for benchmark isolation because the Thrift
+        wrapper can otherwise print and swallow clear failures.
+        """
+        failures = []
         with self._lock:
             for sw_name, controller in self.controllers.items():
-                try:
-                    self._call(controller.table_clear, "l3_forward.ipv4_lpm")
-                    self._call(controller.table_clear, "port_forward.switching_table")
-                    self._call(controller.table_clear, "port_forward.mac_rewriting_table")
-                except Exception as e:
-                    log.warning(f"Failed to clear tables on {sw_name}: {e}")
+                table_names = (
+                    "l3_forward.ipv4_lpm",
+                    "port_forward.switching_table",
+                    "port_forward.mac_rewriting_table",
+                    # ECMP must also be empty before RL/OSPF starts because it
+                    # takes precedence over ipv4_lpm in the P4 pipeline.
+                    "l3_forward.ecmp_group",
+                    "l3_forward.ecmp_nhop",
+                )
+                for table_name in table_names:
+                    try:
+                        self._call(controller.table_clear, table_name)
+                        if verify:
+                            observed = self._call(
+                                controller.table_num_entries,
+                                table_name,
+                            )
+                            if observed is None:
+                                failures.append(
+                                    f"{sw_name}:{table_name} count unavailable "
+                                    "after clear"
+                                )
+                            elif int(observed) != 0:
+                                failures.append(
+                                    f"{sw_name}:{table_name} still has "
+                                    f"{int(observed)} entries after clear"
+                                )
+                    except Exception as exc:
+                        failures.append(f"{sw_name}:{table_name}: {exc}")
 
             self.forwarding_entries.clear()
             self.change_history_by_qid.clear()
@@ -338,6 +439,14 @@ class Controller:
 
             for qid in self.paths_per_queue:
                 self.paths_per_queue[qid].clear()
+
+        if failures:
+            message = "P4 table clear verification failed: " + "; ".join(
+                failures[:5]
+            )
+            if verify:
+                raise RuntimeError(message)
+            log.warning(message)
 
     # -----------------------
     # Table/aux helpers

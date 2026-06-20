@@ -562,6 +562,7 @@ class NetworkVisualizer:
         
         # 3. Traffic Overlay
         link_counts = {}
+        routing_modes = set()
         for qid_s, flows in self.paths_data.items():
             qid = int(qid_s)
             
@@ -570,6 +571,9 @@ class NetworkVisualizer:
                 continue
                 
             for flow in flows:
+                routing_mode = flow.get("routing_mode")
+                if routing_mode:
+                    routing_modes.add(str(routing_mode).upper())
                 path = flow.get("path", [])
                 if not path or len(path) < 2: continue
                 for i in range(len(path) - 1):
@@ -678,7 +682,15 @@ class NetworkVisualizer:
                 self.ax.add_patch(arrow)
 
         # Title (Centered Top)
-        self.ax.text(12.0, 7.5, "Real-Time Network Traffic", fontsize=20, fontweight='bold', ha='center')
+        mode_suffix = f" — {' / '.join(sorted(routing_modes))}" if routing_modes else ""
+        self.ax.text(
+            12.0,
+            7.5,
+            f"Real-Time Network Traffic{mode_suffix}",
+            fontsize=20,
+            fontweight='bold',
+            ha='center'
+        )
 
     def main(self):  # unused directly, compat
         pass

@@ -18,3 +18,5 @@ topology.json
 .active_topology
 int_md.json*
 *.p4info.txt
+benchmark_results/
+calibration_results/

@@ -1,41 +1,9 @@
 #!/usr/bin/env python3
-"""
-traffic_generator.py - Dynamic traffic generation for RL training episodes.
+"""Resilient, reproducible traffic generation for routing experiments.
 
-Uses P4Utils TaskClient to send iperf3 tasks to running TaskServers on mininet hosts.
-Supports per-episode traffic profile selection from 6 predefined profiles.
-
-NOTE: Must be run with sudo since mininet TaskServers run as root.
-
-Traffic Profiles (network bottleneck: ToR-Agg at 5 Mbps):
-┌──────────┬──────────┬─────────────┬─────────────┬─────────────┬───────────────┐
-│ Profile  │ Category │  Voice (Q0) │  Video (Q1) │    BE (Q7)  │ Per-Sender    │
-├──────────┼──────────┼─────────────┼─────────────┼─────────────┼───────────────┤
-│ light_1  │ light    │ 0.22-0.34   │ 0.37-0.52   │ 0.39-0.65   │ ~1.0-1.5 Mbps │
-│ light_2  │ light    │ 0.29-0.42   │ 0.47-0.63   │ 0.55-0.82   │ ~1.3-1.9 Mbps │ 10%
-│ medium_1 │ medium   │ 0.38-0.52   │ 0.47-0.65   │ 0.72-1.03   │ ~1.6-2.2 Mbps │
-│ medium_2 │ medium   │ 0.45-0.62   │ 0.56-0.80   │ 0.86-1.16   │ ~1.9-2.6 Mbps │ 15%
-│ high_1   │ high     │ 0.48-0.70   │ 0.61-0.85   │ 0.94-1.26   │ ~2.0-2.8 Mbps │
-│ high_2   │ high     │ 0.54-0.77   │ 0.68-0.97   │ 1.06-1.44   │ ~2.3-3.2 Mbps │ 35%
-└──────────┴──────────┴─────────────┴─────────────┴─────────────┴───────────────┘
-bursty profiles: 40%
-base medium_1 then pump traffic of one the following profiles:
-    'test_be_heavy_1': {0: (0.05, 0.10), 1: (0.10, 0.20), 7: (1.25, 1.75)},
-    'test_be_heavy_2': {0: (0.08, 0.15), 1: (0.15, 0.25), 7: (1.50, 2.00)},
-    
-    # === Video-heavy scenarios (high video, low voice/BE) ===
-    'test_video_heavy_1': {0: (0.08, 0.15), 1: (1.25, 1.75), 7: (0.20, 0.35)},
-    'test_video_heavy_2': {0: (0.10, 0.18), 1: (1.50, 2.00), 7: (0.25, 0.40)},
-    
-    # === Voice-heavy scenarios (high voice, low video/BE) ===
-    'test_voice_heavy_1': {0: (1.25, 1.75), 1: (0.10, 0.20), 7: (0.20, 0.35)},
-    'test_voice_heavy_2': {0: (1.50, 2.00), 1: (0.15, 0.25), 7: (0.25, 0.40)},
-
-Key features:
-- Round-robin profile selection for equal distribution across episodes
-- Uses unique TRAFFIC_TAG for reliable process termination
-- Bash while-loops for auto-restart if iperf crashes
-- Profile logged to InfluxDB (tags) and CSV for analysis
+Traffic endpoints are started through P4Utils TaskServers and verified exactly.
+Benchmark profiles use deterministic ten-step schedules and verified sender
+HTB caps, allowing RL, ECMP, and OSPF to receive the same offered workload.
 """
 
 import os
@@ -44,14 +12,17 @@ import json
 import glob
 import time
 import random
+import math
 import threading
 import subprocess
 import logging
 import argparse
 import csv
+import re
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 from p4utils.utils.task_scheduler import Task, TaskClient
 
@@ -62,6 +33,148 @@ from network import _traffic_dst_port, QID_TOS, ALL_QUEUES
 from logging_config import setup_unified_logging
 
 log = logging.getLogger(__name__)
+
+
+PROFILE_CYCLE_STEPS = 10
+MEASUREMENT_SETTLE_SECONDS = 0.0
+COMMON_QUEUE_WEIGHTS = {0: 0.22327, 1: 0.34591, 7: 0.43082}
+
+
+def _weighted_load(total_mbps: float, weights: Dict[int, float]) -> Dict[int, float]:
+    """Split an aggregate per-demand load using normalized queue weights."""
+    weight_total = sum(weights.values())
+    if weight_total <= 0:
+        raise ValueError("Traffic weights must have a positive sum")
+    return {
+        qid: total_mbps * weight / weight_total
+        for qid, weight in weights.items()
+    }
+
+
+def _source_load_for(stages: Dict[str, Dict[int, float]]) -> Dict[int, float]:
+    """Offer slightly above the largest shaped stage for every queue."""
+    return {
+        qid: max(stages["low"][qid], stages["high"][qid]) * 1.03
+        for qid in ALL_QUEUES
+    }
+
+
+def _queue_biased_stages(weights: Dict[int, float]) -> Dict[str, Dict[int, float]]:
+    stages = {
+        "low": _weighted_load(0.5, weights),
+        "high": _weighted_load(3.2, weights),
+    }
+    stages["source"] = _source_load_for(stages)
+    return stages
+
+
+def _steady_stages(
+    low_total_mbps: float,
+    high_total_mbps: Optional[float] = None,
+) -> Dict[str, Dict[int, float]]:
+    low = _weighted_load(low_total_mbps, COMMON_QUEUE_WEIGHTS)
+    high = _weighted_load(
+        low_total_mbps if high_total_mbps is None else high_total_mbps,
+        COMMON_QUEUE_WEIGHTS,
+    )
+    stages = {"low": low, "high": high}
+    stages["source"] = _source_load_for(stages)
+    return stages
+
+
+STEADY_PROFILE_SPECS = {
+    # Near-knee stress points are intentionally close because fat_tree_k4 has
+    # a sharp ECMP congestion transition. Light profiles are steady. Medium
+    # and high profiles use deterministic high/low cycles around the knee so
+    # they exercise partial SLA behavior without unbounded queue buildup.
+    "light_1": {
+        "low": 1.50,
+        "high": 1.50,
+        "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    },
+    "light_2": {
+        "low": 1.62,
+        "high": 1.62,
+        "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    },
+    "medium_1": {
+        "low": 1.50,
+        "high": 1.80,
+        "pattern": (0, 1, 0, 0, 1, 0, 0, 1, 0, 0),
+    },
+    "medium_2": {
+        "low": 1.50,
+        "high": 1.92,
+        "pattern": (0, 1, 0, 1, 0, 0, 1, 0, 1, 0),
+    },
+    "high_1": {
+        "low": 1.50,
+        "high": 1.85,
+        "pattern": (0, 1, 1, 0, 1, 1, 0, 1, 1, 0),
+    },
+    "high_2": {
+        "low": 1.85,
+        "high": 1.85,
+        "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    },
+}
+
+BURST_QUEUE_WEIGHTS = {
+    "vo": {0: 0.72, 1: 0.11, 7: 0.17},
+    "vi": {0: 0.12, 1: 0.70, 7: 0.18},
+    "be": {0: 0.10, 1: 0.15, 7: 0.75},
+}
+BURST_HIGH_STEPS = {
+    1: 3,
+    2: 6,
+}
+BURSTY_PROFILE_SPECS = {
+    f"bursty_{traffic_class}_{tier}": {
+        "weights": weights,
+        "high_steps": high_steps,
+    }
+    for traffic_class, weights in BURST_QUEUE_WEIGHTS.items()
+    for tier, high_steps in BURST_HIGH_STEPS.items()
+}
+
+
+def _burst_pattern(high_steps: int) -> Tuple[int, ...]:
+    """Return the deterministic ten-step schedule for a burst tier."""
+    start_step = {3: 3, 6: 2}.get(high_steps)
+    if start_step is None:
+        raise ValueError(f"Unsupported burst duration: {high_steps} steps")
+    return tuple(
+        int(start_step <= step < start_step + high_steps)
+        for step in range(1, PROFILE_CYCLE_STEPS + 1)
+    )
+
+
+SHAPED_PROFILE_STAGES = {
+    name: _steady_stages(spec["low"], spec["high"])
+    for name, spec in STEADY_PROFILE_SPECS.items()
+}
+SHAPED_PROFILE_STAGES.update({
+    name: _queue_biased_stages(spec["weights"])
+    for name, spec in BURSTY_PROFILE_SPECS.items()
+})
+
+SHAPED_PROFILE_PATTERNS = {
+    name: tuple(spec["pattern"])
+    for name, spec in STEADY_PROFILE_SPECS.items()
+}
+SHAPED_PROFILE_PATTERNS.update({
+    name: _burst_pattern(spec["high_steps"])
+    for name, spec in BURSTY_PROFILE_SPECS.items()
+})
+
+PROFILE_GROUPS = {
+    category: tuple(
+        name
+        for name in SHAPED_PROFILE_STAGES
+        if name.startswith(f"{category}_")
+    )
+    for category in ("light", "medium", "high", "bursty")
+}
 
 
 def get_hosts_from_config(config_path: str, topology_file: str = "topology.json") -> Dict[str, str]:
@@ -142,81 +255,26 @@ class TrafficManager:
     Uses TaskClient to send Task objects to TaskServer running on each host.
     This enables runtime traffic control without needing the Mininet net object.
     
-    Profiles are selected round-robin for equal distribution across training episodes.
+    Explicit profiles and weighted profile categories share one canonical
+    registry. Default training selection balances the steady profiles.
     """
     
     # Unique marker for identifying traffic processes (used by pkill)
     TRAFFIC_TAG = "__RL_TRAFFIC__"
     
-    # 6 Training profiles: 2 light, 2 medium, 2 high
-    # Format: {qid: (min_mbps, max_mbps)} where qid 0=Voice, 1=Video, 7=BE
-    # Network: ToR-Agg bottleneck at 5 Mbps, each sender has 3 flows
+    SHAPED_PROFILE_PATTERNS = SHAPED_PROFILE_PATTERNS
+    PROFILE_STAGE_LOADS = SHAPED_PROFILE_STAGES
+    PROFILE_GROUPS = PROFILE_GROUPS
+    MEASUREMENT_SETTLE_SECONDS = MEASUREMENT_SETTLE_SECONDS
     TRAFFIC_PROFILES = {
-        # Light traffic (+5%)
-        'light_1': {0: (0.22, 0.34), 1: (0.37, 0.52), 7: (0.39, 0.65)},
-        'light_2': {0: (0.29, 0.42), 1: (0.47, 0.63), 7: (0.55, 0.82)},
-        # Medium traffic (+5%)
-        'medium_1': {0: (0.38, 0.52), 1: (0.47, 0.65), 7: (0.72, 1.03)},
-        'medium_2': {0: (0.45, 0.62), 1: (0.56, 0.80), 7: (0.86, 1.16)},
-        # High traffic (high_1 unchanged from baseline, high_2 unchanged)
-        'high_1': {0: (0.48, 0.70), 1: (0.61, 0.85), 7: (0.94, 1.26)},
-        'high_2': {0: (0.54, 0.77), 1: (0.68, 0.97), 7: (1.06, 1.44)},
-    }
-    
-    # TEST profiles for production - NOT used in training
-    # These provide varied workload patterns to test agent robustness
-    TEST_TRAFFIC_PROFILES = {
-        # === BE-heavy scenarios (high BE, low voice/video) (+25% from previous) ===
-        'test_be_heavy_1': {0: (0.09, 0.20), 1: (0.20, 0.40), 7: (2.41, 3.39)},
-        'test_be_heavy_2': {0: (0.16, 0.29), 1: (0.29, 0.49), 7: (2.91, 3.89)},
-
-        # === Video-heavy scenarios (high video, low voice/BE) (+15% from previous) ===
-        'test_video_heavy_1': {0: (0.13, 0.23), 1: (1.93, 2.71), 7: (0.32, 0.55)},
-        'test_video_heavy_2': {0: (0.16, 0.29), 1: (2.33, 3.11), 7: (0.39, 0.62)},
-
-        # === Voice-heavy scenarios (high voice, low video/BE) (+15% from previous) ===
-        'test_voice_heavy_1': {0: (1.93, 2.71), 1: (0.16, 0.32), 7: (0.32, 0.55)},
-        'test_voice_heavy_2': {0: (2.33, 3.11), 1: (0.23, 0.39), 7: (0.39, 0.62)},
-
-        # === Minimal load (near idle) (+15% from previous) ===
-        'test_idle_1': {0: (0.05, 0.07), 1: (0.06, 0.13), 7: (0.07, 0.20)},
-        'test_idle_2': {0: (0.07, 0.16), 1: (0.13, 0.23), 7: (0.16, 0.32)},
-    }
-    
-    # Bursty training profiles - step-based bursts during training
-    # Format: {burst_start_min, burst_start_max, burst_duration_min, burst_duration_max, burst_profile}
-    # Baseline is randomly selected from light/medium profiles
-    # Burst starts at random step between burst_start_min and burst_start_max
-    BURSTY_PROFILES = {
-        # BE bursts - short and long variants
-        'bursty_be_1': {'burst_start_min': 2, 'burst_start_max': 84, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_be_heavy_1'},
-        'bursty_be_2': {'burst_start_min': 2, 'burst_start_max': 49, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_be_heavy_1'},
-        # Video bursts
-        'bursty_vi_1': {'burst_start_min': 2, 'burst_start_max': 84, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_video_heavy_1'},
-        'bursty_vi_2': {'burst_start_min': 2, 'burst_start_max': 49, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_video_heavy_1'},
-        # Voice bursts  
-        'bursty_vo_1': {'burst_start_min': 2, 'burst_start_max': 84, 'burst_duration_min': 5, 'burst_duration_max': 15, 'burst_profile': 'test_voice_heavy_1'},
-        'bursty_vo_2': {'burst_start_min': 2, 'burst_start_max': 49, 'burst_duration_min': 25, 'burst_duration_max': 50, 'burst_profile': 'test_voice_heavy_1'},
-    }
-    
-    # Combined profiles for lookup (training + test + bursty metadata)
-    ALL_PROFILES = {**TRAFFIC_PROFILES, **TEST_TRAFFIC_PROFILES}
-    
-    # Profile categories for logging
-    PROFILE_CATEGORIES = {
-        # Training profiles
-        'light_1': 'light', 'light_2': 'light',
-        'medium_1': 'medium', 'medium_2': 'medium',
-        'high_1': 'high', 'high_2': 'high',
-        # Bursty profiles
-        'bursty_be_1': 'bursty', 'bursty_be_2': 'bursty',
-        'bursty_vi_1': 'bursty', 'bursty_vi_2': 'bursty',
-        'bursty_vo_1': 'bursty', 'bursty_vo_2': 'bursty',
-        # Test profiles
-        'test_be_heavy_1': 'test_be', 'test_be_heavy_2': 'test_be',
-        'test_video_heavy_1': 'test_video', 'test_video_heavy_2': 'test_video',
-        'test_voice_heavy_1': 'test_voice', 'test_voice_heavy_2': 'test_voice',
-        'test_idle_1': 'test_idle', 'test_idle_2': 'test_idle',
+        name: {
+            qid: (
+                min(stages["low"][qid], stages["high"][qid]),
+                max(stages["low"][qid], stages["high"][qid]),
+            )
+            for qid in stages["low"]
+        }
+        for name, stages in SHAPED_PROFILE_STAGES.items()
     }
     
     # Default host IP mapping (legacy Fat-Tree k=4 topology)
@@ -231,19 +289,21 @@ class TrafficManager:
         "h8": "10.10.8.2",
     }
 
-    def __init__(self, topology_file: str = "/tmp/topology.json", config_path: str = None):
+    def __init__(self, topology_file: str = "/tmp/topology.json",
+                 config_path: str = None, seed: int = None):
         """Initialize TrafficManager.
 
         Args:
             topology_file: Path to topology.json for host discovery (legacy)
             config_path: Path to YAML topology configuration for dynamic host/IP discovery
+            seed: Optional deterministic seed for reproducible RL/ECMP comparisons
         """
         if os.geteuid() != 0:
             log.warning("TrafficManager: Not running as root. TaskClient may fail.")
 
-        # Use a dedicated random generator seeded with time
-        # This ensures traffic variability even when global random is seeded for reproducibility
-        self._rng = random.Random(time.time())
+        # Keep training variability by default, while allowing benchmark runs
+        # to use the exact same profile scaling and burst schedule.
+        self._rng = random.Random(time.time() if seed is None else seed)
 
         self.topology_file = topology_file
         self.config_path = config_path
@@ -288,33 +348,29 @@ class TrafficManager:
         
         # Current profile state
         self.current_load: Dict[int, float] = {}
+        self._source_load: Dict[int, float] = {}
         self.current_profile_name: str = ""
         self.current_profile_category: str = ""
+        self._tc_original_classes: Dict[str, Dict[str, str]] = {}
+        self._tc_shape_report: Dict = {}
+        self._shaped_stage_high: Optional[bool] = None
+        self._profile_step_offset: int = 0
 
         # iPerf log cleanup thread (CPU-efficient, runs every 120s)
         self._log_cleanup_stop = threading.Event()
         self._log_cleanup_thread = None
 
-        # Balanced random selection with 60-episode windows
-        self._profile_names = list(self.TRAFFIC_PROFILES.keys())
+        # Balanced default selection covers steady profiles. Bursty profiles
+        # are selected through the optional "bursty" category weight.
+        self._profile_names = tuple(
+            name
+            for category in ("light", "medium", "high")
+            for name in self.PROFILE_GROUPS[category]
+        )
         self._episode_count = 0
         self._window_size = 60  # Rebalance weights every 60 episodes
         self._usage_counts = {name: 0 for name in self._profile_names}
         
-        # Burst state tracking (time-based)
-        self._burst_active = False
-        self._burst_end_time = 0.0
-        self._next_burst_time = 0.0
-        
-        # Step-based burst tracking (for training)
-        self._step_burst_profile = None   # Current bursty profile name (e.g., 'bursty_be_1')
-        self._step_burst_active = False
-        self._step_burst_start_step = 0   # When the burst will start
-        self._step_burst_end_step = 0     # When the burst will end
-        self._step_burst_count = 0        # Track burst duration for logging
-        self._step_burst_baseline = None  # Baseline profile used for this episode
-        self._step_burst_baseline_loads = None  # Exact baseline loads to restore after burst
-
         # Traffic transition tracking (for telemetry stability)
         self._in_transition = False
         self._transition_start_time = 0.0
@@ -327,6 +383,10 @@ class TrafficManager:
         self._last_packet_len = 1250  # Remember packet length for restarts
         self._health_check_interval = 10.0  # Check every 10 seconds
         self._restart_count = 0  # Track restarts for logging
+        self._startup_recovery_count = 0
+        self._last_start_report = None
+        self._traffic_failed = False
+        self._last_health_error = None
 
         # Traffic logging - stores traffic configurations to CSV for analysis
         self._traffic_log_dir = Path("log")
@@ -371,7 +431,7 @@ class TrafficManager:
         """Log traffic configuration to CSV file for analysis.
 
         Args:
-            event: Event type (start, stop, burst_start, burst_end, restart)
+            event: Event type such as start, stop, restart, or a failure event.
             extra_info: Optional dict with additional info to log
         """
         try:
@@ -398,8 +458,8 @@ class TrafficManager:
                     f"{self.current_load.get(0, 0):.3f}",
                     f"{self.current_load.get(1, 0):.3f}",
                     f"{self.current_load.get(7, 0):.3f}",
-                    getattr(self, '_step_burst_profile', None) is not None,
-                    getattr(self, '_step_burst_baseline', ''),
+                    self.current_profile_category == "bursty",
+                    '',
                     len(self.traffic_pairs),
                     json.dumps(extra_info) if extra_info else ''
                 ])
@@ -650,6 +710,8 @@ class TrafficManager:
         except Exception as e:
             log.warning(f"Failed to kill traffic: {e}")
 
+        self._restore_sender_rate_caps()
+
         # Log traffic stop event
         self._log_traffic_config(event="stop")
 
@@ -757,180 +819,232 @@ class TrafficManager:
             except Exception as e:
                 log.warning(f"[Health Monitor] Error: {e}")
 
-    def _get_expected_ports(self) -> Dict[str, set]:
-        """Get expected iperf ports per host.
-
-        Returns:
-            Dict mapping hostname to set of expected ports
-        """
-        expected = {}
-
-        # Servers: receivers need server ports
-        for _, receiver, flow_id in self.traffic_pairs:
-            if receiver not in expected:
-                expected[receiver] = {'servers': set(), 'clients': set()}
-            for qid in ALL_QUEUES:
-                port = _traffic_dst_port(flow_id, qid)
-                expected[receiver]['servers'].add(port)
-
-        # Clients: senders need client connections
-        for sender, _, flow_id in self.traffic_pairs:
-            if sender not in expected:
-                expected[sender] = {'servers': set(), 'clients': set()}
-            for qid in ALL_QUEUES:
-                port = _traffic_dst_port(flow_id, qid)
-                expected[sender]['clients'].add(port)
-
-        return expected
-
     def _check_and_restart_traffic(self):
-        """Check if any iperf processes are missing and restart them.
+        """Require the exact role/port endpoint inventory and recover atomically."""
+        report = self.verify_exact_processes(
+            timeout=0.01,
+            raise_on_error=False,
+        )
+        if report["verified"]:
+            log.debug(
+                "[Health Monitor] OK: exact traffic endpoint inventory verified"
+            )
+            return
 
-        Performs both aggregate and per-queue checks:
-        - Aggregate check: Total processes below 70% triggers restart
-        - Per-queue check: Any single queue below 50% triggers restart
+        self._restart_count += 1
+        self._in_transition = True
+        self._transition_start_time = time.monotonic()
+        log.warning(
+            "[Health Monitor] Traffic endpoint mismatch; restarting complete "
+            f"traffic set (restart #{self._restart_count}): "
+            + "; ".join(report["errors"])
+        )
 
-        This ensures Q1-specific failures are detected even if aggregate is OK.
+        started_at = time.monotonic()
+        try:
+            recovery = self._ensure_complete_traffic(
+                self._last_packet_len,
+                max_attempts=2,
+                context="health_monitor",
+            )
+            self._traffic_failed = False
+            self._last_health_error = None
+            self._log_traffic_config(
+                event="restart",
+                extra_info={
+                    "reason": "health_monitor",
+                    "restart_count": self._restart_count,
+                    "runtime_ms": (
+                        time.monotonic() - started_at
+                    ) * 1000.0,
+                    "verification": recovery,
+                },
+            )
+            log.info(
+                "[Health Monitor] Exact endpoint inventory restored: "
+                f"{recovery['observed_total']}/"
+                f"{recovery['expected_total']} processes"
+            )
+        except Exception as exc:
+            self._traffic_failed = True
+            self._last_health_error = str(exc)
+            self._log_traffic_config(
+                event="restart_failed",
+                extra_info={
+                    "reason": "health_monitor",
+                    "restart_count": self._restart_count,
+                    "error": str(exc),
+                },
+            )
+            log.error(f"[Health Monitor] Traffic recovery failed: {exc}")
+
+    def _actual_iperf_inventory(
+        self,
+    ) -> Tuple[int, Counter, Dict[int, int], List[str]]:
+        """Inventory actual iperf3 role/port endpoints.
+
+        Returns total processes, a Counter keyed by ``(role, port)``, per-queue
+        process counts, and any unparseable command lines. Bash wrapper loops
+        are excluded by matching the executable name exactly.
         """
-        expected = self._get_expected_ports()
-
-        # Count expected total processes
-        expected_servers = sum(len(v['servers']) for v in expected.values())
-        expected_clients = sum(len(v['clients']) for v in expected.values())
-        expected_total = expected_servers + expected_clients
-
-        # Count running processes (quick pgrep count)
+        inventory = Counter()
+        queue_counts = {qid: 0 for qid in ALL_QUEUES}
+        unparseable = []
         try:
             result = subprocess.run(
-                ['pgrep', '-c', 'iperf3'],
-                capture_output=True, text=True, timeout=10
+                ['pgrep', '-a', '-x', 'iperf3'],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
-            running_count = int(result.stdout.strip()) if result.returncode == 0 else 0
-        except Exception as e:
-            log.debug(f"[Health Monitor] pgrep error: {e}")
-            running_count = 0
+        except Exception:
+            return 0, inventory, queue_counts, unparseable
 
-        # Check 1: Aggregate threshold (70%)
-        threshold = int(expected_total * 0.7)
-        aggregate_failed = running_count < threshold
+        if result.returncode != 0:
+            return 0, inventory, queue_counts, unparseable
 
-        # Check 2: Per-queue threshold (50%) - detect queue-specific failures
-        expected_per_queue = len(self.traffic_pairs) * 2  # servers + clients per queue
-        per_queue_threshold = int(expected_per_queue * 0.5)
-        per_queue_failed = False
-        failed_queues = []
-
-        for qid in ALL_QUEUES:
-            port_pattern = f'iperf3.*-p 6[1-6][0-9]{qid}'
-            try:
-                result = subprocess.run(
-                    ['pgrep', '-c', '-f', port_pattern],
-                    capture_output=True, text=True, timeout=10
-                )
-                queue_count = int(result.stdout.strip()) if result.returncode == 0 else 0
-            except Exception:
-                queue_count = 0
-
-            if queue_count < per_queue_threshold:
-                per_queue_failed = True
-                failed_queues.append((qid, queue_count, expected_per_queue))
-
-        # Restart if either check fails
-        if aggregate_failed or per_queue_failed:
-            if per_queue_failed and not aggregate_failed:
-                # Queue-specific failure with aggregate OK - this is the Q1 bug scenario
-                log.warning(f"[Health Monitor] Per-queue failure detected (aggregate OK): "
-                           f"queues {[(f'Q{q}:{c}/{e}') for q, c, e in failed_queues]}")
-            elif aggregate_failed:
-                log.warning(f"[Health Monitor] Aggregate failure: {running_count}/{expected_total} "
-                           f"(threshold: {threshold})")
-
-        if aggregate_failed or per_queue_failed:
-            self._restart_count += 1
-            log.warning(f"[Health Monitor] Only {running_count}/{expected_total} iperf processes running "
-                       f"(threshold: {threshold}). Restarting traffic... (restart #{self._restart_count})")
-
-            # Check TaskServer socket health before restart
-            missing_sockets = []
-            for host in self.traffic_hosts:
-                socket_path = f"/tmp/{host}_socket"
-                if not os.path.exists(socket_path):
-                    missing_sockets.append(host)
-            if missing_sockets:
-                log.error(f"[Health Monitor] Missing TaskServer sockets: {missing_sockets}")
-
-            # Mark transition for telemetry stability
-            self._in_transition = True
-            self._transition_start_time = time.monotonic()
-
-            # Restart all traffic (stop then start)
-            t0 = time.monotonic()
-            self._stop_all_iperf()
-            time.sleep(0.5)
-            self._start_servers()
-            time.sleep(1.0)
-            self._start_clients(self._last_packet_len)
-            restart_ms = (time.monotonic() - t0) * 1000
-
-            # Verify restart success
-            time.sleep(2.0)  # Wait for processes to start
-            try:
-                result = subprocess.run(
-                    ['pgrep', '-c', 'iperf3'],
-                    capture_output=True, text=True, timeout=10
-                )
-                new_count = int(result.stdout.strip()) if result.returncode == 0 else 0
-            except Exception:
-                new_count = 0
-
-            # Log restart event with verification
-            self._log_traffic_config(event="restart", extra_info={
-                'reason': 'health_monitor',
-                'running_count_before': running_count,
-                'running_count_after': new_count,
-                'expected_total': expected_total,
-                'restart_count': self._restart_count,
-                'restart_ms': restart_ms,
-                'missing_sockets': missing_sockets
-            })
-
-            if new_count >= threshold:
-                log.info(f"[Health Monitor] Restart OK: {new_count}/{expected_total} processes "
-                        f"(was {running_count}, took {restart_ms:.0f}ms)")
-                # Also verify per-queue status after restart
-                self._log_per_queue_status()
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        for line in lines:
+            match = re.search(r"(?:^|\s)-p\s+(\d+)(?:\s|$)", line)
+            if not match:
+                unparseable.append(line)
+                continue
+            port = int(match.group(1))
+            if re.search(r"(?:^|\s)-s(?:\s|$)", line):
+                role = "server"
+            elif re.search(r"(?:^|\s)-c\s+\S+", line):
+                role = "client"
             else:
-                log.error(f"[Health Monitor] Restart FAILED: only {new_count}/{expected_total} processes "
-                         f"after restart (was {running_count})")
+                unparseable.append(line)
+                continue
 
-                # If restart failed, TaskServer may be unresponsive - try restarting TaskServers
-                log.warning("[Health Monitor] Attempting TaskServer restart due to failed traffic restart...")
-                if self._restart_all_taskservers():
-                    time.sleep(1.0)
-                    self._start_servers()
-                    time.sleep(1.0)
-                    self._start_clients(self._last_packet_len)
+            inventory[(role, port)] += 1
+            qid = port % 10
+            if qid in queue_counts:
+                queue_counts[qid] += 1
+        return len(lines), inventory, queue_counts, unparseable
 
-                    # Verify TaskServer restart helped
-                    time.sleep(2.0)
-                    try:
-                        result = subprocess.run(
-                            ['pgrep', '-c', 'iperf3'],
-                            capture_output=True, text=True, timeout=10
-                        )
-                        final_count = int(result.stdout.strip()) if result.returncode == 0 else 0
-                    except Exception:
-                        final_count = 0
+    def _actual_iperf_counts(self) -> Tuple[int, Dict[int, int]]:
+        """Backward-compatible aggregate view of the endpoint inventory."""
+        total, _, queue_counts, _ = self._actual_iperf_inventory()
+        return total, queue_counts
 
-                    if final_count >= threshold:
-                        log.info(f"[Health Monitor] TaskServer restart SUCCESS: {final_count}/{expected_total} processes")
-                    else:
-                        log.error(f"[Health Monitor] TaskServer restart FAILED: still only {final_count}/{expected_total} processes")
-                else:
-                    log.error("[Health Monitor] TaskServer restart failed!")
-        else:
-            # Log health status periodically at debug level
-            log.debug(f"[Health Monitor] OK: {running_count}/{expected_total} iperf processes running")
+    def verify_exact_processes(
+        self,
+        timeout: float = 8.0,
+        require_no_restarts: bool = False,
+        raise_on_error: bool = True,
+    ) -> Dict:
+        """Require the exact benchmark traffic process population."""
+        expected_endpoints = Counter()
+        for _, _, flow_id in self.traffic_pairs:
+            for qid in ALL_QUEUES:
+                port = _traffic_dst_port(flow_id, qid)
+                expected_endpoints[("server", port)] += 1
+                expected_endpoints[("client", port)] += 1
+
+        expected_per_queue = len(self.traffic_pairs) * 2
+        expected_total = sum(expected_endpoints.values())
+        deadline = time.monotonic() + timeout
+        total = 0
+        inventory = Counter()
+        queue_counts = {qid: 0 for qid in ALL_QUEUES}
+        unparseable = []
+
+        while time.monotonic() < deadline:
+            (
+                total,
+                inventory,
+                queue_counts,
+                unparseable,
+            ) = self._actual_iperf_inventory()
+            if (
+                total == expected_total
+                and inventory == expected_endpoints
+                and not unparseable
+                and all(
+                    queue_counts[qid] == expected_per_queue
+                    for qid in ALL_QUEUES
+                )
+            ):
+                break
+            time.sleep(0.25)
+
+        errors = []
+        if total != expected_total:
+            errors.append(
+                f"total iperf3 processes expected {expected_total}, observed {total}"
+            )
+        for qid in ALL_QUEUES:
+            if queue_counts[qid] != expected_per_queue:
+                errors.append(
+                    f"Q{qid} processes expected {expected_per_queue}, "
+                    f"observed {queue_counts[qid]}"
+                )
+        missing_endpoints = []
+        duplicate_endpoints = []
+        unexpected_endpoints = []
+        for endpoint, expected_count in expected_endpoints.items():
+            observed_count = inventory.get(endpoint, 0)
+            if observed_count < expected_count:
+                missing_endpoints.append(
+                    f"{endpoint[0]}:{endpoint[1]} "
+                    f"expected={expected_count} observed={observed_count}"
+                )
+            elif observed_count > expected_count:
+                duplicate_endpoints.append(
+                    f"{endpoint[0]}:{endpoint[1]} "
+                    f"expected={expected_count} observed={observed_count}"
+                )
+        for endpoint, observed_count in inventory.items():
+            if endpoint not in expected_endpoints:
+                unexpected_endpoints.append(
+                    f"{endpoint[0]}:{endpoint[1]} observed={observed_count}"
+                )
+        if missing_endpoints:
+            errors.append(
+                "missing endpoints: " + ", ".join(missing_endpoints)
+            )
+        if duplicate_endpoints:
+            errors.append(
+                "duplicate endpoints: " + ", ".join(duplicate_endpoints)
+            )
+        if unexpected_endpoints:
+            errors.append(
+                "unexpected endpoints: " + ", ".join(unexpected_endpoints)
+            )
+        if unparseable:
+            errors.append(
+                f"{len(unparseable)} unparseable iperf3 command(s)"
+            )
+        restart_count = int(getattr(self, "_restart_count", 0))
+        if require_no_restarts and restart_count != 0:
+            errors.append(
+                f"traffic health monitor performed {restart_count} "
+                "restart(s) during the measured run"
+            )
+
+        report = {
+            "verified": not errors,
+            "expected_total": expected_total,
+            "observed_total": total,
+            "expected_per_queue": expected_per_queue,
+            "observed_per_queue": queue_counts,
+            "expected_endpoint_count": len(expected_endpoints),
+            "observed_endpoint_count": len(inventory),
+            "missing_endpoints": missing_endpoints,
+            "duplicate_endpoints": duplicate_endpoints,
+            "unexpected_endpoints": unexpected_endpoints,
+            "unparseable_commands": unparseable,
+            "restart_count": restart_count,
+            "errors": errors,
+        }
+        if errors and raise_on_error:
+            raise RuntimeError(
+                "Traffic process verification failed: "
+                + "; ".join(errors)
+            )
+        return report
 
     def _log_per_queue_status(self) -> Dict[int, int]:
         """Log process counts per queue for debugging.
@@ -939,65 +1053,14 @@ class TrafficManager:
             Dict mapping qid to running process count
         """
         expected = len(self.traffic_pairs) * 2  # servers + clients per queue
-        queue_counts = {}
+        _, queue_counts = self._actual_iperf_counts()
         status_parts = []
 
         for qid in ALL_QUEUES:
-            # Pattern matches ports ending in qid digit (6101, 6111, ... for Q1)
-            port_pattern = f'iperf3.*-p 6[1-6][0-9]{qid}'
-            try:
-                result = subprocess.run(
-                    ['pgrep', '-c', '-f', port_pattern],
-                    capture_output=True, text=True, timeout=5
-                )
-                count = int(result.stdout.strip()) if result.returncode == 0 else 0
-            except Exception:
-                count = 0
-            queue_counts[qid] = count
-            status_parts.append(f"Q{qid}:{count}/{expected}")
+            status_parts.append(f"Q{qid}:{queue_counts[qid]}/{expected}")
 
         log.info(f"[Traffic] Per-queue status: {', '.join(status_parts)}")
         return queue_counts
-
-    def _verify_per_queue(self, min_pct: float = 0.7) -> Tuple[bool, Dict[int, int]]:
-        """Verify iperf processes per queue, not just aggregate.
-
-        Args:
-            min_pct: Minimum percentage of expected processes required per queue
-
-        Returns:
-            Tuple of (all_ok, counts_dict) where counts_dict[qid] = running_count
-        """
-        expected_per_queue = len(self.traffic_pairs) * 2  # servers + clients
-        threshold_per_queue = int(expected_per_queue * min_pct)
-
-        queue_counts = {}
-        all_ok = True
-        failed_queues = []
-
-        for qid in ALL_QUEUES:
-            # Pattern matches ports ending in qid digit (6101, 6111, ... for Q1)
-            port_pattern = f'iperf3.*-p 6[1-6][0-9]{qid}'
-            try:
-                result = subprocess.run(
-                    ['pgrep', '-c', '-f', port_pattern],
-                    capture_output=True, text=True, timeout=10
-                )
-                running = int(result.stdout.strip()) if result.returncode == 0 else 0
-            except Exception:
-                running = 0
-
-            queue_counts[qid] = running
-
-            if running < threshold_per_queue:
-                log.warning(f"[Traffic] Q{qid} only has {running}/{expected_per_queue} processes (need {threshold_per_queue})!")
-                all_ok = False
-                failed_queues.append(qid)
-
-        if failed_queues:
-            log.warning(f"[Traffic] Per-queue verification FAILED for queues: {failed_queues}")
-
-        return all_ok, queue_counts
 
     def _stop_all_iperf(self):
         """Stop all iperf processes without clearing traffic state."""
@@ -1007,132 +1070,551 @@ class TrafficManager:
         except Exception as e:
             log.debug(f"Error stopping iperf: {e}")
 
-    def start_traffic(self, packet_len: int = 1250,
-                       category_weights: Dict[str, float] = None,
-                       profile_name: str = None) -> Dict[str, any]:
+    def _ensure_complete_traffic(
+        self,
+        packet_len: int,
+        max_attempts: int = 3,
+        context: str = "startup",
+    ) -> Dict:
+        """Start the complete endpoint set or fail closed.
+
+        Each attempt begins by removing all old iperf processes, then launches
+        every server and client and verifies the exact role/port inventory. If
+        an attempt fails, all TaskServers are restarted before retrying.
+        Partial traffic is never returned to the caller as a successful start.
+        """
+        attempts = []
+        last_report = None
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                self._startup_recovery_count += 1
+                log.warning(
+                    f"[Traffic] {context} recovery attempt "
+                    f"{attempt}/{max_attempts}: restarting TaskServers"
+                )
+                if not self._restart_all_taskservers():
+                    attempts.append(
+                        {
+                            "attempt": attempt,
+                            "taskservers_restarted": False,
+                            "errors": ["TaskServer restart failed"],
+                        }
+                    )
+                    continue
+                time.sleep(1.0)
+
+            self._stop_all_iperf()
+            time.sleep(0.5)
+            self._start_servers()
+            time.sleep(1.0)
+            self._start_clients(packet_len)
+
+            report = self.verify_exact_processes(
+                timeout=8.0,
+                raise_on_error=False,
+            )
+            last_report = report
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "taskservers_restarted": attempt > 1,
+                    "verified": report["verified"],
+                    "observed_total": report["observed_total"],
+                    "observed_per_queue": report["observed_per_queue"],
+                    "errors": report["errors"],
+                }
+            )
+            if report["verified"]:
+                report = {
+                    **report,
+                    "context": context,
+                    "attempts_used": attempt,
+                    "attempt_history": attempts,
+                    "startup_recovery_count": self._startup_recovery_count,
+                }
+                self._last_start_report = report
+                self._traffic_failed = False
+                log.info(
+                    "[Traffic] Exact endpoint inventory verified: "
+                    f"{report['observed_total']}/{report['expected_total']} "
+                    f"processes; Q0={report['observed_per_queue'][0]}, "
+                    f"Q1={report['observed_per_queue'][1]}, "
+                    f"Q7={report['observed_per_queue'][7]}"
+                )
+                return report
+
+            log.warning(
+                f"[Traffic] {context} attempt {attempt}/{max_attempts} "
+                "did not create the complete endpoint set: "
+                + "; ".join(report["errors"])
+            )
+
+        self._stop_all_iperf()
+        self._traffic_active = False
+        self._traffic_failed = True
+        failure = {
+            "verified": False,
+            "context": context,
+            "attempts_used": len(attempts),
+            "attempt_history": attempts,
+            "last_report": last_report,
+            "startup_recovery_count": self._startup_recovery_count,
+        }
+        self._last_start_report = failure
+        raise RuntimeError(
+            f"Unable to establish complete traffic after {max_attempts} "
+            f"attempts ({context})"
+            + (
+                ": " + "; ".join(last_report["errors"])
+                if last_report
+                else ""
+            )
+        )
+
+    @classmethod
+    def profile_category(cls, profile_name: str) -> str:
+        """Return the single category containing ``profile_name``."""
+        for category, profiles in cls.PROFILE_GROUPS.items():
+            if profile_name in profiles:
+                return category
+        raise ValueError(
+            f"Unknown traffic profile {profile_name!r}; valid profiles: "
+            f"{', '.join(cls.TRAFFIC_PROFILES)}"
+        )
+
+    def _choose_profile_name(
+        self,
+        profile_name: Optional[str],
+        category_weights: Optional[Dict[str, float]],
+    ) -> str:
+        """Select and validate a profile from the canonical registry."""
+        if profile_name is not None:
+            if profile_name not in self.TRAFFIC_PROFILES:
+                raise ValueError(
+                    f"Unknown traffic profile {profile_name!r}; valid profiles: "
+                    f"{', '.join(self.TRAFFIC_PROFILES)}"
+                )
+            return profile_name
+
+        if category_weights is not None:
+            weighted_categories = []
+            weights = []
+            for category, raw_weight in category_weights.items():
+                if category not in self.PROFILE_GROUPS:
+                    raise ValueError(
+                        f"Unknown traffic category {category!r}; valid categories: "
+                        f"{', '.join(self.PROFILE_GROUPS)}"
+                    )
+                weight = float(raw_weight)
+                if not math.isfinite(weight):
+                    raise ValueError(
+                        f"Traffic category weight for {category!r} must be finite"
+                    )
+                if weight < 0:
+                    raise ValueError(
+                        f"Traffic category weight for {category!r} cannot be negative"
+                    )
+                if weight > 0:
+                    weighted_categories.append(category)
+                    weights.append(weight)
+            if not weighted_categories:
+                raise ValueError("At least one traffic category weight must be positive")
+            category = self._rng.choices(
+                weighted_categories,
+                weights=weights,
+                k=1,
+            )[0]
+            return self._rng.choice(self.PROFILE_GROUPS[category])
+
+        self._episode_count += 1
+        if self._episode_count % self._window_size == 1:
+            self._usage_counts = {name: 0 for name in self._profile_names}
+
+        max_usage = max(self._usage_counts.values(), default=0)
+        weights = [
+            max_usage + 1 - self._usage_counts[name]
+            for name in self._profile_names
+        ]
+        selected = self._rng.choices(
+            self._profile_names,
+            weights=weights,
+            k=1,
+        )[0]
+        self._usage_counts[selected] += 1
+        return selected
+
+    @classmethod
+    def _stage_loads(cls, profile_name: str, stage_high: bool) -> Dict[int, float]:
+        stage = "high" if stage_high else "low"
+        return cls.PROFILE_STAGE_LOADS[profile_name][stage].copy()
+
+    @staticmethod
+    def _parse_root_htb_class(output: str) -> Optional[Dict[str, str]]:
+        """Parse Mininet's root HTB class from ``tc class show`` output."""
+        match = re.search(
+            r"class htb (?P<classid>\S+) root .*?"
+            r"rate (?P<rate>\S+) ceil (?P<ceil>\S+) .*?"
+            r"burst (?P<burst>\S+) cburst (?P<cburst>\S+)",
+            output,
+        )
+        return match.groupdict() if match else None
+
+    @staticmethod
+    def _tc_rate_to_mbps(value: str) -> float:
+        """Convert tc rate strings such as ``4740Kbit`` to Mbps."""
+        match = re.fullmatch(
+            r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[KMG]?bit)",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            raise ValueError(f"Unsupported tc rate value: {value!r}")
+        amount = float(match.group("value"))
+        factor = {
+            "bit": 1e-6,
+            "kbit": 1e-3,
+            "mbit": 1.0,
+            "gbit": 1e3,
+        }[match.group("unit").lower()]
+        return amount * factor
+
+    def _set_sender_rate_cap(self, hostname: str, rate_mbps: float) -> Dict:
+        """Set and verify the existing Mininet root HTB class rate."""
+        host_pid = self._get_host_pid(hostname)
+        if host_pid is None:
+            raise RuntimeError(f"Cannot find Mininet PID for sender {hostname}")
+
+        interface = f"{hostname}-eth0"
+        show_cmd = [
+            "mnexec", "-a", str(host_pid),
+            "tc", "class", "show", "dev", interface,
+        ]
+        before = subprocess.run(
+            show_cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+        parsed = self._parse_root_htb_class(before)
+        if parsed is None:
+            raise RuntimeError(
+                f"Unable to identify root HTB class on {interface}: {before!r}"
+            )
+        self._tc_original_classes.setdefault(
+            hostname,
+            {
+                **parsed,
+                "pid": str(host_pid),
+                "interface": interface,
+            },
+        )
+
+        rate_kbit = max(1, int(round(rate_mbps * 1000.0)))
+        subprocess.run(
+            [
+                "mnexec", "-a", str(host_pid),
+                "tc", "class", "change", "dev", interface,
+                "classid", parsed["classid"], "htb",
+                "rate", f"{rate_kbit}kbit",
+                "ceil", f"{rate_kbit}kbit",
+                "burst", parsed["burst"],
+                "cburst", parsed["cburst"],
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        after = subprocess.run(
+            show_cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+        verified = self._parse_root_htb_class(after)
+        if verified is None or verified["classid"] != parsed["classid"]:
+            raise RuntimeError(
+                f"Unable to verify sender cap on {interface}: {after!r}"
+            )
+        observed_rate = self._tc_rate_to_mbps(verified["rate"])
+        observed_ceil = self._tc_rate_to_mbps(verified["ceil"])
+        tolerance = max(0.002, rate_mbps * 0.01)
+        if (
+            abs(observed_rate - rate_mbps) > tolerance
+            or abs(observed_ceil - rate_mbps) > tolerance
+        ):
+            raise RuntimeError(
+                f"Sender cap verification mismatch on {interface}: "
+                f"target={rate_mbps:.6f} Mbps, "
+                f"rate={observed_rate:.6f}, ceil={observed_ceil:.6f}"
+            )
+        return {
+            "host": hostname,
+            "interface": interface,
+            "classid": parsed["classid"],
+            "target_rate_mbps": rate_mbps,
+            "observed_rate_mbps": observed_rate,
+            "observed_ceil_mbps": observed_ceil,
+            "tc_state": verified,
+        }
+
+    def _apply_sender_caps(self, profile_name: str) -> Dict:
+        """Shape each sender to the profile's exact aggregate offered load."""
+        pair_counts = Counter(sender for sender, _, _ in self.traffic_pairs)
+        per_pair_total = sum(self.current_load.values())
+        reports = []
+        try:
+            for sender in sorted(pair_counts):
+                reports.append(
+                    self._set_sender_rate_cap(
+                        sender,
+                        per_pair_total * pair_counts[sender],
+                    )
+                )
+        except Exception:
+            self._restore_sender_rate_caps()
+            raise
+
+        self._tc_shape_report = {
+            "verified": True,
+            "profile": profile_name,
+            "stage": (
+                "high"
+                if self._shaped_stage_high is True
+                else (
+                    "low"
+                    if self._shaped_stage_high is False
+                    else "startup"
+                )
+            ),
+            "per_pair_total_mbps": per_pair_total,
+            "senders": reports,
+        }
+        log.info(
+            f"[Traffic] Applied verified sender HTB caps for {profile_name}: "
+            f"{per_pair_total:.4f} Mbps per demand"
+        )
+        return self._tc_shape_report
+
+    def apply_step_profile(
+        self,
+        current_step: int,
+        use_offset: bool = True,
+    ) -> Optional[Dict]:
+        """Apply the deterministic stage for a shaped benchmark profile."""
+        pattern = self.SHAPED_PROFILE_PATTERNS.get(
+            self.current_profile_name
+        )
+        if not pattern:
+            return None
+        if current_step < 1:
+            raise ValueError("current_step must be at least 1")
+
+        profile_step = current_step + (
+            getattr(self, "_profile_step_offset", 0) if use_offset else 0
+        )
+        stage_high = bool(pattern[(profile_step - 1) % len(pattern)])
+        if stage_high == self._shaped_stage_high:
+            return None
+
+        self._shaped_stage_high = stage_high
+        self.current_load = self._stage_loads(
+            self.current_profile_name,
+            stage_high,
+        )
+        report = self._apply_sender_caps(
+            self.current_profile_name
+        )
+        report["step"] = current_step
+        report["profile_step"] = profile_step
+        log.info(
+            f"[Traffic] Step {current_step}: "
+            f"profile_step={profile_step} "
+            f"{self.current_profile_name} -> "
+            f"{'HIGH' if stage_high else 'LOW'} "
+            f"({sum(self.current_load.values()):.3f} Mbps per demand)"
+        )
+        return report
+
+    def warm_profile_for(
+        self,
+        duration_seconds: float,
+        step_interval_seconds: float = 1.0,
+    ) -> Dict:
+        """Advance the active profile during an excluded warmup window.
+
+        ``start_traffic()`` activates profile step 1 immediately. This method
+        advances later profile steps during warmup so measured step 1 continues
+        from a warmed-up deterministic traffic pattern instead of replaying the
+        profile from a cold queue state.
+        """
+        duration = max(0.0, float(duration_seconds))
+        interval = max(0.1, float(step_interval_seconds))
+        transitions = int(duration // interval)
+        applied = []
+
+        for transition in range(1, transitions + 1):
+            time.sleep(interval)
+            report = self.apply_step_profile(
+                transition + 1,
+                use_offset=False,
+            )
+            if report:
+                applied.append(report)
+
+        remaining = duration - transitions * interval
+        if remaining > 0:
+            time.sleep(remaining)
+
+        self._profile_step_offset = transitions
+        log.info(
+            f"[Traffic] Warmed profile {self.current_profile_name} for "
+            f"{duration:.1f}s; measurement starts at profile_step="
+            f"{self._profile_step_offset + 1}"
+        )
+        return {
+            "duration_seconds": duration,
+            "step_interval_seconds": interval,
+            "profile_step_offset": self._profile_step_offset,
+            "stage_changes": applied,
+        }
+
+    def begin_measurement(
+        self,
+        settle_seconds: float = MEASUREMENT_SETTLE_SECONDS,
+    ) -> Optional[Dict]:
+        """Ensure the first measurement stage is active.
+
+        The target stage is normally already active because ``start_traffic()``
+        sets sender caps before launching iperf clients. This method remains
+        as an idempotent compatibility hook for runners that call it before
+        entering their measured loop.
+        """
+        pattern = self.SHAPED_PROFILE_PATTERNS.get(
+            self.current_profile_name
+        )
+        if not pattern:
+            return None
+
+        profile_step = getattr(self, "_profile_step_offset", 0) + 1
+        stage_high = bool(pattern[(profile_step - 1) % len(pattern)])
+        target_load = self._stage_loads(
+            self.current_profile_name,
+            stage_high,
+        )
+        already_active = (
+            self._shaped_stage_high == stage_high
+            and self.current_load == target_load
+            and bool(getattr(self, "_tc_shape_report", {}).get("verified"))
+        )
+        if already_active:
+            report = dict(getattr(self, "_tc_shape_report", {}))
+            report["phase"] = "measurement_start"
+            report["already_active"] = True
+            report["settle_seconds"] = 0.0
+            log.info(
+                f"[Traffic] Measurement load already active for "
+                f"{self.current_profile_name}: "
+                f"{sum(self.current_load.values()):.3f} Mbps per demand"
+            )
+            return report
+
+        self._shaped_stage_high = stage_high
+        self.current_load = target_load
+        report = self._apply_sender_caps(self.current_profile_name)
+        report["phase"] = "measurement_start"
+        report["already_active"] = False
+        report["settle_seconds"] = float(settle_seconds)
+        if settle_seconds > 0:
+            time.sleep(float(settle_seconds))
+        log.info(
+            f"[Traffic] Measurement load ready for "
+            f"{self.current_profile_name}: "
+            f"{sum(self.current_load.values()):.3f} Mbps per demand"
+        )
+        return report
+
+    def _restore_sender_rate_caps(self) -> None:
+        """Restore Mininet's original sender HTB classes after shaped traffic."""
+        states = getattr(self, "_tc_original_classes", {})
+        for hostname, state in list(states.items()):
+            try:
+                subprocess.run(
+                    [
+                        "mnexec", "-a", state["pid"],
+                        "tc", "class", "change", "dev", state["interface"],
+                        "classid", state["classid"], "htb",
+                        "rate", state["rate"],
+                        "ceil", state["ceil"],
+                        "burst", state["burst"],
+                        "cburst", state["cburst"],
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+            except Exception as exc:
+                log.warning(
+                    f"[Traffic] Failed restoring sender cap for {hostname}: {exc}"
+                )
+        states.clear()
+        self._tc_shape_report = {}
+
+    def start_traffic(
+        self,
+        packet_len: int = 1250,
+        category_weights: Optional[Dict[str, float]] = None,
+        profile_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Start traffic with a selected profile.
-        
+
         Args:
             packet_len: UDP packet length in bytes
-            category_weights: Optional category weights, e.g. {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
-                             If provided, selects category first then random profile within category.
-                             For 'bursty' category, returns a bursty profile name (caller should use check_step_burst).
-            profile_name: Optional specific profile name (e.g., 'high_1', 'medium_2', 'bursty_be_1').
-                         If provided, uses this profile directly (overrides category_weights).
-            
+            category_weights: Optional weights for keys in ``PROFILE_GROUPS``.
+                A category is selected first, followed by one of its profiles.
+            profile_name: Optional name from ``TRAFFIC_PROFILES``. An explicit
+                profile takes precedence over category weights.
+
         Returns:
-            Dict with profile info for logging. For bursty profiles, also includes 'is_bursty': True
+            Profile, offered-load, and exact startup verification metadata.
         """
         self.stop_traffic()
         time.sleep(0.3)
         self._start_log_cleanup_thread()
+        self._startup_recovery_count = 0
+        self._last_start_report = None
 
         # Mark traffic as transitioning - telemetry will be unstable during ramp-up
         self._in_transition = True
         self._transition_start_time = time.monotonic()
 
-        is_bursty = False
-        
-        if profile_name:
-            # Use specific profile by name (supports training, test, and bursty profiles)
-            if profile_name in self.BURSTY_PROFILES:
-                is_bursty = True
-                # Select random baseline from light/medium profiles
-                baseline_options = ['light_1', 'light_2', 'medium_1', 'medium_2']
-                baseline_profile = self._rng.choice(baseline_options)
-                self._step_burst_baseline = baseline_profile
-                self.current_profile_name = profile_name
-                self.current_profile_category = 'bursty'
-                profile_ranges = self.ALL_PROFILES[baseline_profile]
-                # Randomize baseline loads now with correlation, save them for restoration after burst
-                # Use correlated randomization (same as main traffic start)
-                midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
-                scale = self._rng.uniform(0.85, 1.15)  # ±15% variation
-                self._step_burst_baseline_loads = {
-                    qid: midpoints[qid] * scale for qid in profile_ranges.keys()
-                }
-                log.info(f"[BURSTY] Episode baseline: {baseline_profile}")
-            elif profile_name in self.ALL_PROFILES:
-                self.current_profile_name = profile_name
-                profile_ranges = self.ALL_PROFILES[profile_name]
-            else:
-                log.warning(f"Unknown profile '{profile_name}', using high_1")
-                profile_name = 'high_1'
-                self.current_profile_name = profile_name
-                profile_ranges = self.ALL_PROFILES[profile_name]
-        elif category_weights:
-            # Select category based on weights, then random profile in that category
-            category = self._rng.choices(
-                list(category_weights.keys()),
-                weights=list(category_weights.values())
-            )[0]
-            
-            if category == 'bursty':
-                # Select a random bursty profile
-                bursty_names = list(self.BURSTY_PROFILES.keys())
-                self.current_profile_name = self._rng.choice(bursty_names)
-                self.current_profile_category = 'bursty'
-                is_bursty = True
-                # Select random baseline from light/medium profiles
-                baseline_options = ['light_1', 'light_2', 'medium_1', 'medium_2']
-                baseline_profile = self._rng.choice(baseline_options)
-                self._step_burst_baseline = baseline_profile
-                profile_ranges = self.ALL_PROFILES[baseline_profile]
-                # Randomize baseline loads now with correlation, save them for restoration after burst
-                midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
-                scale = self._rng.uniform(0.85, 1.15)  # ±15% variation
-                self._step_burst_baseline_loads = {
-                    qid: midpoints[qid] * scale for qid in profile_ranges.keys()
-                }
-                log.info(f"[BURSTY] Episode baseline: {baseline_profile}")
-            else:
-                # Get all profiles in this category (training profiles only)
-                profiles_in_category = [p for p in self._profile_names 
-                                        if self.PROFILE_CATEGORIES.get(p) == category]
-                if not profiles_in_category:
-                    log.warning(f"No profiles for category '{category}', using medium_1")
-                    self.current_profile_name = 'medium_1'
-                else:
-                    self.current_profile_name = self._rng.choice(profiles_in_category)
-                profile_ranges = self.ALL_PROFILES[self.current_profile_name]
-        else:
-            # Balanced selection with rebalancing every 60 episodes
-            self._episode_count += 1
-            
-            if self._episode_count % self._window_size == 1:
-                self._usage_counts = {name: 0 for name in self._profile_names}
-            
-            max_usage = max(self._usage_counts.values()) if any(self._usage_counts.values()) else 0
-            weights = [max_usage + 1 - self._usage_counts[name] for name in self._profile_names]
-            
-            self.current_profile_name = self._rng.choices(self._profile_names, weights=weights, k=1)[0]
-            self._usage_counts[self.current_profile_name] += 1
-            profile_ranges = self.ALL_PROFILES[self.current_profile_name]
-        
-        if not is_bursty:
-            self.current_profile_category = self.PROFILE_CATEGORIES.get(self.current_profile_name, 'unknown')
-        
-        # Set load - use saved baseline loads for bursty profiles, otherwise randomize
-        # PHASE 1.3: Use correlated randomization to reduce variance
-        # Instead of independent per-queue randomization (40% total load variance),
-        # use a single scale factor applied to all queues (maintains queue ratios)
-        if is_bursty and self._step_burst_baseline_loads:
-            self.current_load = self._step_burst_baseline_loads.copy()
-        else:
-            # Compute midpoint for each queue
-            midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
-            # Compute range for scaling (average of per-queue ranges)
-            avg_min = sum(rng[0] for rng in profile_ranges.values()) / len(profile_ranges)
-            avg_max = sum(rng[1] for rng in profile_ranges.values()) / len(profile_ranges)
-            avg_mid = (avg_min + avg_max) / 2.0
+        self.current_profile_name = self._choose_profile_name(
+            profile_name,
+            category_weights,
+        )
+        self.current_profile_category = self.profile_category(
+            self.current_profile_name
+        )
+        is_bursty = self.current_profile_category == "bursty"
 
-            # Pick a single scale factor for the entire profile
-            # This maintains relative queue ratios while allowing load variation
-            scale = self._rng.uniform(0.85, 1.15)  # ±15% variation (was ±20-40% per queue)
-
-            self.current_load = {
-                qid: midpoints[qid] * scale for qid in profile_ranges.keys()
-            }
+        # Apply the profile's first scheduled stage immediately. This keeps the
+        # warmup and telemetry-coverage windows on the same offered workload as
+        # the measured episode instead of starting every profile at a benign
+        # low-rate validation load.
+        stages = self.PROFILE_STAGE_LOADS[self.current_profile_name]
+        self._source_load = stages["source"].copy()
+        self._shaped_stage_high = bool(
+            self.SHAPED_PROFILE_PATTERNS[self.current_profile_name][0]
+        )
+        self._profile_step_offset = 0
+        self.current_load = self._stage_loads(
+            self.current_profile_name,
+            self._shaped_stage_high,
+        )
         
         log.info(f"Starting profile '{self.current_profile_name}' ({self.current_profile_category})")
         log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
@@ -1140,267 +1622,55 @@ class TrafficManager:
         # Track state for health monitoring
         self._last_packet_len = packet_len
         self._traffic_active = True
+        self._traffic_failed = False
+        self._last_health_error = None
 
-        # Start servers then clients
-        self._start_servers()
-        time.sleep(1.0)
-        self._start_clients(packet_len)
+        shaping_report = self._apply_sender_caps(
+            self.current_profile_name
+        )
 
-        # Verify traffic actually started (detects unresponsive TaskServer)
-        if not self._verify_traffic_started():
-            log.warning("[Traffic] Startup verification failed, restarting TaskServers...")
-
-            # Attempt TaskServer restart and retry traffic
-            if self._restart_all_taskservers():
-                time.sleep(1.0)
-                self._start_servers()
-                time.sleep(1.0)
-                self._start_clients(packet_len)
-
-                if not self._verify_traffic_started():
-                    log.error("[Traffic] Startup failed even after TaskServer restart!")
-                    # Log failure but continue - health monitor may recover later
-                    self._log_traffic_config(event="start_failed", extra_info={
-                        'packet_len': packet_len,
-                        'reason': 'verification_failed_after_taskserver_restart'
-                    })
-            else:
-                log.error("[Traffic] TaskServer restart failed!")
-                self._log_traffic_config(event="start_failed", extra_info={
-                    'packet_len': packet_len,
-                    'reason': 'taskserver_restart_failed'
-                })
+        try:
+            start_report = self._ensure_complete_traffic(
+                packet_len,
+                max_attempts=3,
+                context="start_traffic",
+            )
+        except Exception as exc:
+            self._restore_sender_rate_caps()
+            self._log_traffic_config(
+                event="start_failed",
+                extra_info={
+                    "packet_len": packet_len,
+                    "reason": "complete_endpoint_verification_failed",
+                    "error": str(exc),
+                    "verification": self._last_start_report,
+                },
+            )
+            raise
 
         # Start health monitoring to auto-restart crashed processes
         self._start_health_monitor()
 
         # Log traffic configuration to CSV
-        self._log_traffic_config(event="start", extra_info={'packet_len': packet_len})
+        self._log_traffic_config(
+            event="start",
+            extra_info={
+                "packet_len": packet_len,
+                "verification": start_report,
+            },
+        )
 
         log.info("Traffic generation started")
         return {
             'profile_name': self.current_profile_name,
             'profile_category': self.current_profile_category,
             'loads': self.current_load.copy(),
+            'measurement_loads': self.current_load.copy(),
             'is_bursty': is_bursty,
+            'traffic_verified': True,
+            'start_verification': start_report,
+            'traffic_shaping': shaping_report,
         }
-    
-    def check_burst(self, burst_interval: float = 60.0, min_duration: float = 10.0, 
-                    max_duration: float = 300.0, base_profile: str = 'medium_1',
-                    burst_profile: str = 'test_be_heavy_1') -> Optional[str]:
-        """Check and manage periodic burst traffic.
-        
-        Call this regularly from the production loop. It will:
-        - Start a burst, run for random duration, then wait `burst_interval` seconds
-        - Repeat indefinitely
-        
-        Args:
-            burst_interval: Seconds to wait AFTER burst ends before starting next burst
-            min_duration: Minimum burst duration in seconds
-            max_duration: Maximum burst duration in seconds
-            base_profile: Traffic profile to use during normal operation
-            burst_profile: Traffic profile to use during bursts
-            
-        Returns:
-            Status message if state changed, None otherwise
-        """
-        current_time = time.time()
-        
-        # Initialize: schedule first burst after burst_interval
-        if self._next_burst_time == 0.0:
-            self._next_burst_time = current_time + burst_interval
-            log.info(f"[BURST] Initialized - first burst in {burst_interval:.0f}s")
-            return None
-        
-        # STATE: Burst is active - check if it should end
-        if self._burst_active:
-            if current_time >= self._burst_end_time:
-                self._burst_active = False
-                # Schedule next burst: wait burst_interval AFTER this burst ends
-                self._next_burst_time = current_time + burst_interval
-                # Restart with base profile
-                self.start_traffic(profile_name=base_profile)
-                log.info(f"[BURST] Next burst in {burst_interval:.0f}s")
-                return f"BURST ENDED - Returning to {base_profile}"
-            # Burst still running
-            return None
-        
-        # STATE: Not in burst - check if we should start one
-        if current_time >= self._next_burst_time:
-            self._burst_active = True
-            burst_duration = self._rng.uniform(min_duration, max_duration)
-            self._burst_end_time = current_time + burst_duration
-            
-            # Start burst traffic
-            self.start_traffic(profile_name=burst_profile)
-            
-            # Log burst info
-            mins = int(burst_duration // 60)
-            secs = int(burst_duration % 60)
-            duration_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-            return f"BURST STARTED - {burst_profile} for {duration_str}"
-        
-        return None
-    
-    def check_step_burst(self, current_step: int, bursty_profile: str = None) -> Optional[str]:
-        """Check and manage step-based burst traffic for training.
-        
-        Call this regularly from the training loop with a bursty profile active.
-        Burst starts at a random step (15-25), runs for configured duration, then ends.
-        Only ONE burst per episode (no cycling).
-        
-        Args:
-            current_step: Current training step within the episode
-            bursty_profile: Name of bursty profile (e.g., 'bursty_be_1')
-            
-        Returns:
-            Status message if state changed, None otherwise
-        """
-        if bursty_profile is None:
-            return None
-            
-        cfg = self.BURSTY_PROFILES.get(bursty_profile)
-        if cfg is None:
-            return None
-        
-        # Initialize or re-initialize for new episode
-        # We detect a new episode by checking if current_step == 1 (first step after reset)
-        # OR if the profile changed (different bursty profile selected)
-        is_new_episode = (current_step == 1) or (self._step_burst_profile != bursty_profile)
-        
-        if is_new_episode:
-            self._step_burst_profile = bursty_profile
-            self._step_burst_active = False
-            self._step_burst_count = 0
-            # Schedule burst start at random step between min and max
-            self._step_burst_start_step = self._rng.randint(
-                cfg['burst_start_min'], cfg['burst_start_max']
-            )
-            # Schedule burst duration
-            burst_duration = self._rng.randint(
-                cfg['burst_duration_min'], cfg['burst_duration_max']
-            )
-            self._step_burst_end_step = self._step_burst_start_step + burst_duration
-            baseline = self._step_burst_baseline or 'medium_1'
-            log.info(f"[BURST SCHEDULE] Profile={bursty_profile} (base={baseline}): "
-                     f"burst starts at step {self._step_burst_start_step}, "
-                     f"duration={burst_duration} steps, ends at step {self._step_burst_end_step}")
-        
-        result = None
-        
-        # Check if burst should end
-        if self._step_burst_active and current_step >= self._step_burst_end_step:
-            actual_duration = self._step_burst_count
-            self._step_burst_active = False
-            self._step_burst_count = 0
-            # Return to baseline with original loads
-            baseline = self._step_burst_baseline or 'medium_1'
-            self._restore_baseline_traffic(baseline)
-            # Log burst end event
-            self._log_traffic_config(event="burst_end", extra_info={
-                'bursty_profile': bursty_profile,
-                'actual_duration_steps': actual_duration,
-                'baseline_profile': baseline
-            })
-            log.info(f"[BURST END] Ended after {actual_duration} steps. Returning to {baseline}.")
-            result = "BURST ENDED"
-        
-        # Check if burst should start
-        elif not self._step_burst_active and current_step >= self._step_burst_start_step and current_step < self._step_burst_end_step:
-            self._step_burst_active = True
-            self._step_burst_count = 0
-            
-            # Switch to burst profile
-            self.start_traffic(profile_name=cfg['burst_profile'])
-            remaining = self._step_burst_end_step - current_step
-            # Log burst start event (note: start_traffic already logs "start", this adds burst context)
-            self._log_traffic_config(event="burst_start", extra_info={
-                'bursty_profile': bursty_profile,
-                'burst_profile': cfg['burst_profile'],
-                'duration_steps': remaining,
-                'current_step': current_step
-            })
-            log.info(f"[BURST START] Profile={cfg['burst_profile']}, "
-                     f"duration={remaining} steps (ends at step {self._step_burst_end_step})")
-            result = f"BURST STARTED: {cfg['burst_profile']} for {remaining} steps"
-        
-        # Track burst duration
-        if self._step_burst_active:
-            self._step_burst_count += 1
-        
-        return result
-    
-    def _restore_baseline_traffic(self, baseline_profile: str):
-        """Restore baseline traffic with exact saved loads (no re-randomization).
-
-        Used when returning from a burst to maintain the same baseline load
-        that was active at episode start.
-
-        PHASE 3.1 TODO: Current implementation uses hard reset (stop+start traffic)
-        which creates discontinuous traffic change. Future improvement: implement
-        gradual ramp-down over 5-10 steps by updating iperf3 bandwidth without restart.
-        This requires either:
-        1. Using iperf3 TCP control connection to update bandwidth
-        2. Or adding burst_active flag to state (requires retraining)
-        """
-        self.stop_traffic()
-        time.sleep(0.3)
-
-        # Mark traffic as transitioning - telemetry will be unstable during ramp-up
-        self._in_transition = True
-        self._transition_start_time = time.monotonic()
-
-        # Restore exact loads saved at episode start
-        if self._step_burst_baseline_loads:
-            self.current_load = self._step_burst_baseline_loads.copy()
-        else:
-            # Fallback: randomize if no saved loads (use correlated randomization)
-            profile_ranges = self.ALL_PROFILES.get(baseline_profile, self.ALL_PROFILES['medium_1'])
-            midpoints = {qid: (rng[0] + rng[1]) / 2.0 for qid, rng in profile_ranges.items()}
-            scale = self._rng.uniform(0.85, 1.15)  # ±15% variation
-            self.current_load = {
-                qid: midpoints[qid] * scale for qid in profile_ranges.keys()
-            }
-        
-        self.current_profile_name = baseline_profile
-        self.current_profile_category = self.PROFILE_CATEGORIES.get(baseline_profile, 'medium')
-        
-        log.info(f"Restoring profile '{baseline_profile}' ({self.current_profile_category})")
-        log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
-
-        # Track state for health monitoring
-        self._last_packet_len = 1250
-        self._traffic_active = True
-
-        self._start_servers()
-        time.sleep(1.0)
-        self._start_clients(packet_len=1250)
-
-        # Verify traffic actually started (matches start_traffic behavior)
-        if not self._verify_traffic_started():
-            log.warning("[Traffic] Baseline restore verification failed, restarting TaskServers...")
-
-            if self._restart_all_taskservers():
-                time.sleep(1.0)
-                self._start_servers()
-                time.sleep(1.0)
-                self._start_clients(packet_len=1250)
-
-                if not self._verify_traffic_started():
-                    log.error("[Traffic] Baseline restore failed even after TaskServer restart!")
-            else:
-                log.error("[Traffic] TaskServer restart failed during baseline restore!")
-
-        # Start health monitoring (was missing - caused step 474 failure)
-        self._start_health_monitor()
-
-        # Wait for traffic to stabilize before returning
-        # This ensures InfluxDB has fresh data when RL agent queries after burst transitions
-        stabilization_wait = 3.0
-        log.info(f"[Traffic] Waiting {stabilization_wait}s for traffic to stabilize...")
-        time.sleep(stabilization_wait)
-
-        log.info("Traffic generation started")
     
     def _start_servers(self):
         """Start iperf3 servers on receiver hosts with batched task sending.
@@ -1483,7 +1753,10 @@ class TrafficManager:
             for idx, qid in enumerate(ALL_QUEUES):
                 port = _traffic_dst_port(flow_id, qid)
                 tos = QID_TOS.get(qid, 0)
-                bw = self.current_load.get(qid, 0.2)
+                bw = self._source_load.get(
+                    qid,
+                    self.current_load.get(qid, 0.2),
+                )
                 cmd = (
                     f"bash -lc '{self.TRAFFIC_TAG}=1; "
                     f"while true; do iperf3 -c {dst_ip} -p {port} -u "
@@ -1529,59 +1802,27 @@ class TrafficManager:
         else:
             log.debug(f"[Traffic] Clients: {num_hosts} hosts ({total_tasks} tasks) in {elapsed_ms:.0f}ms")
 
-    def _verify_traffic_started(self, timeout: float = 8.0, min_pct: float = 0.7) -> bool:
-        """Verify iperf processes actually started after traffic commands sent.
+    def _verify_traffic_started(
+        self,
+        timeout: float = 8.0,
+        min_pct: float = 1.0,
+    ) -> bool:
+        """Compatibility wrapper; startup verification is now exact.
 
-        This detects when TaskServer becomes unresponsive (tasks are received but
-        never executed). If verification fails, caller should restart TaskServers.
-
-        Also performs per-queue verification to detect queue-specific failures
-        (e.g., Q1 failing while Q0/Q7 succeed).
-
-        Args:
-            timeout: Max time to wait for processes to appear
-            min_pct: Minimum percentage of expected processes required (0.0-1.0)
-
-        Returns:
-            True if sufficient processes started, False otherwise
+        ``min_pct`` is retained for callers but values below 1.0 are ignored.
+        A start is successful only when every expected server/client port is
+        present exactly once.
         """
-        expected = len(self.traffic_pairs) * len(ALL_QUEUES) * 2  # servers + clients
-        threshold = int(expected * min_pct)
-
-        start_time = time.monotonic()
-        last_count = 0
-
-        while time.monotonic() - start_time < timeout:
-            try:
-                result = subprocess.run(
-                    ['pgrep', '-c', 'iperf3'],
-                    capture_output=True, text=True, timeout=10
-                )
-                running = int(result.stdout.strip()) if result.returncode == 0 else 0
-
-                if running >= threshold:
-                    log.info(f"[Traffic] Verified {running}/{expected} processes started")
-                    # Also log per-queue status for diagnostics
-                    self._log_per_queue_status()
-                    # Check per-queue verification (warn but don't fail aggregate check)
-                    per_queue_ok, queue_counts = self._verify_per_queue(min_pct)
-                    if not per_queue_ok:
-                        log.warning(f"[Traffic] Per-queue verification failed despite aggregate OK - some queues may have issues")
-                    return True
-
-                if running != last_count:
-                    log.debug(f"[Traffic] Waiting for processes: {running}/{expected} (need {threshold})")
-                    last_count = running
-
-                time.sleep(0.5)
-            except Exception as e:
-                log.warning(f"[Traffic] Verification error: {e}")
-                time.sleep(1.0)  # Longer sleep on error to let system recover
-
-        # Log per-queue status on failure for debugging
-        self._log_per_queue_status()
-        log.error(f"[Traffic] Only {last_count}/{expected} processes after {timeout}s - startup failed!")
-        return False
+        if min_pct < 1.0:
+            log.debug(
+                "[Traffic] Ignoring permissive min_pct=%s; exact endpoint "
+                "verification is mandatory",
+                min_pct,
+            )
+        return self.verify_exact_processes(
+            timeout=timeout,
+            raise_on_error=False,
+        )["verified"]
 
     def _get_host_pid(self, hostname: str) -> Optional[int]:
         """Get the PID of a Mininet host's bash process.
@@ -1744,8 +1985,9 @@ def get_args():
     parser.add_argument(
         '--profile',
         type=str,
+        choices=tuple(TrafficManager.TRAFFIC_PROFILES),
         default=None,
-        help='Specific traffic profile to use (e.g., high_1, medium_2)'
+        help='Specific traffic profile from TrafficManager.TRAFFIC_PROFILES'
     )
 
     return parser.parse_args()

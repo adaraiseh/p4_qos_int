@@ -200,6 +200,8 @@ struct int_metadata_t {
 
 struct routing_metadata_t {
     ip_address_t nhop_ipv4;
+    bit<16> ecmp_group;
+    bit<16> ecmp_select;
 }
 
 struct local_metadata_t {

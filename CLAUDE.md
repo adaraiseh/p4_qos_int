@@ -243,9 +243,11 @@ ls log/*.log
 
 **Automatic Recovery:**
 The TrafficManager now includes a health monitoring thread that:
-- Checks iperf process count every 10 seconds
-- Auto-restarts traffic if <70% of expected processes are running
-- Logs: `[Health Monitor] Only X/Y iperf processes running... Restarting traffic`
+- Checks the exact iperf endpoint inventory every 10 seconds
+- Requires one server and one client for every configured `(flow, queue)` port
+- Atomically restarts the complete traffic set when any endpoint is missing,
+  duplicated, unexpected, or unparseable
+- Marks recovery failure explicitly instead of accepting partial traffic
 
 **Resolution (if auto-recovery doesn't work):**
 ```bash
@@ -484,16 +486,27 @@ If data is invalid after all retries:
 
 ## Traffic Profiles
 
-| Profile | Voice (Q0) | Video (Q1) | BE (Q7) | Category |
-|---------|------------|------------|---------|----------|
-| light_1 | 0.05-0.10 | 0.05-0.15 | 0.10-0.20 | Light |
-| light_2 | 0.08-0.12 | 0.10-0.18 | 0.15-0.25 | Light |
-| medium_1 | 0.12-0.20 | 0.15-0.25 | 0.25-0.40 | Medium |
-| medium_2 | 0.15-0.25 | 0.20-0.30 | 0.30-0.50 | Medium |
-| high_1 | 0.25-0.35 | 0.30-0.45 | 0.50-0.80 | High |
-| high_2 | 0.30-0.45 | 0.35-0.55 | 0.70-1.00 | High |
+All supported names are defined by `TrafficManager.TRAFFIC_PROFILES`; there is
+no separate test-profile registry. Loads are exact Mbps per demand. Light
+profiles are steady; medium/high profiles use recovery-low plus overload-pulse
+cycles so short ECMP runs start near the intended SLA band instead of slowly
+building a queue from an unrealistically clean start.
 
-Bursty profiles add periodic traffic spikes on top of medium_1 baseline.
+| Profile | Low total | High total | High steps / 10 | Category |
+|---------|-----------|------------|-----------------|----------|
+| light_1 | 1.50 | 1.50 | 0 | Light |
+| light_2 | 1.62 | 1.62 | 0 | Light |
+| medium_1 | 1.50 | 1.80 | 3 | Medium |
+| medium_2 | 1.50 | 1.92 | 4 | Medium |
+| high_1 | 1.50 | 1.85 | 6 | High |
+| high_2 | 1.85 | 1.85 | 0 | High |
+
+Queue weights for these totals are Q0=22.327%, Q1=34.591%, and Q7=43.082%.
+Stage changes use verified sender HTB shaping and do not restart iperf.
+
+Bursty profiles use a 0.5 Mbps low stage and a queue-biased 3.2 Mbps high
+stage. `_1` profiles have three high steps per ten-step cycle; `_2` profiles
+have six.
 
 ---
 
@@ -604,8 +617,8 @@ Traffic configurations are automatically logged to `log/traffic_log.csv` with th
 | `start` | Traffic started with a new profile |
 | `stop` | Traffic stopped |
 | `restart` | Traffic restarted by health monitor |
-| `burst_start` | Burst traffic started (for bursty profiles) |
-| `burst_end` | Burst traffic ended, returning to baseline |
+| `start_failed` | Exact endpoint startup verification failed |
+| `restart_failed` | Health-monitor recovery failed |
 
 **CSV Columns:**
 - `timestamp`: ISO format timestamp
@@ -614,7 +627,7 @@ Traffic configurations are automatically logged to `log/traffic_log.csv` with th
 - `profile_category`: Category (light, medium, high, bursty)
 - `load_q0`, `load_q1`, `load_q7`: Per-queue load in Mbps
 - `is_bursty`: Whether this is a bursty profile episode
-- `baseline_profile`: Baseline profile for bursty episodes
+- `baseline_profile`: Reserved legacy column; deterministic profiles do not use it
 - `num_traffic_pairs`: Number of active traffic pairs
 - `extra_info`: JSON with additional event-specific info
 

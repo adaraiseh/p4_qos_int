@@ -147,8 +147,13 @@ class StressTest:
         self.summary = TestSummary()
         self.cycle_stats: List[CycleStats] = []
 
-        # Only use medium and high profiles for stress test (generate meaningful CPU load)
-        self.all_profiles = ['medium_1', 'medium_2', 'high_1', 'high_2']
+        # Exercise every steady profile from the production registry, including
+        # light_1. Deterministic burst schedules are validated separately.
+        self.all_profiles = [
+            profile
+            for profile in self.tm.TRAFFIC_PROFILES
+            if self.tm.profile_category(profile) != "bursty"
+        ]
 
         # Output directory
         self.output_dir = Path("log/stress_test")

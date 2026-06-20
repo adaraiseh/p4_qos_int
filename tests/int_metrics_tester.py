@@ -35,6 +35,7 @@ from network import _traffic_dst_port, QID_TOS, ALL_QUEUES
 from controller import Controller
 from topology.factory import create_topology
 from config.loader import load_config
+from traffic_generator import TrafficManager
 
 log = logging.getLogger(__name__)
 
@@ -123,16 +124,6 @@ class MetricsReport:
 # =============================================================================
 class INTMetricsTester:
     """Tests INT metrics collection for all traffic flows in a topology."""
-
-    # Traffic profile (from traffic_generator.py)
-    TRAFFIC_PROFILES = {
-        'light_1': {0: (0.18, 0.28), 1: (0.20, 0.35), 7: (0.32, 0.54)},
-        'light_2': {0: (0.24, 0.35), 1: (0.30, 0.46), 7: (0.46, 0.68)},
-        'medium_1': {0: (0.12, 0.20), 1: (0.15, 0.25), 7: (0.25, 0.40)},
-        'medium_2': {0: (0.15, 0.25), 1: (0.20, 0.30), 7: (0.30, 0.50)},
-        'high_1': {0: (0.25, 0.35), 1: (0.30, 0.45), 7: (0.50, 0.80)},
-        'high_2': {0: (0.30, 0.45), 1: (0.35, 0.55), 7: (0.70, 1.00)},
-    }
 
     def __init__(self, config_path: str,
                  influx_url: str = "http://192.168.56.1:8086",
@@ -332,11 +323,13 @@ class INTMetricsTester:
         time.sleep(0.3)
 
         # Get profile
-        if profile not in self.TRAFFIC_PROFILES:
-            log.warning(f"Unknown profile '{profile}', using light_1")
-            profile = 'light_1'
+        if profile not in TrafficManager.TRAFFIC_PROFILES:
+            raise ValueError(
+                f"Unknown traffic profile {profile!r}; valid profiles: "
+                f"{', '.join(TrafficManager.TRAFFIC_PROFILES)}"
+            )
 
-        profile_ranges = self.TRAFFIC_PROFILES[profile]
+        profile_ranges = TrafficManager.TRAFFIC_PROFILES[profile]
         self.current_load = {
             qid: random.uniform(*rng) for qid, rng in profile_ranges.items()
         }
@@ -826,6 +819,7 @@ def get_args():
     parser.add_argument(
         '--profile', '-p',
         type=str,
+        choices=tuple(TrafficManager.TRAFFIC_PROFILES),
         default='light_1',
         help='Traffic profile to use (default: light_1)'
     )

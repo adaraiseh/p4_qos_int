@@ -1,0 +1,1064 @@
+#!/usr/bin/env python3
+"""
+Queue-independent ECMP baseline for comparison with the RL routing agent.
+
+The existing RL controller routes on (destination, DSCP), which intentionally
+allows each QoS queue to take a different path. This baseline instead installs
+standard shortest-path ECMP groups:
+
+* every next hop must reduce the remaining shortest-path distance by one;
+* a CRC16 hash chooses among equal-cost next hops;
+* the hash uses source IP, destination IP, and a per-switch group salt;
+* DSCP and L4 ports are excluded, so Q0/Q1/Q7 for the same demand receive the
+  same ECMP decision.
+
+Run the topology first with the updated P4 program, start the INT collector,
+then run this file. The benchmark uses the same telemetry queries and reward
+function as rl_production.py and writes a richer CSV for direct analysis.
+
+Examples:
+    python3 ecmp_baseline.py --plan-only --config config/topologies/fat_tree_k4.yaml
+    sudo -E python3 ecmp_baseline.py --config config/topologies/fat_tree_k4.yaml \
+        --traffic-profile medium_2 --traffic-seed 42 --steps 300
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import networkx as nx
+import numpy as np
+
+from logging_config import setup_unified_logging
+from topology.factory import create_topology
+
+
+log = logging.getLogger("ecmp_baseline")
+QIDS = (0, 1, 7)
+
+
+def _natural_name_key(name: str) -> Tuple[str, int, str]:
+    prefix = name.rstrip("0123456789")
+    suffix = name[len(prefix):]
+    return prefix, int(suffix) if suffix else -1, name
+
+
+@dataclass(frozen=True)
+class ECMPGroup:
+    switch: str
+    destination: str
+    destination_ip: str
+    group_id: int
+    next_hops: Tuple[str, ...]
+
+
+def ecmp_plan_sha256(groups: Sequence[ECMPGroup]) -> str:
+    payload = [
+        {
+            "switch": group.switch,
+            "destination": group.destination,
+            "destination_ip": group.destination_ip,
+            "group_id": group.group_id,
+            "next_hops": list(group.next_hops),
+        }
+        for group in groups
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+class ECMPPlanner:
+    """Build loop-free equal-cost next-hop groups from topology metadata."""
+
+    def __init__(self, topology_builder):
+        self.builder = topology_builder
+        self.graph = nx.Graph()
+        max_bw = max(
+            (float(link.bw) for link in topology_builder.links),
+            default=1.0,
+        )
+        for link in topology_builder.links:
+            bandwidth = max(float(link.bw), 1e-9)
+            cost = max(1, int(round(100.0 * max_bw / bandwidth)))
+            self.graph.add_edge(link.node1, link.node2, weight=cost)
+
+        self.switches = sorted(
+            topology_builder.switches,
+            key=lambda name: (
+                topology_builder.switches[name].switch_id,
+                _natural_name_key(name),
+            ),
+        )
+        self.hosts = sorted(topology_builder.hosts, key=_natural_name_key)
+
+    def build_groups(self) -> List[ECMPGroup]:
+        groups: List[ECMPGroup] = []
+        host_count = len(self.hosts)
+
+        for switch_index, switch in enumerate(self.switches):
+            for host_index, destination in enumerate(self.hosts):
+                distance = nx.shortest_path_length(
+                    self.graph, switch, destination, weight="weight"
+                )
+                candidates = [
+                    neighbor
+                    for neighbor in self.graph.neighbors(switch)
+                    if (
+                        nx.shortest_path_length(
+                            self.graph,
+                            neighbor,
+                            destination,
+                            weight="weight",
+                        )
+                        + self.graph[switch][neighbor]["weight"]
+                        == distance
+                    )
+                ]
+                if not candidates:
+                    raise RuntimeError(
+                        f"No shortest-path next hop from {switch} to {destination}"
+                    )
+
+                candidates.sort(key=_natural_name_key)
+                group_id = switch_index * host_count + host_index + 1
+                groups.append(
+                    ECMPGroup(
+                        switch=switch,
+                        destination=destination,
+                        destination_ip=self.builder.hosts[destination].ip,
+                        group_id=group_id,
+                        next_hops=tuple(candidates),
+                    )
+                )
+
+        return groups
+
+    def validate(self, groups: Sequence[ECMPGroup]) -> Dict[str, int]:
+        expected = len(self.switches) * len(self.hosts)
+        if len(groups) != expected:
+            raise AssertionError(f"Expected {expected} ECMP groups, got {len(groups)}")
+
+        seen = set()
+        multipath = 0
+        members = 0
+
+        for group in groups:
+            key = (group.switch, group.destination)
+            if key in seen:
+                raise AssertionError(f"Duplicate ECMP group for {key}")
+            seen.add(key)
+
+            current_distance = nx.shortest_path_length(
+                self.graph, group.switch, group.destination, weight="weight"
+            )
+            for next_hop in group.next_hops:
+                next_distance = nx.shortest_path_length(
+                    self.graph, next_hop, group.destination, weight="weight"
+                )
+                edge_cost = self.graph[group.switch][next_hop]["weight"]
+                if next_distance + edge_cost != current_distance:
+                    raise AssertionError(
+                        f"{group.switch}->{next_hop} is not equal-cost toward "
+                        f"{group.destination}"
+                    )
+
+            multipath += int(len(group.next_hops) > 1)
+            members += len(group.next_hops)
+
+        # Queue independence is structural: neither the group lookup nor hash
+        # has a queue/DSCP input. All three queues share these exact groups.
+        return {
+            "groups": len(groups),
+            "multipath_groups": multipath,
+            "members": members,
+            "max_width": max(len(group.next_hops) for group in groups),
+        }
+
+    @staticmethod
+    def bmv2_crc16(data: bytes) -> int:
+        """Return the CRC-16 used by BMv2's HashAlgorithm.crc16.
+
+        BMv2 implements the reflected CRC-16/ARC variant with polynomial
+        0x8005 (0xA001 in reflected form), initial remainder 0, and no final
+        XOR. This matches behavioral-model's calculations.cpp.
+        """
+        remainder = 0
+        for byte in data:
+            remainder ^= byte
+            for _ in range(8):
+                if remainder & 1:
+                    remainder = (remainder >> 1) ^ 0xA001
+                else:
+                    remainder >>= 1
+        return remainder & 0xFFFF
+
+    @classmethod
+    def select_member(
+        cls,
+        src_ip: str,
+        dst_ip: str,
+        group_id: int,
+        path_count: int,
+    ) -> int:
+        """Mirror the P4 hash input and modulo operation exactly."""
+        if path_count <= 0:
+            raise ValueError("ECMP path_count must be positive")
+
+        hash_input = (
+            ipaddress.ip_address(src_ip).packed
+            + ipaddress.ip_address(dst_ip).packed
+            + int(group_id).to_bytes(2, byteorder="big")
+        )
+        return cls.bmv2_crc16(hash_input) % path_count
+
+    def trace_selected_path(
+        self,
+        groups_by_key: Dict[Tuple[str, str], ECMPGroup],
+        src_host: str,
+        dst_host: str,
+    ) -> List[str]:
+        """Trace the concrete path selected by the installed BMv2 ECMP hash."""
+        if src_host not in self.builder.hosts:
+            raise KeyError(f"Unknown source host {src_host}")
+        if dst_host not in self.builder.hosts:
+            raise KeyError(f"Unknown destination host {dst_host}")
+
+        src_ip = self.builder.hosts[src_host].ip
+        dst_ip = self.builder.hosts[dst_host].ip
+        current = src_host
+        path = [current]
+
+        # A valid ECMP hop strictly reduces remaining path cost, so a path can
+        # never contain more nodes than the physical graph.
+        max_hops = len(self.graph)
+        for _ in range(max_hops):
+            if current == dst_host:
+                return path
+
+            if current in self.builder.hosts:
+                next_hop = self.builder.hosts[current].connected_switch
+            else:
+                group = groups_by_key[(current, dst_host)]
+                member_index = self.select_member(
+                    src_ip,
+                    dst_ip,
+                    group.group_id,
+                    len(group.next_hops),
+                )
+                next_hop = group.next_hops[member_index]
+
+            if next_hop in path:
+                raise AssertionError(
+                    f"ECMP visualization trace contains a loop: "
+                    f"{' -> '.join(path + [next_hop])}"
+                )
+            path.append(next_hop)
+            current = next_hop
+
+        raise AssertionError(
+            f"ECMP visualization trace did not reach {dst_host}: "
+            f"{' -> '.join(path)}"
+        )
+
+    def build_visualization_data(
+        self,
+        groups: Sequence[ECMPGroup],
+        traffic_pairs: Sequence[Tuple[str, str, int]],
+    ) -> Dict[int, List[Dict]]:
+        """Build the legacy visualizer schema using concrete ECMP paths.
+
+        Each configured demand is hashed once. The same selected path is then
+        exported for every QoS queue, reflecting that DSCP and queue ID are not
+        part of the ECMP decision.
+        """
+        groups_by_key = {
+            (group.switch, group.destination): group for group in groups
+        }
+        export_data = {qid: [] for qid in QIDS}
+
+        for src_host, dst_host, flow_id in traffic_pairs:
+            path = self.trace_selected_path(
+                groups_by_key,
+                src_host,
+                dst_host,
+            )
+            for qid in QIDS:
+                export_data[qid].append(
+                    {
+                        "src": src_host,
+                        "dst": dst_host,
+                        "flow_id": flow_id,
+                        "routing_mode": "ecmp",
+                        "path": path,
+                    }
+                )
+
+        return export_data
+
+
+class VisualizationPathFile:
+    """Atomically replace and later restore the visualizer's path file."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self.previous_bytes = None
+        self.previous_mode = None
+        self.had_previous_file = False
+        self.snapshot_taken = False
+
+    def _write_bytes(self, content: bytes, mode: int = 0o666) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        with temporary.open("wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, self.path)
+
+    def publish(self, data: Dict[int, List[Dict]]) -> None:
+        if not self.snapshot_taken:
+            try:
+                stat = self.path.stat()
+                self.previous_bytes = self.path.read_bytes()
+                self.previous_mode = stat.st_mode & 0o777
+                self.had_previous_file = True
+            except FileNotFoundError:
+                self.had_previous_file = False
+            self.snapshot_taken = True
+
+        payload = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+        self._write_bytes(payload)
+
+    def restore(self) -> None:
+        if self.had_previous_file and self.previous_bytes is not None:
+            self._write_bytes(
+                self.previous_bytes,
+                mode=self.previous_mode or 0o666,
+            )
+        else:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+class ECMPProgrammer:
+    """Install ECMP groups into the running BMv2 switches."""
+
+    GROUP_TABLE = "l3_forward.ecmp_group"
+    NHOP_TABLE = "l3_forward.ecmp_nhop"
+
+    def __init__(self, controller, groups: Sequence[ECMPGroup]):
+        self.controller = controller
+        self.groups = groups
+        self.installed = False
+
+    def _expected_counts(self) -> Dict[str, Dict[str, int]]:
+        expected = {
+            switch: {"groups": 0, "members": 0}
+            for switch in self.controller.controllers
+        }
+        for group in self.groups:
+            expected[group.switch]["groups"] += 1
+            expected[group.switch]["members"] += len(group.next_hops)
+        return expected
+
+    def _table_count(self, switch: str, thrift, table: str) -> int:
+        observed = self.controller._call(thrift.table_num_entries, table)
+        if observed is None:
+            raise RuntimeError(
+                f"Could not read back {table} entry count on {switch}"
+            )
+        return int(observed)
+
+    def verify(self, raise_on_error: bool = True) -> Dict:
+        expected = self._expected_counts()
+        errors = []
+        per_switch = {}
+
+        for switch, thrift in self.controller.controllers.items():
+            group_count = self._table_count(switch, thrift, self.GROUP_TABLE)
+            member_count = self._table_count(switch, thrift, self.NHOP_TABLE)
+            switch_report = {
+                self.GROUP_TABLE: {
+                    "expected": expected[switch]["groups"],
+                    "observed": group_count,
+                },
+                self.NHOP_TABLE: {
+                    "expected": expected[switch]["members"],
+                    "observed": member_count,
+                },
+            }
+            per_switch[switch] = switch_report
+
+            if group_count != expected[switch]["groups"]:
+                errors.append(
+                    f"{switch}:{self.GROUP_TABLE} expected "
+                    f"{expected[switch]['groups']}, observed {group_count}"
+                )
+            if member_count != expected[switch]["members"]:
+                errors.append(
+                    f"{switch}:{self.NHOP_TABLE} expected "
+                    f"{expected[switch]['members']}, observed {member_count}"
+                )
+
+        report = {
+            "verified": not errors,
+            "expected_groups": sum(item["groups"] for item in expected.values()),
+            "expected_members": sum(item["members"] for item in expected.values()),
+            "observed_groups": sum(
+                item[self.GROUP_TABLE]["observed"] for item in per_switch.values()
+            ),
+            "observed_members": sum(
+                item[self.NHOP_TABLE]["observed"] for item in per_switch.values()
+            ),
+            "errors": errors,
+            "per_switch": per_switch,
+        }
+        if errors and raise_on_error:
+            raise RuntimeError(
+                "ECMP table verification failed: " + "; ".join(errors[:5])
+            )
+        return report
+
+    def clear(self, required: bool = False) -> Dict:
+        failures = []
+        per_switch = {}
+        for switch, thrift in self.controller.controllers.items():
+            switch_report = {}
+            for table in (self.GROUP_TABLE, self.NHOP_TABLE):
+                try:
+                    self.controller._call(thrift.table_clear, table)
+                    observed = self._table_count(switch, thrift, table)
+                    switch_report[table] = observed
+                    if observed != 0:
+                        failures.append(
+                            (
+                                switch,
+                                table,
+                                RuntimeError(
+                                    f"expected 0 entries after clear, observed {observed}"
+                                ),
+                            )
+                        )
+                except Exception as exc:
+                    failures.append((switch, table, exc))
+                    switch_report[table] = None
+            per_switch[switch] = switch_report
+
+        if required and failures:
+            switch, table, exc = failures[0]
+            raise RuntimeError(
+                f"Cannot access {table} on {switch}. Restart the network so it "
+                f"compiles the updated p4src/int_md.p4. Original error: {exc}"
+            )
+        return {
+            "verified": not failures,
+            "errors": [
+                f"{switch}:{table}: {exc}"
+                for switch, table, exc in failures
+            ],
+            "per_switch": per_switch,
+        }
+
+    def install(self) -> Dict:
+        self.clear(required=True)
+        member_count = 0
+
+        try:
+            for group in self.groups:
+                thrift = self.controller.controllers[group.switch]
+
+                # Install members before publishing the group so packets can
+                # never hash into a partially populated group.
+                for index, next_hop in enumerate(group.next_hops):
+                    self.controller.ensure_switching_and_mac(group.switch, next_hop)
+                    egress_port = self.controller.topo.node_to_node_port_num(
+                        group.switch, next_hop
+                    )
+
+                    if next_hop in self.controller.topo.get_hosts():
+                        next_hop_ip = group.destination_ip
+                    else:
+                        next_hop_ip = (
+                            self.controller.topo.node_to_node_interface_ip(
+                                next_hop, group.switch
+                            ).split("/")[0]
+                        )
+
+                    handle = self.controller._call(
+                        thrift.table_add,
+                        self.NHOP_TABLE,
+                        "ipv4_forward",
+                        [str(group.group_id), str(index)],
+                        [next_hop_ip, str(egress_port)],
+                    )
+                    if handle is None:
+                        raise RuntimeError(
+                            f"ECMP next-hop write was rejected on {group.switch}: "
+                            f"group={group.group_id}, member={index}, "
+                            f"next_hop={next_hop}"
+                        )
+                    member_count += 1
+
+                handle = self.controller._call(
+                    thrift.table_add,
+                    self.GROUP_TABLE,
+                    "set_ecmp_group",
+                    [f"{group.destination_ip}/32"],
+                    [str(group.group_id), str(len(group.next_hops))],
+                )
+                if handle is None:
+                    raise RuntimeError(
+                        f"ECMP group write was rejected on {group.switch}: "
+                        f"destination={group.destination_ip}, "
+                        f"group={group.group_id}"
+                    )
+        except Exception:
+            try:
+                self.clear(required=False)
+            except Exception:
+                pass
+            raise
+
+        verification = self.verify(raise_on_error=True)
+        self.installed = True
+        return {
+            "groups": len(self.groups),
+            "members": member_count,
+            "verified": verification["verified"],
+            "verification": verification,
+        }
+
+
+class BenchmarkStats:
+    def __init__(self):
+        self.rewards: List[float] = []
+        self.valid_steps = 0
+        self.sla_met = 0
+        self.sla_checks = 0
+        self.queue_metrics = {
+            qid: {"latency": [], "drop": [], "util": []} for qid in QIDS
+        }
+
+    def add(self, reward: float, info: dict, snapshot: dict) -> None:
+        self.rewards.append(float(reward))
+        self.valid_steps += int(info.get("data_valid", False))
+        self.sla_met += len(info.get("sla_met", []))
+        self.sla_checks += len(QIDS)
+
+        for qid in QIDS:
+            if snapshot[qid].get("data_valid", False):
+                self.queue_metrics[qid]["latency"].append(snapshot[qid]["lat_p95"])
+                self.queue_metrics[qid]["drop"].append(snapshot[qid]["drop_p95"])
+                self.queue_metrics[qid]["util"].append(snapshot[qid]["util_p95"])
+
+    @staticmethod
+    def _mean(values: Sequence[float]) -> float:
+        return float(np.mean(values)) if values else 0.0
+
+    @staticmethod
+    def _p95(values: Sequence[float]) -> float:
+        return float(np.percentile(values, 95)) if values else 0.0
+
+    def to_summary(self, steps: int) -> Dict:
+        return {
+            "total_steps": steps,
+            "mean_reward": self._mean(self.rewards),
+            "overall_sla_compliance": (
+                100.0 * self.sla_met / max(1, self.sla_checks)
+            ),
+            "valid_steps": self.valid_steps,
+            "queue_metrics": {
+                qid: {
+                    "mean_latency": self._mean(self.queue_metrics[qid]["latency"]),
+                    "p95_latency": self._p95(self.queue_metrics[qid]["latency"]),
+                    "mean_drop": self._mean(self.queue_metrics[qid]["drop"]),
+                    "mean_util": self._mean(self.queue_metrics[qid]["util"]),
+                }
+                for qid in QIDS
+            },
+        }
+
+    def log_summary(self, summary: Dict, output_path: Path) -> None:
+        log.info("=" * 68)
+        log.info("ECMP benchmark summary")
+        log.info(f"  Steps: {summary['total_steps']}")
+        log.info(f"  Mean reward: {summary['mean_reward']:+.4f}")
+        log.info(
+            f"  SLA compliance: "
+            f"{summary['overall_sla_compliance']:.2f}%"
+        )
+        log.info(
+            f"  Valid telemetry steps: "
+            f"{summary['valid_steps']}/{summary['total_steps']}"
+        )
+        for qid in QIDS:
+            metrics = summary["queue_metrics"][qid]
+            log.info(
+                f"  Q{qid}: mean(step-p95 latency)="
+                f"{metrics['mean_latency']:.3f} ms, "
+                f"p95(step-p95 latency)={metrics['p95_latency']:.3f} ms, "
+                f"mean drops/100ms={metrics['mean_drop']:.6f}, "
+                f"mean util={metrics['mean_util']:.3f}%"
+            )
+        log.info(f"  CSV: {output_path}")
+        log.info("=" * 68)
+
+
+class ECMPBenchmark:
+    def __init__(self, args):
+        self.args = args
+        self.running = True
+        self.env = None
+        self.traffic_manager = None
+        self.programmer = None
+        self.visualization_file = None
+        self.routing_state = None
+        signal.signal(signal.SIGINT, self._stop)
+        signal.signal(signal.SIGTERM, self._stop)
+
+    def _stop(self, signum, _frame):
+        log.info(f"Received signal {signum}; stopping after the current sample")
+        self.running = False
+
+    @staticmethod
+    def _pressure(snapshot: dict, sla_thresholds: Dict[int, float]) -> float:
+        pressure = 0.0
+        for qid in QIDS:
+            q = snapshot[qid]
+            lat_ratio = q["lat_p95"] / sla_thresholds[qid]
+            drop_norm = min(q["drop_p95"], 0.20) / 0.20
+            util_norm = min(q["util_p95"], 100.0) / 100.0
+            pressure = max(
+                pressure,
+                0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm,
+            )
+        return pressure
+
+    def run(self) -> int:
+        if os.geteuid() != 0:
+            log.error("Runtime benchmarking must be run with sudo -E")
+            return 2
+
+        # Runtime-only imports keep --plan-only usable without BMv2/p4utils.
+        from rl_agent_4 import QoSRoutingEnv, SLA_THRESHOLDS
+        from traffic_generator import TrafficManager
+
+        builder = create_topology(self.args.config)
+        planner = ECMPPlanner(builder)
+        groups = planner.build_groups()
+        plan_stats = planner.validate(groups)
+        log.info(
+            "Validated queue-independent ECMP plan: "
+            f"{plan_stats['groups']} groups, "
+            f"{plan_stats['multipath_groups']} multipath groups, "
+            f"max width {plan_stats['max_width']}"
+        )
+
+        topology_name = builder.config.topology.name.replace("-", "_")
+        rules_dir = self.args.rules_dir or f"rules/{topology_name}"
+
+        self.env = QoSRoutingEnv(
+            self.args.influx_bucket,
+            self.args.influx_token,
+            self.args.influx_org,
+            self.args.influx_url,
+            verbose=False,
+            reset_network=False,
+            production_mode=True,
+            topology_builder=builder,
+            rules_dir=rules_dir,
+            config_path=self.args.config,
+        )
+
+        # ECMP must not inherit any forwarding state from the preceding
+        # benchmark method. Install and verify a clean deterministic fallback
+        # before publishing the ECMP overlay.
+        log.info("Resetting all P4 tables before ECMP installation")
+        self.env.controller.clear_all_tables(verify=True)
+        self.env.controller.compute_forwarding_entries()
+        self.env.controller.program_switches()
+        baseline_verification = self.env.controller.verify_forwarding_tables(
+            raise_on_error=True
+        )
+        log.info("Verified clean fallback forwarding tables on all switches")
+
+        self.programmer = ECMPProgrammer(self.env.controller, groups)
+        installed = self.programmer.install()
+        plan_digest = ecmp_plan_sha256(groups)
+        self.routing_state = {
+            "verified": bool(
+                baseline_verification["verified"] and installed["verified"]
+            ),
+            "plan_sha256": plan_digest,
+            "baseline_tables": baseline_verification,
+            "ecmp_tables": installed["verification"],
+        }
+        log.info(
+            f"Verified {installed['groups']} ECMP groups and "
+            f"{installed['members']} next-hop members; "
+            f"plan_sha256={plan_digest}"
+        )
+
+        self.traffic_manager = TrafficManager(
+            config_path=self.args.config,
+            seed=self.args.traffic_seed,
+        )
+        self.visualization_file = VisualizationPathFile(self.args.paths_file)
+        visualization_data = planner.build_visualization_data(
+            groups,
+            self.traffic_manager.traffic_pairs,
+        )
+        self.visualization_file.publish(visualization_data)
+        log.info(
+            f"Published {len(self.traffic_manager.traffic_pairs)} concrete ECMP "
+            f"routes to {self.args.paths_file}; Q0/Q1/Q7 use identical paths"
+        )
+
+        profile_info = self.traffic_manager.start_traffic(
+            profile_name=self.args.traffic_profile
+        )
+        traffic_state = self.traffic_manager.verify_exact_processes(
+            raise_on_error=True
+        )
+        traffic_state["sender_rate_shaping"] = profile_info.get(
+            "traffic_shaping",
+            {},
+        )
+        self.routing_state["traffic_processes"] = traffic_state
+        loads = profile_info.get("measurement_loads", profile_info["loads"])
+        log.info(
+            f"Planned measurement profile {profile_info['profile_name']} "
+            f"with seed "
+            f"{self.args.traffic_seed}: Q0={loads[0]:.3f}, "
+            f"Q1={loads[1]:.3f}, Q7={loads[7]:.3f} Mbps"
+        )
+        # Preserve ECMP: force_reset=False avoids the environment's OSPF reset.
+        # Traffic warmup is handled by TrafficManager so staged profiles advance
+        # during the excluded warmup window instead of holding their first stage.
+        state = self.env.reset(
+            force_reset=False,
+            cooldown_seconds=0.0,
+            collect_initial_snapshot=False,
+        )
+        del state
+        warmup_state = self.traffic_manager.warm_profile_for(
+            self.args.warmup_seconds
+        )
+        self.routing_state["traffic_profile_warmup"] = warmup_state
+        expected_flow_ids = [
+            flow_id for _, _, flow_id in self.traffic_manager.traffic_pairs
+        ]
+        telemetry_state = self.env.verify_telemetry_flow_coverage(
+            expected_flow_ids,
+            window_seconds=max(5.0, self.args.warmup_seconds),
+            raise_on_error=True,
+        )
+        self.routing_state["telemetry_flow_coverage"] = telemetry_state
+        log.info("Verified telemetry coverage for every ECMP demand and queue")
+        measurement_shaping = self.traffic_manager.begin_measurement()
+        if measurement_shaping:
+            self.routing_state["measurement_shaping"] = measurement_shaping
+            traffic_state["sender_rate_shaping"] = measurement_shaping
+        output_path = Path(self.args.output) if self.args.output else Path(
+            "data"
+        ) / f"ecmp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        stats = BenchmarkStats()
+        completed_steps = 0
+
+        with output_path.open("w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    "step",
+                    "routing_mode",
+                    "traffic_profile",
+                    "traffic_seed",
+                    "load_q0_mbps",
+                    "load_q1_mbps",
+                    "load_q7_mbps",
+                    "reward",
+                    "raw_reward",
+                    "sla_met_count",
+                    "data_valid",
+                    "routing_state_verified",
+                    "traffic_state_verified",
+                    "telemetry_state_verified",
+                    "pressure",
+                    "q0_latency_ms",
+                    "q0_drop",
+                    "q0_util_pct",
+                    "q1_latency_ms",
+                    "q1_drop",
+                    "q1_util_pct",
+                    "q7_latency_ms",
+                    "q7_drop",
+                    "q7_util_pct",
+                    "timestamp",
+                ]
+            )
+
+            while self.running and (
+                self.args.steps == 0 or completed_steps < self.args.steps
+            ):
+                next_step = completed_steps + 1
+                self.traffic_manager.apply_step_profile(next_step)
+
+                _, reward, _, _, info = self.env.step(0)
+                completed_steps += 1
+                snapshot = self.env.last_snapshot
+                current_loads = self.traffic_manager.current_load
+                pressure = self._pressure(snapshot, SLA_THRESHOLDS)
+                info["pressure"] = pressure
+                stats.add(reward, info, snapshot)
+
+                row = [
+                    completed_steps,
+                    "ecmp",
+                    self.traffic_manager.current_profile_name,
+                    self.args.traffic_seed,
+                    current_loads.get(0, 0.0),
+                    current_loads.get(1, 0.0),
+                    current_loads.get(7, 0.0),
+                    reward,
+                    info.get("raw_reward", reward),
+                    len(info.get("sla_met", [])),
+                    int(info.get("data_valid", False)),
+                    int(self.routing_state["verified"]),
+                    int(traffic_state["verified"]),
+                    int(telemetry_state["verified"]),
+                    pressure,
+                ]
+                for qid in QIDS:
+                    row.extend(
+                        [
+                            snapshot[qid]["lat_p95"],
+                            snapshot[qid]["drop_p95"],
+                            snapshot[qid]["util_p95"],
+                        ]
+                    )
+                row.append(datetime.now().isoformat())
+                writer.writerow(row)
+                csv_file.flush()
+
+                if self.args.log_every > 0 and completed_steps % self.args.log_every == 0:
+                    log.info(
+                        f"[Step {completed_steps}] reward={reward:+.2f} "
+                        f"sla={len(info.get('sla_met', []))}/3 "
+                        f"pressure={pressure:.3f}"
+                    )
+
+        final_traffic_state = self.traffic_manager.verify_exact_processes(
+            timeout=2.0,
+            require_no_restarts=True,
+            raise_on_error=False,
+        )
+        traffic_state["final"] = final_traffic_state
+        traffic_state["verified"] = bool(
+            traffic_state["verified"] and final_traffic_state["verified"]
+        )
+        if not traffic_state["verified"]:
+            raise RuntimeError(
+                "ECMP traffic-state verification failed: "
+                + "; ".join(final_traffic_state["errors"])
+            )
+
+        final_telemetry_state = self.env.verify_telemetry_flow_coverage(
+            expected_flow_ids,
+            window_seconds=5.0,
+            raise_on_error=False,
+        )
+        telemetry_state["final"] = final_telemetry_state
+        telemetry_state["verified"] = bool(
+            telemetry_state["verified"] and final_telemetry_state["verified"]
+        )
+        if not telemetry_state["verified"]:
+            raise RuntimeError(
+                "ECMP telemetry-state verification failed: "
+                + "; ".join(final_telemetry_state["errors"])
+            )
+
+        final_baseline_verification = (
+            self.env.controller.verify_forwarding_tables(raise_on_error=True)
+        )
+        final_ecmp_verification = self.programmer.verify(raise_on_error=True)
+        self.routing_state["final_baseline_tables"] = final_baseline_verification
+        self.routing_state["final_ecmp_tables"] = final_ecmp_verification
+        self.routing_state["verified"] = bool(
+            self.routing_state["verified"]
+            and final_baseline_verification["verified"]
+            and final_ecmp_verification["verified"]
+        )
+        if not self.routing_state["verified"]:
+            raise RuntimeError("ECMP routing-state verification failed")
+
+        summary = stats.to_summary(completed_steps)
+        stats.log_summary(summary, output_path)
+        log.info(
+            "  Routing state: VERIFIED "
+            f"(plan_sha256={self.routing_state['plan_sha256']})"
+        )
+        log.info("  Traffic process state: VERIFIED")
+        log.info("  Telemetry flow coverage: VERIFIED")
+        if self.args.summary_json:
+            summary_payload = {
+                **summary,
+                "method": "ecmp",
+                "traffic_profile": self.args.traffic_profile,
+                "traffic_seed": self.args.traffic_seed,
+                "csv_path": str(output_path.resolve()),
+                "status": "completed",
+                "routing_state_verified": self.routing_state["verified"],
+                "traffic_state_verified": traffic_state["verified"],
+                "telemetry_state_verified": telemetry_state["verified"],
+                "routing_state": self.routing_state,
+            }
+            summary_path = Path(self.args.summary_json)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(
+                json.dumps(summary_payload, indent=2, sort_keys=True)
+            )
+        return 0
+
+    def close(self) -> None:
+        # Clear ECMP first so the legacy LPM baseline immediately becomes active.
+        if self.programmer is not None:
+            try:
+                clear_report = self.programmer.clear(required=False)
+                if clear_report["verified"]:
+                    log.info("Cleared and verified empty ECMP overlay")
+                else:
+                    log.warning(
+                        "ECMP overlay clear could not be verified: "
+                        + "; ".join(clear_report["errors"][:3])
+                    )
+            except Exception as exc:
+                log.warning(f"Failed to clear ECMP overlay: {exc}")
+
+        if self.visualization_file is not None:
+            try:
+                self.visualization_file.restore()
+                log.info("Restored previous visualization paths")
+            except Exception as exc:
+                log.warning(f"Failed to restore visualization paths: {exc}")
+
+        if self.traffic_manager is not None:
+            try:
+                self.traffic_manager.stop_traffic()
+                log.info("Stopped traffic")
+            except Exception as exc:
+                log.warning(f"Failed to stop traffic: {exc}")
+
+        if self.env is not None:
+            self.env.close()
+
+
+def parse_args() -> argparse.Namespace:
+    from traffic_generator import TrafficManager
+
+    parser = argparse.ArgumentParser(
+        description="Queue-independent ECMP benchmark for RL comparison"
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        default="config/topologies/fat_tree_k4.yaml",
+        help="Topology YAML used by the running network",
+    )
+    parser.add_argument("--rules-dir", default=None)
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Validate and summarize ECMP groups without touching the network",
+    )
+    parser.add_argument("--steps", type=int, default=300, help="0 runs forever")
+    parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument("--warmup-seconds", type=float, default=5.0)
+    parser.add_argument("--output", default=None, help="Output CSV path")
+    parser.add_argument(
+        "--summary-json",
+        default=None,
+        help="Optional machine-readable run summary path",
+    )
+    parser.add_argument(
+        "--paths-file",
+        default="/tmp/p4_paths.json",
+        help="Path consumed by visualize_routes.py",
+    )
+    parser.add_argument("--log-level", default="info")
+
+    parser.add_argument(
+        "--traffic-profile",
+        choices=tuple(TrafficManager.TRAFFIC_PROFILES),
+        default="medium_2",
+    )
+    parser.add_argument(
+        "--traffic-seed",
+        type=int,
+        default=42,
+        help="Use the same value with rl_production.py",
+    )
+
+    parser.add_argument("--influx-url", default="http://192.168.56.1:8086")
+    parser.add_argument("--influx-org", default="Research")
+    parser.add_argument("--influx-bucket", default="INT")
+    parser.add_argument(
+        "--influx-token",
+        default=os.environ.get("INFLUX_TOKEN"),
+        help="InfluxDB token or INFLUX_TOKEN environment variable",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    setup_unified_logging(module_name="ecmp_baseline", log_level=args.log_level)
+
+    builder = create_topology(args.config)
+    planner = ECMPPlanner(builder)
+    groups = planner.build_groups()
+    summary = planner.validate(groups)
+
+    if args.plan_only:
+        print(
+            "ECMP plan valid: "
+            f"{summary['groups']} groups, "
+            f"{summary['multipath_groups']} multipath groups, "
+            f"{summary['members']} members, max width {summary['max_width']}. "
+            "The group lookup and hash contain no DSCP/queue input."
+        )
+        return 0
+
+    if not args.influx_token:
+        log.error("Set INFLUX_TOKEN or pass --influx-token")
+        return 2
+
+    benchmark = ECMPBenchmark(args)
+    try:
+        return benchmark.run()
+    except Exception:
+        log.exception("ECMP benchmark failed")
+        return 1
+    finally:
+        benchmark.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

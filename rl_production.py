@@ -28,6 +28,7 @@ import logging
 import argparse
 import csv
 import glob
+import json
 from datetime import datetime
 from collections import deque
 from typing import Dict, Optional
@@ -202,6 +203,11 @@ class ProductionMetricsWriter:
         self.total_sla_checks = 0
         self.total_sla_met = 0
         self.total_steps = 0
+        self.valid_steps = 0
+        self.queue_metrics = {
+            qid: {'latency': [], 'drop': [], 'util': []}
+            for qid in QIDS
+        }
         self.start_time = time.time()
 
         # PHASE 2.2: Circuit breaker for write failures
@@ -227,6 +233,24 @@ class ProductionMetricsWriter:
         self.cumulative_reward += reward
         self.total_sla_checks += len(QIDS)
         self.total_sla_met += sla_met_count
+        self.valid_steps += int(info.get('data_valid', False))
+
+        # Track the same comparison metrics reported by ecmp_baseline.py.
+        # invalid_queues reflects telemetry validity independently of whether
+        # the RL action itself was accepted.
+        per_queue = info.get('per_queue', {})
+        invalid_queues = set(info.get('invalid_queues', []))
+        for qid in QIDS:
+            if qid in per_queue and qid not in invalid_queues:
+                self.queue_metrics[qid]['latency'].append(
+                    float(per_queue[qid].get('lat', 0.0))
+                )
+                self.queue_metrics[qid]['drop'].append(
+                    float(per_queue[qid].get('drop', 0.0))
+                )
+                self.queue_metrics[qid]['util'].append(
+                    float(per_queue[qid].get('util', 0.0))
+                )
 
         try:
             p = (
@@ -242,11 +266,11 @@ class ProductionMetricsWriter:
             )
 
             # Per-queue latency and drops
-            per_queue = info.get('per_queue', {})
             for qid in QIDS:
                 if qid in per_queue:
                     p = p.field(f"queue_{qid}_latency", float(per_queue[qid].get('lat', 0)))
                     p = p.field(f"queue_{qid}_drops", float(per_queue[qid].get('drop', 0)))
+                    p = p.field(f"queue_{qid}_utilization", float(per_queue[qid].get('util', 0)))
             
             # PHASE 2.2: Circuit breaker pattern for write failures
             if self.circuit_open:
@@ -273,11 +297,36 @@ class ProductionMetricsWriter:
     
     def get_summary(self) -> Dict:
         """Get summary statistics."""
+        queue_summary = {}
+        for qid in QIDS:
+            metrics = self.queue_metrics[qid]
+            queue_summary[qid] = {
+                'mean_latency': (
+                    float(np.mean(metrics['latency'])) if metrics['latency'] else 0.0
+                ),
+                'p95_latency': (
+                    float(np.percentile(metrics['latency'], 95))
+                    if metrics['latency'] else 0.0
+                ),
+                'mean_drop': (
+                    float(np.mean(metrics['drop'])) if metrics['drop'] else 0.0
+                ),
+                'mean_util': (
+                    float(np.mean(metrics['util'])) if metrics['util'] else 0.0
+                ),
+            }
+
         return {
             'total_steps': self.total_steps,
             'cumulative_reward': self.cumulative_reward,
-            'avg_reward_100': np.mean(self.rewards) if self.rewards else 0.0,
+            'mean_reward': (
+                self.cumulative_reward / self.total_steps
+                if self.total_steps else 0.0
+            ),
+            'avg_reward_100': float(np.mean(self.rewards)) if self.rewards else 0.0,
             'overall_sla_compliance': (self.total_sla_met / max(1, self.total_sla_checks)) * 100,
+            'valid_steps': self.valid_steps,
+            'queue_metrics': queue_summary,
             'uptime_seconds': time.time() - self.start_time,
         }
     
@@ -312,9 +361,10 @@ class ProductionRunner:
         log.info(f"\nReceived signal {signum}, initiating graceful shutdown...")
         self.running = False
     
-    def run(self):
+    def run(self) -> int:
         """Main production loop."""
         args = self.args
+        failed = False
         
         log.info("=" * 60)
         log.info("Starting RL Production - DQN Agent v4")
@@ -374,37 +424,102 @@ class ProductionRunner:
             if not os.path.exists(weights_path):
                 log.error(f"Weights file not found: {weights_path}")
                 log.error(f"Pattern searched: {pattern}")
-                return
+                env.close()
+                metrics.close()
+                return 2
             log.info(f"Using legacy checkpoint: {os.path.basename(weights_path)}")
 
         agent.load(weights_path)
         
         # Traffic generation (optional) - fixed profile for entire run
         traffic_manager = None
+        profile_info = {}
+        traffic_loads = {qid: 0.0 for qid in QIDS}
         if args.generate_traffic:
-            traffic_manager = TrafficManager(config_path=args.config)
+            traffic_manager = TrafficManager(
+                config_path=args.config,
+                seed=args.traffic_seed,
+            )
             log.info(f"Traffic generation enabled with profile: {args.traffic_profile}")
             
             # Start traffic with fixed profile
             profile_info = traffic_manager.start_traffic(profile_name=args.traffic_profile)
+            traffic_loads = profile_info.get(
+                'measurement_loads',
+                profile_info['loads'],
+            )
             log.info(f"Started traffic: {profile_info['profile_name']} ({profile_info['profile_category']})")
-            log.info("Waiting 5s for traffic to stabilize...")
-            time.sleep(5.0)
         
         # CSV logging
-        os.makedirs('data', exist_ok=True)
-        csv_path = f"data/production_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_path = args.output or f"data/production_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
         csv_file = open(csv_path, 'w', newline='')
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             'step', 'action', 'action_name', 'reward', 'raw_reward',
             'q_max', 'q_mean', 'chosen_q', 'q_gap',
-            'sla_met_count', 'sla_streak', 'action_applied', 'pressure', 'timestamp'
+            'sla_met_count', 'sla_streak', 'action_applied', 'data_valid',
+            'routing_state_verified', 'traffic_state_verified',
+            'telemetry_state_verified', 'pressure',
+            'routing_mode', 'traffic_profile', 'traffic_seed',
+            'load_q0_mbps', 'load_q1_mbps', 'load_q7_mbps',
+            'q0_latency_ms', 'q0_drop', 'q0_util_pct',
+            'q1_latency_ms', 'q1_drop', 'q1_util_pct',
+            'q7_latency_ms', 'q7_drop', 'q7_util_pct',
+            'timestamp'
         ])
         log.info(f"Production log: {csv_path}")
         
         # Initialize environment
-        state = env.reset()
+        state = env.reset(
+            cooldown_seconds=0.0,
+            collect_initial_snapshot=traffic_manager is None,
+        )
+        warmup_state = None
+        if traffic_manager:
+            warmup_state = traffic_manager.warm_profile_for(
+                args.warmup_seconds
+            )
+        routing_state = env.controller.verify_forwarding_tables(
+            raise_on_error=True
+        )
+        traffic_state = (
+            traffic_manager.verify_exact_processes(raise_on_error=True)
+            if traffic_manager
+            else {
+                'verified': True,
+                'note': 'Traffic generation disabled for this run.',
+            }
+        )
+        if traffic_manager:
+            traffic_state["sender_rate_shaping"] = profile_info.get(
+                "traffic_shaping",
+                {},
+            )
+            traffic_state["traffic_profile_warmup"] = warmup_state
+        telemetry_state = (
+            env.verify_telemetry_flow_coverage(
+                [flow_id for _, _, flow_id in traffic_manager.traffic_pairs],
+                window_seconds=max(5.0, args.warmup_seconds),
+                raise_on_error=True,
+            )
+            if traffic_manager
+            else {
+                'verified': True,
+                'note': 'Traffic generation disabled for this run.',
+            }
+        )
+        log.info("Verified clean initial forwarding tables for RL")
+        log.info("Verified telemetry coverage for every RL demand and queue")
+        if traffic_manager:
+            measurement_shaping = traffic_manager.begin_measurement()
+            if measurement_shaping:
+                traffic_state["measurement_shaping"] = measurement_shaping
+                traffic_state["sender_rate_shaping"] = measurement_shaping
+            state = env.reset(
+                force_reset=False,
+                cooldown_seconds=0.0,
+            )
         log.info("Environment initialized, starting production loop...")
         
         try:
@@ -415,18 +530,9 @@ class ProductionRunner:
                 if args.steps > 0 and self.step > args.steps:
                     log.info(f"Reached step limit ({args.steps}), stopping...")
                     break
-                
-                # Check for bursty mode traffic changes
-                if traffic_manager and args.bursty_mode:
-                    burst_msg = traffic_manager.check_burst(
-                        burst_interval=30.0,    # Every 30 seconds
-                        min_duration=5.0,       # Minimum 5 seconds
-                        max_duration=120.0,     # Maximum 2 minutes
-                        base_profile=args.traffic_profile,
-                        burst_profile=args.burst_profile
-                    )
-                    if burst_msg:
-                        log.info(f"[Step {self.step}] {burst_msg}")
+
+                if traffic_manager:
+                    traffic_manager.apply_step_profile(self.step)
 
                 # PHASE 2.3: Check for model reload (hot-reload support)
                 # If checkpoint file is updated, reload model and clear stacks
@@ -459,6 +565,9 @@ class ProductionRunner:
                 metrics.write_metrics(self.step, action, reward, info, q_stats)
                 
                 # CSV logging
+                snapshot = env.last_snapshot
+                if traffic_manager:
+                    traffic_loads = traffic_manager.current_load
                 csv_writer.writerow([
                     self.step, action, action_name, reward,
                     info.get('raw_reward', reward),
@@ -466,7 +575,20 @@ class ProductionRunner:
                     q_stats.get('chosen_q', 0.0), q_stats.get('q_gap', 0.0),
                     len(info['sla_met']), info.get('sla_streak', 0),
                     int(info.get('action_applied', False)),
+                    int(info.get('data_valid', False)),
+                    int(routing_state['verified']),
+                    int(traffic_state['verified']),
+                    int(telemetry_state['verified']),
                     info.get('pressure', 0),
+                    'rl',
+                    traffic_manager.current_profile_name if traffic_manager else args.traffic_profile,
+                    args.traffic_seed if args.traffic_seed is not None else '',
+                    traffic_loads.get(0, 0.0),
+                    traffic_loads.get(1, 0.0),
+                    traffic_loads.get(7, 0.0),
+                    snapshot[0]['lat_p95'], snapshot[0]['drop_p95'], snapshot[0]['util_p95'],
+                    snapshot[1]['lat_p95'], snapshot[1]['drop_p95'], snapshot[1]['util_p95'],
+                    snapshot[7]['lat_p95'], snapshot[7]['drop_p95'], snapshot[7]['util_p95'],
                     datetime.now().isoformat()
                 ])
                 csv_file.flush()
@@ -476,21 +598,108 @@ class ProductionRunner:
         
         except Exception as e:
             log.error(f"Production loop error: {e}", exc_info=True)
+            failed = True
         
         finally:
             # Graceful shutdown
             log.info("\nShutting down gracefully...")
+
+            if traffic_manager:
+                final_traffic_state = traffic_manager.verify_exact_processes(
+                    timeout=2.0,
+                    require_no_restarts=True,
+                    raise_on_error=False,
+                )
+                traffic_state['final'] = final_traffic_state
+                traffic_state['verified'] = bool(
+                    traffic_state['verified']
+                    and final_traffic_state['verified']
+                )
+                if not traffic_state['verified']:
+                    failed = True
+                    log.error(
+                        "Final traffic-state verification failed: "
+                        + "; ".join(final_traffic_state['errors'])
+                    )
+                final_telemetry_state = env.verify_telemetry_flow_coverage(
+                    [flow_id for _, _, flow_id in traffic_manager.traffic_pairs],
+                    window_seconds=5.0,
+                    raise_on_error=False,
+                )
+                telemetry_state['final'] = final_telemetry_state
+                telemetry_state['verified'] = bool(
+                    telemetry_state['verified']
+                    and final_telemetry_state['verified']
+                )
+                if not telemetry_state['verified']:
+                    failed = True
+                    log.error(
+                        "Final telemetry-state verification failed: "
+                        + "; ".join(final_telemetry_state['errors'])
+                    )
             
             # Print summary
             summary = metrics.get_summary()
-            log.info("=" * 60)
-            log.info("Production Run Summary:")
-            log.info(f"  Total steps: {self.step}")
-            log.info(f"  Cumulative reward: {summary['cumulative_reward']:.2f}")
-            log.info(f"  Avg reward (last 100): {summary['avg_reward_100']:.2f}")
-            log.info(f"  SLA compliance: {summary['overall_sla_compliance']:.1f}%")
-            log.info(f"  Uptime: {summary['uptime_seconds']:.1f}s")
-            log.info("=" * 60)
+            log.info("=" * 68)
+            log.info("RL benchmark summary")
+            log.info(f"  Steps: {summary['total_steps']}")
+            log.info(f"  Mean reward: {summary['mean_reward']:+.4f}")
+            log.info(
+                f"  SLA compliance: "
+                f"{summary['overall_sla_compliance']:.2f}%"
+            )
+            log.info(
+                f"  Valid telemetry steps: "
+                f"{summary['valid_steps']}/{summary['total_steps']}"
+            )
+            for qid in QIDS:
+                queue_stats = summary['queue_metrics'][qid]
+                log.info(
+                    f"  Q{qid}: mean(step-p95 latency)="
+                    f"{queue_stats['mean_latency']:.3f} ms, "
+                    f"p95(step-p95 latency)="
+                    f"{queue_stats['p95_latency']:.3f} ms, "
+                    f"mean drops/100ms={queue_stats['mean_drop']:.6f}, "
+                    f"mean util={queue_stats['mean_util']:.3f}%"
+                )
+            log.info(f"  CSV: {csv_path}")
+            log.info("  Initial routing state: VERIFIED")
+            log.info(
+                "  Traffic process state: "
+                + ("VERIFIED" if traffic_state['verified'] else "FAILED")
+            )
+            log.info(
+                "  Telemetry flow coverage: "
+                + ("VERIFIED" if telemetry_state['verified'] else "FAILED")
+            )
+            log.info("=" * 68)
+
+            if args.summary_json:
+                summary_payload = {
+                    **summary,
+                    'method': 'rl',
+                    'traffic_profile': args.traffic_profile,
+                    'traffic_seed': args.traffic_seed,
+                    'weights_path': os.path.abspath(weights_path),
+                    'csv_path': os.path.abspath(csv_path),
+                    'status': 'failed' if failed else 'completed',
+                    'routing_state_verified': routing_state['verified'],
+                    'traffic_state_verified': traffic_state['verified'],
+                    'telemetry_state_verified': telemetry_state['verified'],
+                    'routing_state': {
+                        'verified': routing_state['verified'],
+                        'initial_tables': routing_state,
+                        'traffic_processes': traffic_state,
+                        'telemetry_flow_coverage': telemetry_state,
+                        'note': (
+                            'Initial clean baseline verified before RL actions; '
+                            'per-action success is recorded separately.'
+                        ),
+                    },
+                }
+                os.makedirs(os.path.dirname(args.summary_json) or '.', exist_ok=True)
+                with open(args.summary_json, 'w') as summary_file:
+                    json.dump(summary_payload, summary_file, indent=2, sort_keys=True)
             
             # Clean up
             csv_file.close()
@@ -500,8 +709,8 @@ class ProductionRunner:
                 traffic_manager.stop_traffic()
                 log.info("Stopped traffic generation")
             
-            log.info(f"Production log saved to: {csv_path}")
             log.info("Shutdown complete.")
+        return 1 if failed else 0
 
 
 # =============================================================================
@@ -521,6 +730,12 @@ def main():
                         help='Max steps (0 = infinite, run until interrupted)')
     parser.add_argument('--log-every', type=int, default=1,
                         help='Console log frequency')
+    parser.add_argument('--warmup-seconds', type=float, default=5.0,
+                        help='Traffic warm-up excluded from measurement')
+    parser.add_argument('--output', default=None,
+                        help='Explicit per-step CSV output path')
+    parser.add_argument('--summary-json', default=None,
+                        help='Optional machine-readable run summary path')
     
     # InfluxDB
     parser.add_argument('--influx-url', default='http://192.168.56.1:8086')
@@ -543,12 +758,12 @@ def main():
     # Traffic generation
     parser.add_argument('--generate-traffic', action='store_true',
                         help='Generate traffic with a fixed profile')
-    parser.add_argument('--traffic-profile', type=str, default='high_1',
-                        help='Traffic profile name: light_1, light_2, medium_1, medium_2, high_1, high_2, test_*')
-    parser.add_argument('--bursty-mode', action='store_true',
-                        help='Enable periodic bursts every 30s with random duration (5s-2min)')
-    parser.add_argument('--burst-profile', type=str, default='bursty_be_2',
-                        help='Traffic profile to use during bursts (default: bursty_be_2)')
+    parser.add_argument('--traffic-profile', type=str,
+                        choices=tuple(TrafficManager.TRAFFIC_PROFILES),
+                        default='high_1',
+                        help='Traffic profile name from TrafficManager.TRAFFIC_PROFILES')
+    parser.add_argument('--traffic-seed', type=int, default=None,
+                        help='Deterministic traffic seed for fair RL/ECMP comparisons')
     
     args = parser.parse_args()
 
@@ -560,7 +775,7 @@ def main():
         sys.exit(1)
 
     runner = ProductionRunner(args)
-    runner.run()
+    sys.exit(runner.run())
 
 
 if __name__ == '__main__':

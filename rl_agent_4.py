@@ -947,14 +947,15 @@ class QoSRoutingEnv:
         self.current_traffic_category = ""  # "light", "medium", "high", "bursty"
         self.traffic_category_weights = None  # Optional: {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
         self.fixed_traffic_profile = None    # Optional: override to use specific profile for all episodes
-        self.is_bursty_episode = False  # Track if current episode uses bursty profile
 
         # CPU Optimization: Persistent ThreadPoolExecutor for parallel InfluxDB queries
         # Avoids thread creation/destruction overhead on every _collect_snapshot() call
         # 5 workers: 2 main queries + up to 3 parallel retries (lat, drop, util)
         self._query_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="influx_query")
 
-    def reset(self, force_reset: Optional[bool] = None) -> np.ndarray:
+    def reset(self, force_reset: Optional[bool] = None,
+              cooldown_seconds: Optional[float] = None,
+              collect_initial_snapshot: bool = True) -> np.ndarray:
         """Reset episode and return initial stacked state.
         
         Args:
@@ -962,6 +963,15 @@ class QoSRoutingEnv:
                 - None: use self.reset_network default
                 - True: force baseline reset (clear tables, reprogram OSPF)
                 - False: warm-start from current state
+            cooldown_seconds: Optional explicit stabilization interval. When
+                omitted, preserves the training defaults (5s after a baseline
+                reset, 2s after a warm start). Benchmark runners set the same
+                value for RL, ECMP, and OSPF.
+            collect_initial_snapshot: When False, reset counters/stacks without
+                issuing the initial InfluxDB telemetry query. Baseline runners
+                discard the returned state and use this to avoid holding one
+                traffic stage for several query-retry seconds before measured
+                step 1.
         
         Curriculum-based training can use this to mix baseline-starts and warm-starts:
         - Early training: mostly baseline-starts (agent learns from clean state)
@@ -975,7 +985,7 @@ class QoSRoutingEnv:
             log.info("=== BASELINE START: Resetting network to OSPF ===")
             
             # Step 1: Clear all P4 tables
-            self.controller.clear_all_tables()
+            self.controller.clear_all_tables(verify=True)
             log.info("Cleared all P4 tables")
             
             # Step 2: Recompute baseline OSPF paths
@@ -999,15 +1009,20 @@ class QoSRoutingEnv:
             
             self.current_traffic_profile = profile_info['profile_name']
             self.current_traffic_category = profile_info['profile_category']
-            self.is_bursty_episode = profile_info.get('is_bursty', False)
             log.info(f"Traffic started: {self.current_traffic_profile} ({self.current_traffic_category})")
-            if self.is_bursty_episode:
-                log.info(f"  [BURSTY] Will cycle bursts during episode")
         
         # Cool-down period for traffic to stabilize (traffic is now running)
-        cooldown = 5.0 if do_reset else 2.0  # Less cooldown for warm-start
+        cooldown = (
+            float(cooldown_seconds)
+            if cooldown_seconds is not None
+            else (5.0 if do_reset else 2.0)
+        )
         log.info(f"Traffic running, waiting {cooldown}s for metrics to stabilize...")
-        time.sleep(cooldown)
+        if self.traffic_manager:
+            self.traffic_manager.warm_profile_for(cooldown)
+            self.traffic_manager.begin_measurement()
+        else:
+            time.sleep(cooldown)
         log.info("Episode start complete")
         
         # Reset episode counters
@@ -1019,10 +1034,17 @@ class QoSRoutingEnv:
         
         # Reset EMA state
         self.lat_ema = {qid: 1.0 for qid in QIDS}
-        
-        # Collect initial snapshot (after reset if applicable)
-        self.last_snapshot = self._collect_snapshot()
-        raw_state = self._build_raw_state(self.last_snapshot)
+
+        # Collect initial snapshot (after reset if applicable). Some baseline
+        # runners discard the returned state; for them, skipping this query
+        # prevents the initial telemetry retry path from becoming unintended
+        # traffic preconditioning.
+        if collect_initial_snapshot:
+            self.last_snapshot = self._collect_snapshot()
+            raw_state = self._build_raw_state(self.last_snapshot)
+        else:
+            self.last_snapshot = None
+            raw_state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
         
         # Debug assertion to catch dimension mismatches early
         assert len(raw_state) == RAW_STATE_DIM, f"State dim mismatch: {len(raw_state)} != {RAW_STATE_DIM}"
@@ -1093,6 +1115,97 @@ class QoSRoutingEnv:
         stop_dt = datetime.utcnow() - timedelta(milliseconds=SAFETY_LAG_MS)
         start_dt = stop_dt - timedelta(seconds=WINDOW_SECONDS)
         return start_dt.isoformat() + 'Z', stop_dt.isoformat() + 'Z'
+
+    def verify_telemetry_flow_coverage(
+        self,
+        expected_flow_ids,
+        window_seconds: float = 5.0,
+        retries: int = 12,
+        retry_delay: float = 1.0,
+        raise_on_error: bool = True,
+    ) -> Dict:
+        """Verify that every configured demand reports latency in every queue.
+
+        Metric presence alone is insufficient for benchmark validity: a
+        partially blackholed ECMP condition can look excellent when percentiles
+        contain only surviving flows. This check requires exact flow-ID
+        coverage for Q0/Q1/Q7 over a multi-second window. Retries allow the
+        INT collector and InfluxDB writer to catch up after a clean traffic
+        start without weakening the exact all-flow requirement.
+        """
+        expected = {str(int(flow_id)) for flow_id in expected_flow_ids}
+        observed = {qid: set() for qid in QIDS}
+        query_error = None
+
+        for attempt in range(max(1, retries)):
+            stop_dt = datetime.utcnow()
+            start_dt = stop_dt - timedelta(seconds=float(window_seconds))
+            start = start_dt.isoformat() + 'Z'
+            stop = stop_dt.isoformat() + 'Z'
+            flux = f'''
+            from(bucket:"{self.bucket}")
+                |> range(start:{start}, stop:{stop})
+                |> filter(fn: (r) => r._measurement == "flow_latency")
+                |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+                |> group(columns:["queue_id", "flow_id"])
+                |> first()
+            '''
+            try:
+                tables = self.query_api.query(org=self.org, query=flux)
+                observed = {qid: set() for qid in QIDS}
+                for table in tables or []:
+                    for record in table.records:
+                        try:
+                            qid = int(record.values.get('queue_id', -1))
+                        except (TypeError, ValueError):
+                            continue
+                        flow_id = record.values.get('flow_id')
+                        if qid in observed and flow_id is not None:
+                            observed[qid].add(str(flow_id))
+                query_error = None
+            except Exception as exc:
+                query_error = str(exc)
+
+            if query_error is None and all(
+                observed[qid] == expected for qid in QIDS
+            ):
+                break
+            if attempt < max(1, retries) - 1:
+                time.sleep(retry_delay)
+
+        per_queue = {}
+        errors = []
+        for qid in QIDS:
+            missing = sorted(expected - observed[qid], key=int)
+            unexpected = sorted(observed[qid] - expected, key=int)
+            per_queue[qid] = {
+                'expected_count': len(expected),
+                'observed_count': len(observed[qid]),
+                'missing_flow_ids': missing,
+                'unexpected_flow_ids': unexpected,
+            }
+            if missing or unexpected:
+                errors.append(
+                    f"Q{qid} expected {len(expected)} flows, observed "
+                    f"{len(observed[qid])}; missing={missing}; "
+                    f"unexpected={unexpected}"
+                )
+        if query_error:
+            errors.append(f"InfluxDB coverage query failed: {query_error}")
+
+        report = {
+            'verified': not errors,
+            'window_seconds': float(window_seconds),
+            'expected_flow_ids': sorted(expected, key=int),
+            'per_queue': per_queue,
+            'errors': errors,
+        }
+        if errors and raise_on_error:
+            raise RuntimeError(
+                "Telemetry flow-coverage verification failed: "
+                + "; ".join(errors)
+            )
+        return report
 
     def _query_aggregated_metrics(self, start: str, stop: str, step: int) -> Dict:
         """
@@ -1994,6 +2107,8 @@ class QoSRoutingEnv:
             # Store per-queue info for debugging
             info['per_queue'][qid] = {
                 'lat': lat,
+                'drop': q['drop_p95'],
+                'util': q['util_p95'],
                 'ratio': ratio,
                 'component': component,
                 'drop_penalty': drop_penalty
@@ -2162,14 +2277,9 @@ class QoSRoutingEnv:
         # Increment global step counter (persists across episodes)
         self.global_step += 1
         self.episode_step += 1
-        
-        # Handle step-based bursts for bursty episodes
-        if self.is_bursty_episode and self.traffic_manager:
-            burst_msg = self.traffic_manager.check_step_burst(
-                self.episode_step, 
-                bursty_profile=self.current_traffic_profile
-            )
-            # Burst state changes are logged inside check_step_burst
+
+        if self.traffic_manager:
+            self.traffic_manager.apply_step_profile(self.episode_step)
         
         # Get current snapshot
         current_snapshot = self.last_snapshot
@@ -2907,7 +3017,9 @@ def main():
                         help='Reset epsilon to this value when resuming (e.g., 0.10)')
     parser.add_argument('--traffic-weights', type=str, default=None,
                         help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
-    parser.add_argument('--traffic-profile', type=str, default=None,
+    parser.add_argument('--traffic-profile', type=str,
+                        choices=tuple(TrafficManager.TRAFFIC_PROFILES),
+                        default=None,
                         help='Use specific traffic profile for all episodes (overrides --traffic-weights)')
 
     # Learning rate override
@@ -2974,4 +3086,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
