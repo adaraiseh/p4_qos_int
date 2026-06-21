@@ -11,7 +11,10 @@
 *.pcap
 pcap
 log
-training_files/
+training_files/*
+!training_files/training_logs/
+training_files/training_logs/*
+!training_files/training_logs/.gitkeep
 data/
 sync_results*
 topology.json

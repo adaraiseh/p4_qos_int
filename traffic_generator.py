@@ -1204,6 +1204,7 @@ class TrafficManager:
         self,
         profile_name: Optional[str],
         category_weights: Optional[Dict[str, float]],
+        profile_weights: Optional[Dict[str, float]] = None,
     ) -> str:
         """Select and validate a profile from the canonical registry."""
         if profile_name is not None:
@@ -1213,6 +1214,35 @@ class TrafficManager:
                     f"{', '.join(self.TRAFFIC_PROFILES)}"
                 )
             return profile_name
+
+        if profile_weights is not None:
+            weighted_profiles = []
+            weights = []
+            for weighted_profile, raw_weight in profile_weights.items():
+                if weighted_profile not in self.TRAFFIC_PROFILES:
+                    raise ValueError(
+                        f"Unknown traffic profile {weighted_profile!r}; valid profiles: "
+                        f"{', '.join(self.TRAFFIC_PROFILES)}"
+                    )
+                weight = float(raw_weight)
+                if not math.isfinite(weight):
+                    raise ValueError(
+                        f"Traffic profile weight for {weighted_profile!r} must be finite"
+                    )
+                if weight < 0:
+                    raise ValueError(
+                        f"Traffic profile weight for {weighted_profile!r} cannot be negative"
+                    )
+                if weight > 0:
+                    weighted_profiles.append(weighted_profile)
+                    weights.append(weight)
+            if not weighted_profiles:
+                raise ValueError("At least one traffic profile weight must be positive")
+            return self._rng.choices(
+                weighted_profiles,
+                weights=weights,
+                k=1,
+            )[0]
 
         if category_weights is not None:
             weighted_categories = []
@@ -1661,6 +1691,7 @@ class TrafficManager:
         packet_len: int = 1250,
         category_weights: Optional[Dict[str, float]] = None,
         profile_name: Optional[str] = None,
+        profile_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Start traffic with a selected profile.
 
@@ -1670,6 +1701,9 @@ class TrafficManager:
                 A category is selected first, followed by one of its profiles.
             profile_name: Optional name from ``TRAFFIC_PROFILES``. An explicit
                 profile takes precedence over category weights.
+            profile_weights: Optional weights for exact profile names. This is
+                preferred for research training plans that must guarantee
+                exposure to every traffic profile family.
 
         Returns:
             Profile, offered-load, and exact startup verification metadata.
@@ -1687,6 +1721,7 @@ class TrafficManager:
         self.current_profile_name = self._choose_profile_name(
             profile_name,
             category_weights,
+            profile_weights,
         )
         self.current_profile_category = self.profile_category(
             self.current_profile_name

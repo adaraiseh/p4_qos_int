@@ -16,6 +16,34 @@ CHECKPOINT ?= 50pct
 LOG_LEVEL  ?= info
 STEPS      ?= 300
 TRAFFIC_SEED ?= 42
+TRAIN_STEPS ?= 55000
+TRAIN_RESUME_STEPS ?= 10000
+TRAIN_TEST_STEPS ?= 20
+TRAIN_FOUNDATION_STEPS ?= 30000
+TRAIN_BURST_STEPS ?= 35000
+TRAIN_POLISH_STEPS ?= 25000
+TRAIN_BURST_RESUME_EPS ?= 0.25
+TRAIN_POLISH_RESUME_EPS ?= 0.10
+TRAIN_PROFILE_RESUME_EPS ?= 0.15
+TRAIN_RESET_PROB_START ?= 0.80
+TRAIN_RESET_PROB_END ?= 0.25
+TRAIN_FOUNDATION_RESET_PROB_START ?= 0.85
+TRAIN_FOUNDATION_RESET_PROB_END ?= 0.45
+TRAIN_BURST_RESET_PROB_START ?= 0.45
+TRAIN_BURST_RESET_PROB_END ?= 0.15
+TRAIN_POLISH_RESET_PROB_START ?= 0.30
+TRAIN_POLISH_RESET_PROB_END ?= 0.10
+TRAIN_BASELINE_COOLDOWN ?= 5
+TRAIN_WARM_COOLDOWN ?= 3
+TRAIN_LOG_FLUSH_EVERY ?= 25
+TRAIN_INFLUX_DETAIL ?= minimal
+TRAIN_TEST_INFLUX_DETAIL ?= off
+TRAFFIC_TEST_INFLUX_DETAIL ?= off
+TRAIN_LOG_DIR ?=
+TRAIN_PROFILE_WEIGHTS ?= light_1:2,light_2:2,medium_1:3,medium_2:3,high_1:4,high_2:4,bursty_vo_1:4,bursty_vo_2:4,bursty_vi_1:4,bursty_vi_2:4,bursty_be_1:4,bursty_be_2:4
+TRAIN_FOUNDATION_PROFILE_WEIGHTS ?= light_1:6,light_2:6,medium_1:6,medium_2:6,high_1:6,high_2:6,bursty_vo_1:2,bursty_vo_2:2,bursty_vi_1:2,bursty_vi_2:2,bursty_be_1:2,bursty_be_2:2
+TRAIN_BURST_PROFILE_WEIGHTS ?= light_1:1,light_2:1,medium_1:2,medium_2:2,high_1:3,high_2:3,bursty_vo_1:5,bursty_vo_2:5,bursty_vi_1:5,bursty_vi_2:5,bursty_be_1:5,bursty_be_2:5
+TRAIN_POLISH_PROFILE_WEIGHTS ?= $(TRAIN_PROFILE_WEIGHTS)
 BENCH_PROFILES ?= light_2,medium_2,high_1
 BENCH_REPETITIONS ?= 6
 BENCH_BASE_SEED ?= 42
@@ -23,7 +51,7 @@ BENCH_WARMUP ?= 5
 BENCH_COOLDOWN ?= 30
 BENCH_MIN_VALID ?= 0.80
 BENCH_RETRIES ?= 1
-BENCH_WEIGHTS_TAG ?= best
+BENCH_WEIGHTS_TAG ?= final
 BENCH_OUTPUT ?=
 BENCHMARK_DIR ?= benchmark_results
 CALIBRATION_DIR ?= calibration_results
@@ -42,6 +70,10 @@ DETECT_TOPOLOGY = $(shell cat .active_topology 2>/dev/null || echo "$(TOPO_DIR)/
 # =============================================
 LOG_LEVEL_FLAG := --log-level $(LOG_LEVEL)
 BENCH_OUTPUT_FLAG := $(if $(BENCH_OUTPUT),--output-dir $(BENCH_OUTPUT),)
+TRAIN_LOG_DIR_FLAG = $(if $(TRAIN_LOG_DIR),--training-log-dir $(TRAIN_LOG_DIR),)
+TRAIN_LOGGING_FLAGS = --training-log-flush-every $(TRAIN_LOG_FLUSH_EVERY) $(TRAIN_LOG_DIR_FLAG)
+TRAIN_RESET_FLAGS = --reset-prob-start $(TRAIN_RESET_PROB_START) --reset-prob-end $(TRAIN_RESET_PROB_END) --baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) --warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN)
+TRAIN_COMMON_FLAGS = $(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_RESET_FLAGS) --training-influx-detail $(TRAIN_INFLUX_DETAIL)
 
 # =============================================
 # Common Command Variables
@@ -96,6 +128,13 @@ clean_bench clean-benchmark:
 	sudo rm -f log/traffic_log.csv
 	@echo "Benchmark statistics and logs cleaned."
 
+# Remove durable training report artifacts while preserving model checkpoints
+# and the tracked training_logs/.gitkeep placeholder.
+clean_training_logs clean-training-logs:
+	@echo "Removing durable training logs from training_files/training_logs..."
+	sudo rm -rf training_files/training_logs/*
+	@echo "Training logs cleaned; model checkpoints preserved."
+
 bench:
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
 	$(MAKE) --no-print-directory clean_bench
@@ -121,22 +160,61 @@ visualize:
 # RL Training
 # =============================================
 
-# Full training: 50K steps on fat_tree_k4
+# Full training with durable local report artifacts and minimal Influx progress logging.
 train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
-	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 55000 \
-		$(RL_COMMON) --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
+	@echo "Training steps: $(TRAIN_STEPS), Influx training detail: $(TRAIN_INFLUX_DETAIL)"
+	@echo "Reset schedule: $(TRAIN_RESET_PROB_START) -> $(TRAIN_RESET_PROB_END); cooldowns baseline=$(TRAIN_BASELINE_COOLDOWN)s warm=$(TRAIN_WARM_COOLDOWN)s"
+	@echo "Profile weights: $(TRAIN_PROFILE_WEIGHTS)"
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_STEPS) \
+		$(TRAIN_COMMON_FLAGS) --traffic-profile-weights "$(TRAIN_PROFILE_WEIGHTS)"
+
+# Paper training curriculum after traffic-generator calibration:
+# 1) balanced category foundation, 2) burst-specific recovery, 3) paper-mix polish.
+train_paper:
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "=== Stage 1/3: balanced foundation ($(TRAIN_FOUNDATION_STEPS) steps) ==="
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_FOUNDATION_STEPS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		--reset-prob-start $(TRAIN_FOUNDATION_RESET_PROB_START) \
+		--reset-prob-end $(TRAIN_FOUNDATION_RESET_PROB_END) \
+		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
+		--warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN) \
+		--training-influx-detail $(TRAIN_INFLUX_DETAIL) \
+		--traffic-profile-weights "$(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"
+	@echo "=== Stage 2/3: burst specialization ($(TRAIN_BURST_STEPS) steps, resume final, eps=$(TRAIN_BURST_RESUME_EPS)) ==="
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_BURST_STEPS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		--reset-prob-start $(TRAIN_BURST_RESET_PROB_START) \
+		--reset-prob-end $(TRAIN_BURST_RESET_PROB_END) \
+		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
+		--warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN) \
+		--training-influx-detail $(TRAIN_INFLUX_DETAIL) \
+		--resume final --resume-eps $(TRAIN_BURST_RESUME_EPS) \
+		--traffic-profile-weights "$(TRAIN_BURST_PROFILE_WEIGHTS)"
+	@echo "=== Stage 3/3: all-profile polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS)) ==="
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_POLISH_STEPS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		--reset-prob-start $(TRAIN_POLISH_RESET_PROB_START) \
+		--reset-prob-end $(TRAIN_POLISH_RESET_PROB_END) \
+		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
+		--warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN) \
+		--training-influx-detail $(TRAIN_INFLUX_DETAIL) \
+		--resume final --resume-eps $(TRAIN_POLISH_RESUME_EPS) \
+		--traffic-profile-weights "$(TRAIN_POLISH_PROFILE_WEIGHTS)"
 
 # Test training: 20 steps per episode, cycles through all traffic profiles
 train_test:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	@echo "=== Testing all training profiles (20 steps each) ==="
-	@for p in bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
+	@echo "=== Testing all training profiles ($(TRAIN_TEST_STEPS) steps each) ==="
+	@echo "Influx training detail: $(TRAIN_TEST_INFLUX_DETAIL)"
+	@for p in bursty_vo_2 bursty_vi_2 bursty_be_2 bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
 		echo ""; \
 		echo "=== Testing profile: $$p ==="; \
-		if ! $(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
-			--steps 20 --max-episode-steps 20 --no-warm-start \
+		if ! $(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+			--training-influx-detail $(TRAIN_TEST_INFLUX_DETAIL) \
+			--steps $(TRAIN_TEST_STEPS) --max-episode-steps $(TRAIN_TEST_STEPS) --no-warm-start \
 			--traffic-profile $$p; then \
 			echo "Training interrupted or failed."; \
 			ret=$$?; \
@@ -152,9 +230,20 @@ train_test:
 	@echo "=== All profile tests completed ==="
 
 resume:
-	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps 10000 \
-		$(RL_COMMON) --resume $(CHECKPOINT) --resume-eps 0.10 \
-		--traffic-weights "light:0.05,medium:0.05,high:0.35,bursty:0.55"
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "Resume checkpoint: $(CHECKPOINT), steps: $(TRAIN_RESUME_STEPS), Influx training detail: $(TRAIN_INFLUX_DETAIL)"
+	@echo "Profile weights: $(TRAIN_PROFILE_WEIGHTS)"
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_RESUME_STEPS) \
+		$(TRAIN_COMMON_FLAGS) --resume $(CHECKPOINT) --resume-eps 0.10 \
+		--traffic-profile-weights "$(TRAIN_PROFILE_WEIGHTS)"
+
+# Focused fixed-profile fine-tuning, useful after analyzing benchmark failures.
+train_profile:
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "Fine-tuning profile: $(profile), resume=$(CHECKPOINT), steps=$(TRAIN_RESUME_STEPS), eps=$(TRAIN_PROFILE_RESUME_EPS)"
+	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_RESUME_STEPS) \
+		$(TRAIN_COMMON_FLAGS) --resume $(CHECKPOINT) --resume-eps $(TRAIN_PROFILE_RESUME_EPS) \
+		--traffic-profile $(profile)
 
 # =============================================
 # Traffic Testing
@@ -165,7 +254,9 @@ test_traffic:
 	@echo "Testing traffic profile: $(profile)"
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Running indefinitely (Ctrl+C to stop)..."
-	$(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) \
+	@echo "Influx training detail: $(TRAFFIC_TEST_INFLUX_DETAIL)"
+	$(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		--training-influx-detail $(TRAFFIC_TEST_INFLUX_DETAIL) \
 		--steps 999999 --max-episode-steps 999999 --no-warm-start \
 		--traffic-profile $(profile)
 
@@ -267,6 +358,7 @@ help:
 	@echo "  make stop                 Stop mininet"
 	@echo "  make clean                Clean up all files"
 	@echo "  make clean_bench          Clean benchmark statistics/log artifacts"
+	@echo "  make clean_training_logs  Clean durable training logs only"
 	@echo ""
 	@echo "Available topologies for 'topo=':"
 	@echo "  Fat-Tree:    fat_tree_k2, fat_tree_k4 [default], fat_tree_k8"
@@ -274,9 +366,18 @@ help:
 	@echo "  Three-Tier:  three_tier_4, three_tier_6, three_tier_8"
 	@echo ""
 	@echo "Training:"
-	@echo "  make train                Full training (50K steps, fat_tree_k4)"
-	@echo "  make train_test           Test all profiles (20 steps each)"
+	@echo "  make train                Full training with durable local report logs"
+	@echo "  make train_paper          3-stage paper curriculum: foundation, burst, polish"
+	@echo "  make train_profile profile=<name> CHECKPOINT=final"
+	@echo "  make train_test           Test all profiles ($(TRAIN_TEST_STEPS) steps each)"
 	@echo "  make resume               Resume training from checkpoint"
+	@echo "  Training log artifacts: training_files/training_logs/<run_id>/"
+	@echo "  TRAIN_STEPS=55000 TRAIN_INFLUX_DETAIL=minimal|off"
+	@echo "  TRAIN_LOG_FLUSH_EVERY=25 TRAIN_LOG_DIR=<optional-dir>"
+	@echo "  TRAIN_PROFILE_WEIGHTS=<profile:weight,...>"
+	@echo "  TRAIN_RESET_PROB_START=0.80 TRAIN_RESET_PROB_END=0.25"
+	@echo "  TRAIN_BASELINE_COOLDOWN=5 TRAIN_WARM_COOLDOWN=3"
+	@echo "  Paper plan defaults: $(TRAIN_FOUNDATION_STEPS)+$(TRAIN_BURST_STEPS)+$(TRAIN_POLISH_STEPS) steps"
 	@echo ""
 	@echo "Traffic Testing:"
 	@echo "  make test_traffic profile=<name>   Run specific profile indefinitely"
@@ -299,6 +400,7 @@ help:
 	@echo "    BENCH_PROFILES=light_2,medium_2,high_1"
 	@echo "    BENCH_REPETITIONS=6 STEPS=300 BENCH_COOLDOWN=30"
 	@echo "  make clean_bench           Remove benchmark_results/ and run logs"
+	@echo "  make clean_training_logs   Remove training_files/training_logs contents"
 	@echo ""
 	@echo "Monitoring:"
 	@echo "  make collect              Run INT collector"
@@ -317,8 +419,8 @@ help:
 	@echo "  make production profile=bursty_be_1"
 
 .PHONY: all validate rules run stop clean collect monitor visualize \
-        train train_test resume test test_best test_traffic \
+        train train_paper train_profile train_test resume test test_best test_traffic \
         traffic_stress_test traffic_stress_test_quick traffic_stress_test_custom \
         production production_best production_final production_75pct \
         rl_compare ecmp ecmp_plan ospf benchmark clean_bench clean-benchmark \
-        bench help
+        clean_training_logs clean-training-logs bench help

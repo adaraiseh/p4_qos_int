@@ -39,10 +39,17 @@ import argparse
 import math
 import glob
 import copy
+import csv
+import json
+import hashlib
+import platform
+import socket
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from collections import deque
-from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 
 import torch
@@ -300,9 +307,9 @@ class PrioritizedReplayBuffer:
         self.max_priority = 1.0
         self.epsilon = 1e-5
     
-    def push(self, state, action, reward, next_state, terminated):
+    def push(self, state, action, reward, next_state, terminated, next_valid_mask):
         """Add experience with max priority (ensures new samples get sampled)."""
-        data = (state, action, reward, next_state, terminated)
+        data = (state, action, reward, next_state, terminated, next_valid_mask)
         # Apply alpha once here (max_priority is raw, not exponentiated)
         priority = self.max_priority ** self.alpha
         self.tree.add(priority, data)
@@ -329,7 +336,15 @@ class PrioritizedReplayBuffer:
         weights = (self.tree.n_entries * sampling_probs) ** (-beta)
         weights /= weights.max()  # Normalize
         
-        states, actions, rewards, next_states, terminateds = zip(*samples)
+        if samples and len(samples[0]) == 6:
+            states, actions, rewards, next_states, terminateds, next_valid_masks = zip(*samples)
+        else:
+            # Backward compatibility for older checkpoints whose replay entries
+            # predate next-action-mask storage. These legacy samples keep the
+            # old unconstrained target behavior until naturally overwritten by
+            # new masked experiences.
+            states, actions, rewards, next_states, terminateds = zip(*samples)
+            next_valid_masks = [np.ones(ACTION_DIM, dtype=bool) for _ in samples]
         
         return (
             np.array(states),
@@ -337,6 +352,7 @@ class PrioritizedReplayBuffer:
             rewards,
             np.array(next_states),
             terminateds,
+            np.array(next_valid_masks, dtype=bool),
             indices,
             weights
         )
@@ -378,11 +394,13 @@ class MultiTopologyReplayBuffer:
             )
             log.info(f"Created replay buffer for topology: {topology_name}")
 
-    def push(self, state, action, reward, next_state, terminated):
+    def push(self, state, action, reward, next_state, terminated, next_valid_mask):
         """Add experience to current topology's buffer."""
         if self.current_topology is None:
             raise ValueError("Must call set_topology() before push()")
-        self.buffers[self.current_topology].push(state, action, reward, next_state, terminated)
+        self.buffers[self.current_topology].push(
+            state, action, reward, next_state, terminated, next_valid_mask
+        )
 
     def sample(self, batch_size: int, beta: float = 0.4, balance: bool = True):
         """
@@ -404,7 +422,7 @@ class MultiTopologyReplayBuffer:
         remainder = batch_size % n_topos
 
         all_states, all_actions, all_rewards = [], [], []
-        all_next_states, all_terminateds = [], []
+        all_next_states, all_terminateds, all_next_valid_masks = [], [], []
         all_indices, all_weights = [], []
 
         for i, (topo_name, buffer) in enumerate(self.buffers.items()):
@@ -413,7 +431,7 @@ class MultiTopologyReplayBuffer:
                 continue
 
             n_samples = samples_per_topo + (1 if i < remainder else 0)
-            (states, actions, rewards, next_states, terminateds,
+            (states, actions, rewards, next_states, terminateds, next_valid_masks,
              indices, weights) = buffer.sample(n_samples, beta)
 
             all_states.append(states)
@@ -421,6 +439,7 @@ class MultiTopologyReplayBuffer:
             all_rewards.extend(rewards)
             all_next_states.append(next_states)
             all_terminateds.extend(terminateds)
+            all_next_valid_masks.append(next_valid_masks)
             # Tag indices with topology for priority updates
             all_indices.extend([(topo_name, idx) for idx in indices])
             all_weights.extend(weights)
@@ -435,6 +454,7 @@ class MultiTopologyReplayBuffer:
             all_rewards,
             np.concatenate(all_next_states),
             all_terminateds,
+            np.concatenate(all_next_valid_masks),
             all_indices,  # Now tuples of (topology_name, index)
             np.array(all_weights)
         )
@@ -602,9 +622,14 @@ class DQNAgent:
         beta_progress = min(1.0, self.step_count / PER_BETA_STEPS)
         self.beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * beta_progress
     
-    def push_experience(self, state, action, reward, next_state, terminated):
+    def push_experience(self, state, action, reward, next_state, terminated, next_valid_mask):
         """Add experience to replay buffer."""
-        self.replay_buffer.push(state, action, reward, next_state, terminated)
+        if next_valid_mask is None:
+            next_valid_mask = np.zeros(self.action_dim, dtype=bool)
+            next_valid_mask[0] = True
+        self.replay_buffer.push(
+            state, action, reward, next_state, terminated, next_valid_mask
+        )
         self.rewards.append(reward)
     
     def train_step(self) -> Optional[float]:
@@ -620,11 +645,11 @@ class DQNAgent:
         # Sample from prioritized replay buffer (with optional balanced sampling)
         if self.multi_buffer:
             (states, actions, rewards, next_states, terminateds,
-             indices, weights) = self.replay_buffer.sample(
+             next_valid_masks, indices, weights) = self.replay_buffer.sample(
                  BATCH_SIZE, self.beta, balance=self.balanced_sampling)
         else:
             (states, actions, rewards, next_states, terminateds,
-             indices, weights) = self.replay_buffer.sample(BATCH_SIZE, self.beta)
+             next_valid_masks, indices, weights) = self.replay_buffer.sample(BATCH_SIZE, self.beta)
 
         # Convert to tensors
         states_t = torch.FloatTensor(states).to(self.device)
@@ -632,6 +657,7 @@ class DQNAgent:
         rewards_t = torch.FloatTensor(rewards).to(self.device)
         next_states_t = torch.FloatTensor(next_states).to(self.device)
         terminated_t = torch.BoolTensor(terminateds).to(self.device)
+        next_valid_masks_t = torch.BoolTensor(next_valid_masks).to(self.device)
         weights_t = torch.FloatTensor(weights).to(self.device)
 
         # Current Q values
@@ -639,7 +665,9 @@ class DQNAgent:
 
         # Double DQN: use online net to select actions, target net to evaluate
         with torch.no_grad():
-            next_actions = self.online_net(next_states_t).argmax(dim=1)
+            next_q_online = self.online_net(next_states_t)
+            next_q_online = next_q_online.masked_fill(~next_valid_masks_t, -1e9)
+            next_actions = next_q_online.argmax(dim=1)
             next_q = self.target_net(next_states_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             next_q[terminated_t] = 0.0  # Only zero bootstrap for true terminals, not truncations
             target_q = rewards_t + GAMMA * next_q
@@ -682,7 +710,7 @@ class DQNAgent:
     
     def save(self, path: str):
         """Save model checkpoint including replay buffer."""
-        torch.save({
+        checkpoint = {
             'online_net': self.online_net.state_dict(),
             'target_net': self.target_net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
@@ -690,13 +718,31 @@ class DQNAgent:
             'eps_step_count': self.eps_step_count,
             'eps': self.eps,
             'beta': self.beta,
+            'multi_buffer': self.multi_buffer,
+            'balanced_sampling': self.balanced_sampling,
+        }
+        if self.multi_buffer:
+            checkpoint['multi_replay_buffers'] = {
+                topo_name: {
+                    'tree': buf.tree.tree.copy(),
+                    'data': buf.tree.data.copy(),
+                    'write': buf.tree.write,
+                    'n_entries': buf.tree.n_entries,
+                    'max_priority': buf.max_priority,
+                }
+                for topo_name, buf in self.replay_buffer.buffers.items()
+            }
+            checkpoint['current_topology'] = self.replay_buffer.current_topology
+        else:
             # Replay buffer state for resume continuity
-            'replay_tree': self.replay_buffer.tree.tree.copy(),
-            'replay_data': self.replay_buffer.tree.data.copy(),
-            'replay_write': self.replay_buffer.tree.write,
-            'replay_n_entries': self.replay_buffer.tree.n_entries,
-            'replay_max_priority': self.replay_buffer.max_priority,
-        }, path)
+            checkpoint.update({
+                'replay_tree': self.replay_buffer.tree.tree.copy(),
+                'replay_data': self.replay_buffer.tree.data.copy(),
+                'replay_write': self.replay_buffer.tree.write,
+                'replay_n_entries': self.replay_buffer.tree.n_entries,
+                'replay_max_priority': self.replay_buffer.max_priority,
+            })
+        torch.save(checkpoint, path)
         log.info(f"Model saved to {path} (with replay buffer: {len(self.replay_buffer)} experiences)")
     
     def load(self, path: str):
@@ -711,13 +757,28 @@ class DQNAgent:
         self.beta = checkpoint.get('beta', PER_BETA_END)
         
         # Load replay buffer if available
-        if 'replay_tree' in checkpoint:
+        if self.multi_buffer and 'multi_replay_buffers' in checkpoint:
+            for topo_name, state in checkpoint['multi_replay_buffers'].items():
+                self.replay_buffer.set_topology(topo_name)
+                buf = self.replay_buffer.buffers[topo_name]
+                buf.tree.tree = state['tree']
+                buf.tree.data = state['data']
+                buf.tree.write = state['write']
+                buf.tree.n_entries = state['n_entries']
+                buf.max_priority = state['max_priority']
+            current_topology = checkpoint.get('current_topology')
+            if current_topology:
+                self.replay_buffer.set_topology(current_topology)
+            log.info(f"Loaded multi-topology replay buffer with {len(self.replay_buffer)} experiences")
+        elif 'replay_tree' in checkpoint and not self.multi_buffer:
             self.replay_buffer.tree.tree = checkpoint['replay_tree']
             self.replay_buffer.tree.data = checkpoint['replay_data']
             self.replay_buffer.tree.write = checkpoint['replay_write']
             self.replay_buffer.tree.n_entries = checkpoint['replay_n_entries']
             self.replay_buffer.max_priority = checkpoint['replay_max_priority']
             log.info(f"Loaded replay buffer with {len(self.replay_buffer)} experiences")
+        elif 'replay_tree' in checkpoint and self.multi_buffer:
+            log.warning("Checkpoint has single replay buffer but agent uses --multi-buffer; replay not loaded")
         else:
             log.info("No replay buffer in checkpoint, starting fresh")
         
@@ -874,7 +935,8 @@ class QoSRoutingEnv:
     def __init__(self, bucket: str, token: str, org: str, url: str,
                  verbose: bool = False, reset_network: bool = True,
                  production_mode: bool = False, topology_builder=None,
-                 rules_dir: str = None, config_path: str = None):
+                 rules_dir: str = None, config_path: str = None,
+                 traffic_seed: Optional[int] = None):
         self.bucket = bucket
         self.org = org
         self.url = url
@@ -918,6 +980,7 @@ class QoSRoutingEnv:
         self.sla_streak = 0
         self.last_action_time = 0.0
         self.last_action = 0
+        self._last_action_global_step = 0
         
         # Cache snapshots for comparison
         self.last_snapshot = None
@@ -940,12 +1003,16 @@ class QoSRoutingEnv:
         
         # Traffic manager for dynamic profile changes (training only)
         # In production_mode, traffic is managed externally by ProductionRunner
-        self.traffic_manager = TrafficManager(config_path=self._config_path) if (reset_network and not production_mode) else None
+        self.traffic_manager = (
+            TrafficManager(config_path=self._config_path, seed=traffic_seed)
+            if (reset_network and not production_mode) else None
+        )
         
         # Current traffic profile for logging
         self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", "bursty_be_1"
         self.current_traffic_category = ""  # "light", "medium", "high", "bursty"
         self.traffic_category_weights = None  # Optional: {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
+        self.traffic_profile_weights = None   # Optional: {'light_1': 1.0, 'bursty_vo_1': 2.0, ...}
         self.fixed_traffic_profile = None    # Optional: override to use specific profile for all episodes
 
         # CPU Optimization: Persistent ThreadPoolExecutor for parallel InfluxDB queries
@@ -1005,7 +1072,10 @@ class QoSRoutingEnv:
                 profile_info = self.traffic_manager.start_traffic(profile_name=self.fixed_traffic_profile)
             else:
                 log.info("Starting randomized traffic profile...")
-                profile_info = self.traffic_manager.start_traffic(category_weights=self.traffic_category_weights)
+                profile_info = self.traffic_manager.start_traffic(
+                    category_weights=self.traffic_category_weights,
+                    profile_weights=self.traffic_profile_weights,
+                )
             
             self.current_traffic_profile = profile_info['profile_name']
             self.current_traffic_category = profile_info['profile_category']
@@ -1025,14 +1095,24 @@ class QoSRoutingEnv:
             time.sleep(cooldown)
         log.info("Episode start complete")
         
+        preserve_action_history = (
+            not do_reset
+            and self.action_stack
+            and len(self.action_stack) == STACK_SIZE
+        )
+
         # Reset episode counters
         self.episode_step = 0
         self.sla_streak = 0
-        self.last_action = 0
-        self.last_action_time = time.monotonic()
-        self._last_action_step = 0  # For steps_since_action feature
+        if do_reset:
+            self.last_action = 0
+            self.last_action_time = time.monotonic()
+            self._last_action_global_step = self.global_step
+            self._last_action_step = 0  # legacy/debug compatibility
         
-        # Reset EMA state
+        # Reset EMA state for the new traffic profile; warm-starts preserve
+        # routing/action context, but not stale latency trends from a prior
+        # workload profile.
         self.lat_ema = {qid: 1.0 for qid in QIDS}
 
         # Collect initial snapshot (after reset if applicable). Some baseline
@@ -1049,8 +1129,15 @@ class QoSRoutingEnv:
         # Debug assertion to catch dimension mismatches early
         assert len(raw_state) == RAW_STATE_DIM, f"State dim mismatch: {len(raw_state)} != {RAW_STATE_DIM}"
         
-        # Initialize frame and action stacks for clean slate
-        self._init_stacks(raw_state)
+        if preserve_action_history:
+            # Warm-start: routing state persists, so keep recent action history
+            # while refreshing observation frames for the new traffic profile.
+            self.frame_stack.clear()
+            for _ in range(STACK_SIZE):
+                self.frame_stack.append(raw_state.copy())
+        else:
+            # Baseline reset or first episode: clean slate.
+            self._init_stacks(raw_state)
 
         return self._build_stacked_state()
 
@@ -1931,7 +2018,7 @@ class QoSRoutingEnv:
         
         # Steps since last action (normalized: 0=just acted, 1=10+ steps ago)
         # Helps agent learn to wait for effects before acting again
-        steps_since = self.episode_step - getattr(self, '_last_action_step', 0)
+        steps_since = self.global_step - getattr(self, '_last_action_global_step', 0)
         state[idx] = min(steps_since / 10.0, 1.0)  # Cap at 10 steps
         idx += 1
 
@@ -2291,6 +2378,7 @@ class QoSRoutingEnv:
         if action_applied:
             self.last_action_time = time.monotonic()
             self._last_action_step = self.episode_step  # For steps_since_action feature
+            self._last_action_global_step = self.global_step
         self.last_action = action
         
         # Wait for network to settle
@@ -2429,6 +2517,7 @@ class QoSRoutingEnv:
         info['action_applied'] = action_applied
         info['terminated'] = terminated
         info['truncated'] = truncated
+        info['pre_action_snapshot'] = current_snapshot
         if alt_name is not None:
             info['alt_used'] = alt_name  # String name for stdout/CSV
             info['alt_idx'] = alt_idx    # Numeric index for InfluxDB
@@ -2513,6 +2602,7 @@ class QoSRoutingEnv:
         
         # Build stacked state (464-dim)
         next_state = self._build_stacked_state()
+        info['next_valid_mask'] = self._get_valid_actions(next_snapshot)
         self.last_snapshot = next_snapshot
         
         return next_state, reward, terminated, truncated, info
@@ -2528,10 +2618,15 @@ class QoSRoutingEnv:
         Write training metrics to InfluxDB for Grafana monitoring.
         Measurement: rl_training
 
-        Minimal fields: step, episode, action, reward, eps, loss, q_max,
-        sla_met_count, data_valid, traffic_profile, queue_X_latency, queue_X_drops
+        Minimal progress-monitoring fields only. Detailed training/INT report
+        data is written to local durable artifacts instead of InfluxDB to keep
+        live database writes light.
         """
         try:
+            detail = getattr(self, "training_influx_detail", "minimal")
+            if detail == "off":
+                return
+
             p = (
                 Point("rl_training")
                 .field("step", int(step))
@@ -2540,23 +2635,16 @@ class QoSRoutingEnv:
                 .field("reward", float(reward))
                 .field("eps", float(agent_stats['eps']))
                 .field("loss", float(agent_stats['avg_loss']))
+                .field("buffer_size", int(agent_stats.get('buffer_size', 0)))
                 .field("sla_met_count", len(info.get('sla_met', [])))
                 .field("data_valid", int(info.get('data_valid', False)))
                 .time(datetime.utcnow())
             )
 
-            # Q-value stats from agent (only q_max)
             if 'q_max' in agent_stats:
                 p = p.field("q_max", float(agent_stats['q_max']))
-
-            # Per-queue latencies and drops
-            per_queue = info.get('per_queue', {})
-            for qid in QIDS:
-                if qid in per_queue:
-                    q_lat = per_queue[qid].get('lat', 0.0)
-                    q_drop = per_queue[qid].get('drop', 0.0)
-                    p = p.field(f"queue_{qid}_latency", float(q_lat))
-                    p = p.field(f"queue_{qid}_drops", float(q_drop))
+            if agent_stats.get('last_loss') is not None:
+                p = p.field("last_loss", float(agent_stats['last_loss']))
 
             # Traffic profile
             if info.get('traffic_profile'):
@@ -2574,6 +2662,8 @@ class QoSRoutingEnv:
         Minimal fields: episode, episode_reward, reward_rolling_avg, traffic_profile
         """
         try:
+            if getattr(self, "training_influx_detail", "minimal") == "off":
+                return
             p = (
                 Point("rl_training")
                 .field("episode", int(episode))
@@ -2616,6 +2706,629 @@ class QoSRoutingEnv:
             log.info("InfluxDB connections closed")
         except Exception as e:
             log.warning(f"Error closing InfluxDB: {e}")
+
+
+# =============================================================================
+#                         DURABLE TRAINING ARTIFACTS
+# =============================================================================
+def _json_safe(value: Any) -> Any:
+    """Convert numpy/torch/path/container values into JSON-safe objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return str(value)
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, deque)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _file_sha256(path: str) -> Optional[str]:
+    """Return SHA256 for a file if it exists."""
+    if not path or not os.path.exists(path) or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_metadata() -> Dict[str, Any]:
+    """Collect best-effort git metadata for reproducible training reports."""
+    def run_git(args: List[str]) -> Optional[str]:
+        try:
+            return subprocess.check_output(
+                ["git", *args],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).strip()
+        except Exception:
+            return None
+
+    return {
+        "commit": run_git(["rev-parse", "HEAD"]),
+        "branch": run_git(["branch", "--show-current"]),
+        "status_short": run_git(["status", "--short"]),
+        "remote_origin": run_git(["remote", "get-url", "origin"]),
+    }
+
+
+def _sanitized_args(args: argparse.Namespace) -> Dict[str, Any]:
+    """Return CLI args safe for durable metadata without secrets."""
+    safe = dict(vars(args))
+    for key in ("influx_token",):
+        if key in safe:
+            safe[key] = "<set>" if safe[key] else None
+    return safe
+
+
+def _replay_write_position(replay_buffer) -> Optional[int]:
+    """Return replay write pointer for single-buffer replay, if available."""
+    tree = getattr(replay_buffer, "tree", None)
+    return getattr(tree, "write", None)
+
+
+def _replay_max_priority(replay_buffer) -> Optional[float]:
+    """Return max replay priority across supported replay-buffer types."""
+    if hasattr(replay_buffer, "max_priority"):
+        return getattr(replay_buffer, "max_priority")
+    buffers = getattr(replay_buffer, "buffers", None)
+    if buffers:
+        return max(
+            (getattr(buf, "max_priority", 0.0) for buf in buffers.values()),
+            default=None,
+        )
+    return None
+
+
+class TrainingArtifactLogger:
+    """Persist enough training data to rebuild a full report without InfluxDB.
+
+    Files written under ``training_files/training_logs/<run_id>/``:
+      - metadata.json: command, args, topology, git/source hashes, checkpoints.
+      - step_metrics.csv: flat per-step training and INT-derived metrics.
+      - int_snapshots.jsonl: full pre/post INT snapshot context per step.
+      - episode_metrics.csv: per-episode reward/profile summaries.
+      - checkpoints.csv: every checkpoint/sidecar path and agent state.
+    """
+
+    STEP_FIELDS = [
+        "timestamp_utc", "run_id", "total_step", "agent_step_count",
+        "eps_step_count", "episode", "episode_step", "reset_type",
+        "reset_prob", "traffic_profile", "traffic_category", "stage_high",
+        "profile_step_offset", "load_q0_mbps", "load_q1_mbps",
+        "load_q7_mbps", "action", "action_name", "reward", "raw_reward",
+        "eps", "beta", "avg_loss", "last_loss", "q_max", "buffer_size",
+        "sla_met_count", "sla_violated_count", "sla_streak",
+        "all_sla_met", "pressure", "data_valid", "valid_count",
+        "invalid_queues", "action_applied", "action_cost",
+        "action_cost_applied", "targeted_qid", "alt_used", "alt_idx",
+        "multi_reroute_count", "terminated", "truncated",
+    ] + [
+        field
+        for qid in QIDS
+        for field in (
+            f"q{qid}_latency_ms", f"q{qid}_drop_p95",
+            f"q{qid}_util_pct", f"q{qid}_sla_ratio",
+            f"q{qid}_reward_component", f"q{qid}_drop_penalty",
+            f"q{qid}_data_valid", f"q{qid}_recovered_via_retry",
+            f"q{qid}_hot_src_ip", f"q{qid}_hot_dst_ip",
+            f"q{qid}_bottleneck_sid", f"q{qid}_bottleneck_score",
+            f"q{qid}_bottleneck_drop", f"q{qid}_bottleneck_lat",
+            f"q{qid}_bottleneck_util", f"q{qid}_bottleneck_role",
+            f"q{qid}_alternatives_count",
+        )
+    ]
+
+    EPISODE_FIELDS = [
+        "timestamp_utc", "run_id", "episode", "reset_type", "reset_prob",
+        "start_total_step", "end_total_step", "episode_steps",
+        "episode_reward", "rolling_avg_100", "traffic_profile",
+        "traffic_category", "valid_learning_steps", "invalid_steps",
+        "best_avg_reward",
+    ]
+
+    CHECKPOINT_FIELDS = [
+        "timestamp_utc", "run_id", "tag", "kind", "checkpoint_path",
+        "metadata_path", "sha256", "total_step", "episode",
+        "agent_step_count", "eps_step_count", "eps", "beta",
+        "replay_entries", "replay_write", "best_avg_reward",
+        "rolling_avg_100",
+    ]
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        run_id: str,
+        topology_builder=None,
+        rules_dir: Optional[str] = None,
+        buffer_capacity: Optional[int] = None,
+        lr: Optional[float] = None,
+    ):
+        self.args = args
+        self.run_id = run_id
+        base_dir = Path(args.training_log_dir) if args.training_log_dir else (
+            Path(args.save_dir) / "training_logs"
+        )
+        self.run_dir = base_dir / run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.flush_every = max(
+            1, int(getattr(args, "training_log_flush_every", 25) or 25)
+        )
+        self.snapshot_every = 1
+        self.step_path = self.run_dir / "step_metrics.csv"
+        self.snapshot_path = self.run_dir / "int_snapshots.jsonl"
+        self.episode_path = self.run_dir / "episode_metrics.csv"
+        self.checkpoint_path = self.run_dir / "checkpoints.csv"
+        self.metadata_path = self.run_dir / "metadata.json"
+        self.started_at_utc = datetime.utcnow().isoformat() + "Z"
+        self.checkpoints: List[Dict[str, Any]] = []
+        self._rows_since_flush = 0
+        self.closed = False
+
+        self._step_file = self.step_path.open("w", newline="", buffering=1024 * 1024)
+        self._step_writer = csv.DictWriter(
+            self._step_file, fieldnames=self.STEP_FIELDS
+        )
+        self._step_writer.writeheader()
+
+        self._episode_file = self.episode_path.open("w", newline="", buffering=256 * 1024)
+        self._episode_writer = csv.DictWriter(
+            self._episode_file, fieldnames=self.EPISODE_FIELDS
+        )
+        self._episode_writer.writeheader()
+
+        self._checkpoint_file = self.checkpoint_path.open("w", newline="", buffering=64 * 1024)
+        self._checkpoint_writer = csv.DictWriter(
+            self._checkpoint_file, fieldnames=self.CHECKPOINT_FIELDS
+        )
+        self._checkpoint_writer.writeheader()
+
+        self._snapshot_file = self.snapshot_path.open("w", buffering=1024 * 1024)
+
+        self.metadata: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "started_at_utc": self.started_at_utc,
+            "run_dir": str(self.run_dir),
+            "command": " ".join(sys.argv),
+            "argv": sys.argv,
+            "args": _sanitized_args(args),
+            "host": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": sys.version,
+            "git": _git_metadata(),
+            "topology": {
+                "config_path": args.config,
+                "rules_dir": str(rules_dir) if rules_dir else None,
+                "name": (
+                    topology_builder.config.topology.name
+                    if topology_builder and getattr(topology_builder, "config", None)
+                    else None
+                ),
+            },
+            "influxdb": {
+                "url": args.influx_url,
+                "org": args.influx_org,
+                "bucket": args.influx_bucket,
+                "token_recorded": bool(args.influx_token),
+            },
+            "source_hashes": {
+                path: _file_sha256(path)
+                for path in (
+                    "rl_agent_4.py", "traffic_generator.py", "controller.py",
+                    "network.py", "logging_config.py", args.config,
+                )
+                if path
+            },
+            "hyperparameters": {
+                "learning_rate": lr,
+                "gamma": GAMMA,
+                "batch_size": BATCH_SIZE,
+                "replay_capacity": buffer_capacity,
+                "min_replay_size": MIN_REPLAY_SIZE,
+                "epsilon_start": EPS_START,
+                "epsilon_end": EPS_END,
+                "epsilon_decay_steps": EPS_DECAY_STEPS,
+                "per_alpha": PER_ALPHA,
+                "per_beta_start": PER_BETA_START,
+                "per_beta_end": PER_BETA_END,
+                "per_beta_steps": PER_BETA_STEPS,
+                "target_update_freq": TARGET_UPDATE_FREQ,
+                "window_seconds": WINDOW_SECONDS,
+                "delay_after_action": DELAY_AFTER_ACTION,
+                "delay_no_action": DELAY_NO_ACTION,
+                "cooldown_seconds": COOLDOWN_SECONDS,
+                "sla_thresholds": SLA_THRESHOLDS,
+                "qids": QIDS,
+                "action_names": {idx: action_to_name(idx) for idx in range(ACTION_DIM)},
+                "reward": {
+                    "sla_met_scale": REWARD_SLA_MET_SCALE,
+                    "sla_violated_scale": REWARD_SLA_VIOLATED_SCALE,
+                    "drop_penalty": REWARD_DROP_PENALTY,
+                    "action_cost_healthy": REWARD_ACTION_COST_HEALTHY,
+                    "action_cost_sick": REWARD_ACTION_COST_SICK,
+                    "sla_margin_low": SLA_MARGIN_LOW,
+                    "sla_margin_high": SLA_MARGIN_HIGH,
+                },
+            },
+            "traffic": {
+                "weights_raw": args.traffic_weights,
+                "profile_weights_raw": args.traffic_profile_weights,
+                "fixed_profile": args.traffic_profile,
+                "seed": args.seed,
+            },
+            "artifacts": {
+                "step_metrics_csv": str(self.step_path),
+                "int_snapshots_jsonl": str(self.snapshot_path),
+                "episode_metrics_csv": str(self.episode_path),
+                "checkpoints_csv": str(self.checkpoint_path),
+            },
+            "logging_policy": {
+                "local_artifacts": "single durable run directory; no extra Influx stream",
+                "flush_every_steps": self.flush_every,
+                "int_snapshot_every_steps": 1,
+                "influx_detail": getattr(args, "training_influx_detail", "minimal"),
+                "checkpoint_sidecars": "one metadata JSON beside each checkpoint",
+            },
+            "checkpoints": self.checkpoints,
+        }
+        self._write_json(self.metadata_path, self.metadata)
+        (self.run_dir / "command.txt").write_text(self.metadata["command"] + "\n")
+        log.info(f"Training artifacts will be written to {self.run_dir}")
+
+    @staticmethod
+    def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+        path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True))
+
+    def _flush_if_needed(self, *, force: bool = False) -> None:
+        if not force and self._rows_since_flush < self.flush_every:
+            return
+        for fh in (self._step_file, self._snapshot_file):
+            try:
+                fh.flush()
+            except Exception:
+                pass
+        self._rows_since_flush = 0
+
+    @staticmethod
+    def _snapshot_summary(snapshot: Optional[Dict[int, Dict]]) -> Dict[str, Dict]:
+        if not snapshot:
+            return {}
+        out: Dict[str, Dict] = {}
+        for qid in QIDS:
+            q = snapshot.get(qid, {})
+            out[str(qid)] = {
+                key: q.get(key)
+                for key in (
+                    "lat_p95", "drop_p95", "util_p95", "data_valid",
+                    "recovered_via_retry", "hot_src_ip", "hot_dst_ip",
+                    "path_nodes", "bottleneck_sid", "bottleneck_score",
+                    "bottleneck_drop", "bottleneck_lat", "bottleneck_util",
+                    "bottleneck_role", "alternatives", "alt_exists",
+                    "lat_ema", "lat_ema_diff", "transitioning",
+                )
+            }
+        return out
+
+    def _traffic_state(self, env: QoSRoutingEnv) -> Dict[str, Any]:
+        tm = getattr(env, "traffic_manager", None)
+        if tm is None:
+            return {}
+        return {
+            "profile": getattr(tm, "current_profile_name", ""),
+            "category": getattr(tm, "current_profile_category", ""),
+            "current_load": getattr(tm, "current_load", {}),
+            "source_load": getattr(tm, "_source_load", {}),
+            "stage_high": getattr(tm, "_shaped_stage_high", None),
+            "profile_step_offset": getattr(tm, "_profile_step_offset", None),
+        }
+
+    def log_step(
+        self,
+        *,
+        total_step: int,
+        episode: int,
+        reset_type: str,
+        reset_prob: float,
+        agent: DQNAgent,
+        agent_stats: Dict[str, Any],
+        env: QoSRoutingEnv,
+        action: int,
+        reward: float,
+        info: Dict[str, Any],
+        valid_mask: np.ndarray,
+        loss: Optional[float],
+    ) -> None:
+        traffic = self._traffic_state(env)
+        loads = traffic.get("current_load", {})
+        post_snapshot = getattr(env, "last_snapshot", {})
+        per_queue = info.get("per_queue", {})
+        row: Dict[str, Any] = {
+            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "run_id": self.run_id,
+            "total_step": total_step,
+            "agent_step_count": agent.step_count,
+            "eps_step_count": agent.eps_step_count,
+            "episode": episode,
+            "episode_step": info.get("episode_step"),
+            "reset_type": reset_type,
+            "reset_prob": reset_prob,
+            "traffic_profile": traffic.get("profile") or info.get("traffic_profile", ""),
+            "traffic_category": traffic.get("category", ""),
+            "stage_high": traffic.get("stage_high"),
+            "profile_step_offset": traffic.get("profile_step_offset"),
+            "load_q0_mbps": loads.get(0, 0.0),
+            "load_q1_mbps": loads.get(1, 0.0),
+            "load_q7_mbps": loads.get(7, 0.0),
+            "action": action,
+            "action_name": action_to_name(action),
+            "reward": reward,
+            "raw_reward": info.get("raw_reward", reward),
+            "eps": agent_stats.get("eps"),
+            "beta": agent.beta,
+            "avg_loss": agent_stats.get("avg_loss"),
+            "last_loss": agent_stats.get("last_loss") if agent_stats.get("last_loss") is not None else "",
+            "q_max": agent_stats.get("q_max"),
+            "buffer_size": agent_stats.get("buffer_size"),
+            "sla_met_count": len(info.get("sla_met", [])),
+            "sla_violated_count": len(info.get("sla_violated", [])),
+            "sla_streak": info.get("sla_streak"),
+            "all_sla_met": info.get("all_sla_met"),
+            "pressure": info.get("pressure"),
+            "data_valid": info.get("data_valid"),
+            "valid_count": info.get("valid_count"),
+            "invalid_queues": json.dumps(_json_safe(info.get("invalid_queues", []))),
+            "action_applied": info.get("action_applied"),
+            "action_cost": info.get("action_cost"),
+            "action_cost_applied": info.get("action_cost_applied"),
+            "targeted_qid": info.get("targeted_qid", ""),
+            "alt_used": info.get("alt_used", ""),
+            "alt_idx": info.get("alt_idx", ""),
+            "multi_reroute_count": info.get("multi_reroute_count", 0),
+            "terminated": info.get("terminated"),
+            "truncated": info.get("truncated"),
+        }
+        for qid in QIDS:
+            q = post_snapshot.get(qid, {}) if post_snapshot else {}
+            pq = per_queue.get(qid, {})
+            row.update({
+                f"q{qid}_latency_ms": q.get("lat_p95", pq.get("lat")),
+                f"q{qid}_drop_p95": q.get("drop_p95", pq.get("drop")),
+                f"q{qid}_util_pct": q.get("util_p95", pq.get("util")),
+                f"q{qid}_sla_ratio": pq.get("ratio"),
+                f"q{qid}_reward_component": pq.get("component"),
+                f"q{qid}_drop_penalty": pq.get("drop_penalty"),
+                f"q{qid}_data_valid": q.get("data_valid"),
+                f"q{qid}_recovered_via_retry": q.get("recovered_via_retry"),
+                f"q{qid}_hot_src_ip": q.get("hot_src_ip"),
+                f"q{qid}_hot_dst_ip": q.get("hot_dst_ip"),
+                f"q{qid}_bottleneck_sid": q.get("bottleneck_sid"),
+                f"q{qid}_bottleneck_score": q.get("bottleneck_score"),
+                f"q{qid}_bottleneck_drop": q.get("bottleneck_drop"),
+                f"q{qid}_bottleneck_lat": q.get("bottleneck_lat"),
+                f"q{qid}_bottleneck_util": q.get("bottleneck_util"),
+                f"q{qid}_bottleneck_role": q.get("bottleneck_role"),
+                f"q{qid}_alternatives_count": len(q.get("alternatives", []) or []),
+            })
+        self._step_writer.writerow({
+            k: _json_safe(row.get(k, "")) for k in self.STEP_FIELDS
+        })
+        self._rows_since_flush += 1
+
+        snapshot_record = {
+            "timestamp_utc": row["timestamp_utc"],
+            "run_id": self.run_id,
+            "total_step": total_step,
+            "episode": episode,
+            "episode_step": info.get("episode_step"),
+            "traffic": traffic,
+            "action": {
+                "index": action,
+                "name": action_to_name(action),
+                "valid_mask": [bool(x) for x in valid_mask.tolist()],
+                "applied": info.get("action_applied"),
+                "alt_used": info.get("alt_used"),
+                "alt_idx": info.get("alt_idx"),
+                "targeted_qid": info.get("targeted_qid"),
+            },
+            "reward": {
+                "reward": reward,
+                "raw_reward": info.get("raw_reward", reward),
+                "pressure": info.get("pressure"),
+                "sla_met": info.get("sla_met", []),
+                "sla_violated": info.get("sla_violated", []),
+                "per_queue": info.get("per_queue", {}),
+            },
+            "agent": {
+                "eps": agent.eps,
+                "beta": agent.beta,
+                "step_count": agent.step_count,
+                "eps_step_count": agent.eps_step_count,
+                "buffer_size": len(agent.replay_buffer),
+                "loss": loss,
+                "stats": agent_stats,
+            },
+            "data_valid": info.get("data_valid"),
+            "valid_count": info.get("valid_count"),
+            "invalid_queues": info.get("invalid_queues", []),
+            "pre_action_snapshot": self._snapshot_summary(
+                info.get("pre_action_snapshot")
+            ),
+            "post_action_snapshot": self._snapshot_summary(post_snapshot),
+        }
+        self._snapshot_file.write(
+            json.dumps(_json_safe(snapshot_record), separators=(",", ":")) + "\n"
+        )
+
+        self._flush_if_needed()
+
+    def log_episode(
+        self,
+        *,
+        episode: int,
+        reset_type: str,
+        reset_prob: float,
+        start_total_step: int,
+        end_total_step: int,
+        episode_steps: int,
+        episode_reward: float,
+        rolling_avg_100: float,
+        env: QoSRoutingEnv,
+        valid_learning_steps: int,
+        invalid_steps: int,
+        best_avg_reward: float,
+    ) -> None:
+        row = {
+            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "run_id": self.run_id,
+            "episode": episode,
+            "reset_type": reset_type,
+            "reset_prob": reset_prob,
+            "start_total_step": start_total_step,
+            "end_total_step": end_total_step,
+            "episode_steps": episode_steps,
+            "episode_reward": episode_reward,
+            "rolling_avg_100": rolling_avg_100,
+            "traffic_profile": getattr(env, "current_traffic_profile", ""),
+            "traffic_category": getattr(env, "current_traffic_category", ""),
+            "valid_learning_steps": valid_learning_steps,
+            "invalid_steps": invalid_steps,
+            "best_avg_reward": best_avg_reward,
+        }
+        self._episode_writer.writerow({k: _json_safe(row.get(k, "")) for k in self.EPISODE_FIELDS})
+        self._episode_file.flush()
+        self._flush_if_needed(force=True)
+
+    def log_checkpoint(
+        self,
+        *,
+        tag: str,
+        kind: str,
+        checkpoint_path: str,
+        total_step: int,
+        episode: int,
+        agent: DQNAgent,
+        best_avg_reward: float,
+        rolling_avg_100: Optional[float],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        metadata_path = f"{checkpoint_path}.metadata.json"
+        payload = {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "tag": tag,
+            "kind": kind,
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_sha256": _file_sha256(checkpoint_path),
+            "created_at_utc": datetime.utcnow().isoformat() + "Z",
+            "total_step": total_step,
+            "episode": episode,
+            "agent": {
+                "step_count": agent.step_count,
+                "eps_step_count": agent.eps_step_count,
+                "eps": agent.eps,
+                "beta": agent.beta,
+                "replay_entries": len(agent.replay_buffer),
+                "replay_write": _replay_write_position(agent.replay_buffer),
+                "replay_max_priority": _replay_max_priority(agent.replay_buffer),
+            },
+            "training": {
+                "best_avg_reward": best_avg_reward,
+                "rolling_avg_100": rolling_avg_100,
+                "run_metadata_path": str(self.metadata_path),
+                "run_dir": str(self.run_dir),
+            },
+            "extra": extra or {},
+        }
+        self._write_json(Path(metadata_path), payload)
+        row = {
+            "timestamp_utc": payload["created_at_utc"],
+            "run_id": self.run_id,
+            "tag": tag,
+            "kind": kind,
+            "checkpoint_path": checkpoint_path,
+            "metadata_path": metadata_path,
+            "sha256": payload["checkpoint_sha256"],
+            "total_step": total_step,
+            "episode": episode,
+            "agent_step_count": agent.step_count,
+            "eps_step_count": agent.eps_step_count,
+            "eps": agent.eps,
+            "beta": agent.beta,
+            "replay_entries": len(agent.replay_buffer),
+            "replay_write": _replay_write_position(agent.replay_buffer),
+            "best_avg_reward": best_avg_reward,
+            "rolling_avg_100": rolling_avg_100,
+        }
+        self._checkpoint_writer.writerow({k: _json_safe(row.get(k, "")) for k in self.CHECKPOINT_FIELDS})
+        self._checkpoint_file.flush()
+        self.checkpoints.append({
+            "tag": tag,
+            "kind": kind,
+            "checkpoint_path": checkpoint_path,
+            "metadata_path": metadata_path,
+            "checkpoint_sha256": payload["checkpoint_sha256"],
+            "created_at_utc": payload["created_at_utc"],
+            "total_step": total_step,
+            "episode": episode,
+            "agent_step_count": agent.step_count,
+        })
+        self.metadata["checkpoints"] = self.checkpoints
+        self._write_json(self.metadata_path, self.metadata)
+        self._flush_if_needed(force=True)
+
+    def finalize(
+        self,
+        *,
+        interrupted: bool,
+        agent: Optional[DQNAgent] = None,
+        total_steps: Optional[int] = None,
+        episodes: Optional[int] = None,
+        best_avg_reward: Optional[float] = None,
+        final_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.closed:
+            return
+        self.metadata.update({
+            "finished_at_utc": datetime.utcnow().isoformat() + "Z",
+            "interrupted": interrupted,
+            "total_environment_steps": total_steps,
+            "episodes": episodes,
+            "best_avg_reward": best_avg_reward,
+            "final_stats": final_stats,
+        })
+        if agent is not None:
+            self.metadata["final_agent_state"] = {
+                "step_count": agent.step_count,
+                "eps_step_count": agent.eps_step_count,
+                "eps": agent.eps,
+                "beta": agent.beta,
+                "replay_entries": len(agent.replay_buffer),
+                "replay_write": _replay_write_position(agent.replay_buffer),
+            }
+        self._write_json(self.metadata_path, self.metadata)
+        self._flush_if_needed(force=True)
+        for fh in (
+            self._step_file, self._episode_file,
+            self._checkpoint_file, self._snapshot_file,
+        ):
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self.closed = True
 
 
 # =============================================================================
@@ -2674,8 +3387,10 @@ def train(args):
         args.influx_org, args.influx_url,
         topology_builder=topology_builder,
         rules_dir=rules_dir,
-        config_path=args.config
+        config_path=args.config,
+        traffic_seed=args.seed,
     )
+    env.training_influx_detail = args.training_influx_detail
     agent = DQNAgent(
         STATE_DIM, ACTION_DIM, device,
         lr=lr,
@@ -2745,11 +3460,42 @@ def train(args):
             category_weights[k.strip()] = float(v.strip())
         env.traffic_category_weights = category_weights
         log.info(f"Using traffic weights: {category_weights}")
+
+    profile_weights = None
+    if args.traffic_profile_weights:
+        profile_weights = {}
+        for item in args.traffic_profile_weights.split(','):
+            k, v = item.split(':')
+            profile = k.strip()
+            if profile not in TrafficManager.TRAFFIC_PROFILES:
+                raise ValueError(
+                    f"Unknown traffic profile {profile!r}; valid profiles: "
+                    f"{', '.join(TrafficManager.TRAFFIC_PROFILES)}"
+                )
+            profile_weights[profile] = float(v.strip())
+        env.traffic_profile_weights = profile_weights
+        if category_weights:
+            log.warning(
+                "--traffic-profile-weights overrides --traffic-weights for randomized training"
+            )
+        log.info(f"Using traffic profile weights: {profile_weights}")
     
     # Parse fixed traffic profile if specified (overrides weights)
     if args.traffic_profile:
         env.fixed_traffic_profile = args.traffic_profile
         log.info(f"Using FIXED traffic profile: {args.traffic_profile}")
+
+    # Durable training artifacts for post-hoc reporting even if terminal logs
+    # or InfluxDB retention are lost.
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    artifact_logger = TrainingArtifactLogger(
+        args,
+        run_id=run_id,
+        topology_builder=topology_builder,
+        rules_dir=rules_dir,
+        buffer_capacity=buffer_capacity,
+        lr=lr,
+    )
     
     # Training state
     total_steps = 0
@@ -2763,7 +3509,6 @@ def train(args):
         int(args.steps * 0.25): '25pct',
         int(args.steps * 0.50): '50pct',
         int(args.steps * 0.75): '75pct',
-        args.steps: 'final',
     }
 
     try:
@@ -2779,12 +3524,23 @@ def train(args):
                 reset_prob = 1.0
             else:
                 progress = total_steps / args.steps
-                reset_prob = 0.9 - 0.6 * progress  # 0.9 → 0.3 over training
+                reset_prob = (
+                    args.reset_prob_start
+                    + (args.reset_prob_end - args.reset_prob_start) * progress
+                )
+                reset_prob = max(0.0, min(1.0, reset_prob))
                 do_reset = random.random() < reset_prob
             
-            state = env.reset(force_reset=do_reset)
+            cooldown = (
+                args.baseline_cooldown_seconds
+                if do_reset else args.warm_cooldown_seconds
+            )
+            state = env.reset(force_reset=do_reset, cooldown_seconds=cooldown)
             episode_reward = 0.0
             episode_steps = 0
+            episode_start_step = total_steps
+            episode_valid_learning_steps = 0
+            episode_invalid_steps = 0
             done = False
             
             reset_type = "BASELINE" if do_reset else "WARM"
@@ -2808,9 +3564,18 @@ def train(args):
                 # Invalid data (fallback values: 2x SLA, DROP_CAP, UTIL_CAP) would poison the replay buffer
                 # CRITICAL: Store 'terminated' not 'done' - truncation should still bootstrap!
                 if info.get('data_valid', False):
-                    agent.push_experience(state, action, reward, next_state, terminated)
+                    agent.push_experience(
+                        state,
+                        action,
+                        reward,
+                        next_state,
+                        terminated,
+                        info.get('next_valid_mask'),
+                    )
                     agent.update_epsilon()
+                    episode_valid_learning_steps += 1
                 else:
+                    episode_invalid_steps += 1
                     log.debug(f"[Step {total_steps}] Skipping experience storage - invalid telemetry")
                 
                 # Always try to train from existing valid experiences in the buffer
@@ -2837,7 +3602,21 @@ def train(args):
                 
                 # Write metrics to InfluxDB
                 info['traffic_profile'] = env.current_traffic_profile
-                env.write_training_metrics(total_steps, stats, reward, action, info)
+                env.write_training_metrics(total_steps, stats, reward, action, info, episode=episode)
+                artifact_logger.log_step(
+                    total_step=total_steps,
+                    episode=episode,
+                    reset_type=reset_type,
+                    reset_prob=reset_prob,
+                    agent=agent,
+                    agent_stats=stats,
+                    env=env,
+                    action=action,
+                    reward=reward,
+                    info=info,
+                    valid_mask=valid_mask,
+                    loss=loss,
+                )
 
                 # Save checkpoints
                 if total_steps in checkpoint_steps:
@@ -2845,6 +3624,19 @@ def train(args):
                     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                     path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_{tag}.pth")
                     agent.save(path)
+                    artifact_logger.log_checkpoint(
+                        tag=tag,
+                        kind="scheduled",
+                        checkpoint_path=path,
+                        total_step=total_steps,
+                        episode=episode,
+                        agent=agent,
+                        best_avg_reward=best_avg_reward,
+                        rolling_avg_100=(
+                            sum(episode_rewards) / len(episode_rewards)
+                            if episode_rewards else None
+                        ),
+                    )
                     log.info(f"Checkpoint saved: {path}")
             
             # Episode summary - compute episode reward (avg reward per step)
@@ -2865,6 +3657,20 @@ def train(args):
             env.write_episode_metrics(
                 episode, ep_reward, rolling_100, env.current_traffic_profile
             )
+            artifact_logger.log_episode(
+                episode=episode,
+                reset_type=reset_type,
+                reset_prob=reset_prob,
+                start_total_step=episode_start_step,
+                end_total_step=total_steps,
+                episode_steps=episode_steps,
+                episode_reward=ep_reward,
+                rolling_avg_100=rolling_100,
+                env=env,
+                valid_learning_steps=episode_valid_learning_steps,
+                invalid_steps=episode_invalid_steps,
+                best_avg_reward=best_avg_reward,
+            )
             
             # Track best model (based on rolling 100-episode average)
             if rolling_100 > best_avg_reward and len(episode_rewards) >= 50:
@@ -2877,6 +3683,16 @@ def train(args):
 
                 # Save new checkpoint first
                 agent.save(new_path)
+                artifact_logger.log_checkpoint(
+                    tag="best",
+                    kind="best",
+                    checkpoint_path=new_path,
+                    total_step=total_steps,
+                    episode=episode,
+                    agent=agent,
+                    best_avg_reward=best_avg_reward,
+                    rolling_avg_100=rolling_100,
+                )
                 log.info(f"New best model saved: rolling_avg_100={best_avg_reward:.3f}")
 
                 # Delete previous best checkpoint(s) after successful save
@@ -2884,6 +3700,10 @@ def train(args):
                     try:
                         os.remove(old_path)
                         log.info(f"Deleted old best checkpoint: {old_path}")
+                        old_meta = f"{old_path}.metadata.json"
+                        if os.path.exists(old_meta):
+                            os.remove(old_meta)
+                            log.info(f"Deleted old best metadata: {old_meta}")
                     except OSError as e:
                         log.warning(f"Failed to delete old checkpoint {old_path}: {e}")
     
@@ -2896,14 +3716,49 @@ def train(args):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_final.pth")
         agent.save(path)
+        artifact_logger.log_checkpoint(
+            tag="final",
+            kind="final",
+            checkpoint_path=path,
+            total_step=total_steps,
+            episode=episode,
+            agent=agent,
+            best_avg_reward=best_avg_reward,
+            rolling_avg_100=(
+                sum(episode_rewards) / len(episode_rewards)
+                if episode_rewards else None
+            ),
+        )
 
         # Compute and save EWC Fisher matrix if requested (for next topology)
         if args.compute_ewc and not interrupted:
             ewc_path = os.path.join(args.save_dir, f"{timestamp}-ewc.pth")
             log.info("Computing EWC Fisher matrix for next topology...")
             agent.save_ewc(ewc_path, env, EWC_FISHER_SAMPLES)
+            artifact_logger.log_checkpoint(
+                tag="ewc",
+                kind="ewc",
+                checkpoint_path=ewc_path,
+                total_step=total_steps,
+                episode=episode,
+                agent=agent,
+                best_avg_reward=best_avg_reward,
+                rolling_avg_100=(
+                    sum(episode_rewards) / len(episode_rewards)
+                    if episode_rewards else None
+                ),
+                extra={"fisher_samples": EWC_FISHER_SAMPLES},
+            )
 
         env.close()
+        artifact_logger.finalize(
+            interrupted=interrupted,
+            agent=agent,
+            total_steps=total_steps,
+            episodes=episode,
+            best_avg_reward=best_avg_reward,
+            final_stats=agent.get_stats(),
+        )
 
     log.info("\nTraining complete!")
     log.info(f"Final stats: {agent.get_stats()}")
@@ -2931,7 +3786,8 @@ def evaluate(args):
         verbose=args.verbose,
         topology_builder=topology_builder,
         rules_dir=rules_dir,
-        config_path=args.config
+        config_path=args.config,
+        traffic_seed=args.seed,
     )
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
 
@@ -3005,10 +3861,34 @@ def main():
                         help='Random seed')
     parser.add_argument('--log-every', type=int, default=10,
                         help='Log frequency')
+    parser.add_argument('--reset-prob-start', type=float, default=0.9,
+                        help='Probability of baseline reset at the beginning '
+                             'of training (default: 0.9)')
+    parser.add_argument('--reset-prob-end', type=float, default=0.3,
+                        help='Probability of baseline reset near the end of '
+                             'training (default: 0.3)')
+    parser.add_argument('--baseline-cooldown-seconds', type=float, default=5.0,
+                        help='Traffic warmup/cooldown before measured steps '
+                             'after a baseline reset (default: 5.0)')
+    parser.add_argument('--warm-cooldown-seconds', type=float, default=2.0,
+                        help='Traffic warmup/cooldown before measured steps '
+                             'after a warm-start episode (default: 2.0)')
     
     # Model
     parser.add_argument('--save-dir', default='training_files',
                         help='Directory to save/load model weights')
+    parser.add_argument('--training-log-dir', default=None,
+                        help='Directory for durable training report artifacts '
+                             '(default: <save-dir>/training_logs)')
+    parser.add_argument('--training-log-flush-every', type=int, default=25,
+                        help='Flush durable local training logs every N steps '
+                             '(default: 25; checkpoints/episodes always flush)')
+    parser.add_argument('--training-influx-detail',
+                        choices=['minimal', 'off'],
+                        default='minimal',
+                        help='Influx training logging detail: minimal writes only '
+                             'progress-monitoring fields, off disables training '
+                             'Influx writes (default: minimal)')
     parser.add_argument('--weights-tag', default='final',
                         help='Weight file tag for evaluation (e.g., final, best, 50pct)')
     parser.add_argument('--resume', type=str, default=None,
@@ -3017,6 +3897,10 @@ def main():
                         help='Reset epsilon to this value when resuming (e.g., 0.10)')
     parser.add_argument('--traffic-weights', type=str, default=None,
                         help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
+    parser.add_argument('--traffic-profile-weights', type=str, default=None,
+                        help='Exact traffic profile weights as '
+                             '"light_1:1,medium_2:2,bursty_vo_1:3". '
+                             'Overrides --traffic-weights when both are set.')
     parser.add_argument('--traffic-profile', type=str,
                         choices=tuple(TrafficManager.TRAFFIC_PROFILES),
                         default=None,
