@@ -431,21 +431,53 @@ class TrafficIntegrityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             manager._choose_profile_name(None, {"light": 0.0})
 
-    def test_bursty_profiles_have_deterministic_queue_biased_bursts(self):
+    def test_bursty_profiles_have_queue_biased_bursts(self):
         for queue_name, qid in (("vo", 0), ("vi", 1), ("be", 7)):
             for suffix, high_steps in ((1, 3), (2, 6)):
                 profile = f"bursty_{queue_name}_{suffix}"
                 stages = TrafficManager.PROFILE_STAGE_LOADS[profile]
-                pattern = TrafficManager.SHAPED_PROFILE_PATTERNS[profile]
                 self.assertIn(profile, TrafficManager.TRAFFIC_PROFILES)
-                self.assertEqual(sum(pattern), high_steps)
-                self.assertEqual(len(pattern), 10)
+                self.assertEqual(
+                    TrafficManager.BURSTY_PROFILE_HIGH_STEPS[profile],
+                    high_steps,
+                )
                 self.assertEqual(
                     max(stages["high"], key=stages["high"].get),
                     qid,
                 )
                 self.assertAlmostEqual(sum(stages["low"].values()), 0.5)
                 self.assertAlmostEqual(sum(stages["high"].values()), 3.2)
+
+    def test_bursty_cycles_are_seeded_random_with_fixed_high_step_count(self):
+        first = object.__new__(TrafficManager)
+        first.current_profile_name = "bursty_vo_1"
+        first._seed_material = "42"
+        first._bursty_cycle_patterns = {}
+
+        second = object.__new__(TrafficManager)
+        second.current_profile_name = "bursty_vo_1"
+        second._seed_material = "42"
+        second._bursty_cycle_patterns = {}
+
+        pattern_0 = first._bursty_pattern_for_cycle(0)
+        pattern_1 = first._bursty_pattern_for_cycle(1)
+
+        self.assertEqual(len(pattern_0), 10)
+        self.assertEqual(sum(pattern_0), 3)
+        self.assertEqual(len(pattern_1), 10)
+        self.assertEqual(sum(pattern_1), 3)
+        self.assertEqual(pattern_0, second._bursty_pattern_for_cycle(0))
+        self.assertEqual(pattern_1, second._bursty_pattern_for_cycle(1))
+        self.assertNotEqual(pattern_0, pattern_1)
+
+    def test_bursty_profiles_use_longer_telemetry_coverage_window(self):
+        manager = object.__new__(TrafficManager)
+        manager.current_profile_category = "bursty"
+        self.assertEqual(manager.telemetry_coverage_window_seconds(5.0), 30.0)
+        self.assertEqual(manager.telemetry_coverage_window_seconds(45.0), 45.0)
+
+        manager.current_profile_category = "medium"
+        self.assertEqual(manager.telemetry_coverage_window_seconds(5.0), 5.0)
 
     def test_step_profile_follows_shaped_pattern(self):
         manager = object.__new__(TrafficManager)
@@ -454,6 +486,9 @@ class TrafficIntegrityTests(unittest.TestCase):
             "bursty_be_1"
         ]["low"].copy()
         manager._shaped_stage_high = False
+        manager._bursty_cycle_patterns = {
+            0: (0, 0, 1, 1, 1, 0, 0, 0, 0, 0),
+        }
         manager._apply_sender_caps = Mock(
             return_value={"verified": True}
         )
@@ -661,6 +696,21 @@ class TrafficIntegrityTests(unittest.TestCase):
 
         self.assertFalse(report["verified"])
         self.assertIn("restart(s)", report["errors"][0])
+
+    def test_health_monitor_requires_sustained_endpoint_mismatch(self):
+        manager = object.__new__(TrafficManager)
+        manager.verify_exact_processes = Mock(
+            return_value={"verified": True, "errors": []}
+        )
+        manager._ensure_complete_traffic = Mock()
+
+        manager._check_and_restart_traffic()
+
+        manager.verify_exact_processes.assert_called_once_with(
+            timeout=3.0,
+            raise_on_error=False,
+        )
+        manager._ensure_complete_traffic.assert_not_called()
 
 
 if __name__ == "__main__":

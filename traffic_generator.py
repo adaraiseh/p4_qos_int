@@ -2,8 +2,9 @@
 """Resilient, reproducible traffic generation for routing experiments.
 
 Traffic endpoints are started through P4Utils TaskServers and verified exactly.
-Benchmark profiles use deterministic ten-step schedules and verified sender
-HTB caps, allowing RL, ECMP, and OSPF to receive the same offered workload.
+Benchmark profiles use verified sender HTB caps. Steady profiles use fixed
+ten-step schedules; bursty profiles use seeded random ten-step schedules,
+allowing RL, ECMP, and OSPF to receive the same offered workload.
 """
 
 import os
@@ -12,6 +13,7 @@ import json
 import glob
 import time
 import random
+import hashlib
 import math
 import threading
 import subprocess
@@ -138,14 +140,25 @@ BURSTY_PROFILE_SPECS = {
 }
 
 
-def _burst_pattern(high_steps: int) -> Tuple[int, ...]:
-    """Return the deterministic ten-step schedule for a burst tier."""
-    start_step = {3: 3, 6: 2}.get(high_steps)
-    if start_step is None:
+BURSTY_PROFILE_HIGH_STEPS = {
+    name: spec["high_steps"]
+    for name, spec in BURSTY_PROFILE_SPECS.items()
+}
+
+
+def _contiguous_burst_pattern(high_steps: int, start_step: int) -> Tuple[int, ...]:
+    """Return a ten-step burst window with wrap-around support."""
+    if not 1 <= high_steps <= PROFILE_CYCLE_STEPS:
         raise ValueError(f"Unsupported burst duration: {high_steps} steps")
+    if not 1 <= start_step <= PROFILE_CYCLE_STEPS:
+        raise ValueError(f"Unsupported burst start step: {start_step}")
+    high_indexes = {
+        (start_step - 1 + offset) % PROFILE_CYCLE_STEPS
+        for offset in range(high_steps)
+    }
     return tuple(
-        int(start_step <= step < start_step + high_steps)
-        for step in range(1, PROFILE_CYCLE_STEPS + 1)
+        int(index in high_indexes)
+        for index in range(PROFILE_CYCLE_STEPS)
     )
 
 
@@ -162,10 +175,6 @@ SHAPED_PROFILE_PATTERNS = {
     name: tuple(spec["pattern"])
     for name, spec in STEADY_PROFILE_SPECS.items()
 }
-SHAPED_PROFILE_PATTERNS.update({
-    name: _burst_pattern(spec["high_steps"])
-    for name, spec in BURSTY_PROFILE_SPECS.items()
-})
 
 PROFILE_GROUPS = {
     category: tuple(
@@ -264,6 +273,7 @@ class TrafficManager:
     
     SHAPED_PROFILE_PATTERNS = SHAPED_PROFILE_PATTERNS
     PROFILE_STAGE_LOADS = SHAPED_PROFILE_STAGES
+    BURSTY_PROFILE_HIGH_STEPS = BURSTY_PROFILE_HIGH_STEPS
     PROFILE_GROUPS = PROFILE_GROUPS
     MEASUREMENT_SETTLE_SECONDS = MEASUREMENT_SETTLE_SECONDS
     TRAFFIC_PROFILES = {
@@ -303,7 +313,8 @@ class TrafficManager:
 
         # Keep training variability by default, while allowing benchmark runs
         # to use the exact same profile scaling and burst schedule.
-        self._rng = random.Random(time.time() if seed is None else seed)
+        self._seed_material = str(time.time_ns() if seed is None else int(seed))
+        self._rng = random.Random(int(self._seed_material))
 
         self.topology_file = topology_file
         self.config_path = config_path
@@ -355,6 +366,7 @@ class TrafficManager:
         self._tc_shape_report: Dict = {}
         self._shaped_stage_high: Optional[bool] = None
         self._profile_step_offset: int = 0
+        self._bursty_cycle_patterns: Dict[int, Tuple[int, ...]] = {}
 
         # iPerf log cleanup thread (CPU-efficient, runs every 120s)
         self._log_cleanup_stop = threading.Event()
@@ -822,7 +834,12 @@ class TrafficManager:
     def _check_and_restart_traffic(self):
         """Require the exact role/port endpoint inventory and recover atomically."""
         report = self.verify_exact_processes(
-            timeout=0.01,
+            # Client tasks are bash loops around iperf3. Under burst/reroute
+            # stress an iperf3 child can exit and be relaunched by its wrapper
+            # after a short sleep. Require a sustained mismatch before doing an
+            # expensive whole-traffic restart, otherwise benchmark runs can be
+            # marked invalid even though the wrapper self-healed.
+            timeout=3.0,
             raise_on_error=False,
         )
         if report["verified"]:
@@ -1249,6 +1266,48 @@ class TrafficManager:
         stage = "high" if stage_high else "low"
         return cls.PROFILE_STAGE_LOADS[profile_name][stage].copy()
 
+    def _bursty_pattern_for_cycle(self, cycle_index: int) -> Tuple[int, ...]:
+        """Return the seeded random burst pattern for a zero-based cycle."""
+        if cycle_index < 0:
+            raise ValueError("cycle_index must be non-negative")
+        cached = self._bursty_cycle_patterns.get(cycle_index)
+        if cached is not None:
+            return cached
+
+        profile_name = self.current_profile_name
+        high_steps = self.BURSTY_PROFILE_HIGH_STEPS[profile_name]
+        seed_material = (
+            f"{getattr(self, '_seed_material', 'unseeded')}:"
+            f"{profile_name}:{cycle_index}"
+        )
+        seed_int = int.from_bytes(
+            hashlib.sha256(seed_material.encode("utf-8")).digest()[:8],
+            "big",
+        )
+        rng = random.Random(seed_int)
+        start_step = rng.randint(1, PROFILE_CYCLE_STEPS)
+        pattern = _contiguous_burst_pattern(high_steps, start_step)
+        self._bursty_cycle_patterns[cycle_index] = pattern
+        return pattern
+
+    def _scheduled_stage_high(self, profile_step: int) -> bool:
+        """Return whether the active profile should be in its high stage."""
+        if profile_step < 1:
+            raise ValueError("profile_step must be at least 1")
+        if self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS:
+            cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS
+            cycle_position = (profile_step - 1) % PROFILE_CYCLE_STEPS
+            return bool(
+                self._bursty_pattern_for_cycle(cycle_index)[cycle_position]
+            )
+
+        pattern = self.SHAPED_PROFILE_PATTERNS.get(self.current_profile_name)
+        if not pattern:
+            raise ValueError(
+                f"No shaped traffic pattern for profile {self.current_profile_name!r}"
+            )
+        return bool(pattern[(profile_step - 1) % len(pattern)])
+
     @staticmethod
     def _parse_root_htb_class(output: str) -> Optional[Dict[str, str]]:
         """Parse Mininet's root HTB class from ``tc class show`` output."""
@@ -1404,11 +1463,12 @@ class TrafficManager:
         current_step: int,
         use_offset: bool = True,
     ) -> Optional[Dict]:
-        """Apply the deterministic stage for a shaped benchmark profile."""
-        pattern = self.SHAPED_PROFILE_PATTERNS.get(
-            self.current_profile_name
+        """Apply the scheduled stage for a shaped benchmark profile."""
+        has_pattern = (
+            self.current_profile_name in self.SHAPED_PROFILE_PATTERNS
+            or self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS
         )
-        if not pattern:
+        if not has_pattern:
             return None
         if current_step < 1:
             raise ValueError("current_step must be at least 1")
@@ -1416,7 +1476,7 @@ class TrafficManager:
         profile_step = current_step + (
             getattr(self, "_profile_step_offset", 0) if use_offset else 0
         )
-        stage_high = bool(pattern[(profile_step - 1) % len(pattern)])
+        stage_high = self._scheduled_stage_high(profile_step)
         if stage_high == self._shaped_stage_high:
             return None
 
@@ -1430,12 +1490,22 @@ class TrafficManager:
         )
         report["step"] = current_step
         report["profile_step"] = profile_step
+        pattern_note = ""
+        if self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS:
+            cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS
+            cycle_pattern = "".join(
+                str(bit) for bit in self._bursty_pattern_for_cycle(cycle_index)
+            )
+            report["profile_cycle"] = cycle_index + 1
+            report["cycle_pattern"] = cycle_pattern
+            pattern_note = f" cycle={cycle_index + 1} pattern={cycle_pattern}"
         log.info(
             f"[Traffic] Step {current_step}: "
             f"profile_step={profile_step} "
             f"{self.current_profile_name} -> "
             f"{'HIGH' if stage_high else 'LOW'} "
             f"({sum(self.current_load.values()):.3f} Mbps per demand)"
+            f"{pattern_note}"
         )
         return report
 
@@ -1482,6 +1552,24 @@ class TrafficManager:
             "stage_changes": applied,
         }
 
+    def telemetry_coverage_window_seconds(
+        self,
+        minimum_seconds: float = 5.0,
+    ) -> float:
+        """Return the audit window needed to observe all profile flows.
+
+        Bursty profiles intentionally spend much of each cycle at very low
+        rates for non-dominant queues. A short exact-flow audit can therefore
+        land in an off-burst slice and falsely report missing flows even when
+        the measured run had valid telemetry at every step. Use a longer
+        window for bursty workloads so coverage audits span at least one
+        burst/recovery cycle while still requiring exact flow IDs.
+        """
+        minimum = max(0.0, float(minimum_seconds))
+        if self.current_profile_category == "bursty":
+            return max(minimum, 30.0)
+        return minimum
+
     def begin_measurement(
         self,
         settle_seconds: float = MEASUREMENT_SETTLE_SECONDS,
@@ -1496,11 +1584,15 @@ class TrafficManager:
         pattern = self.SHAPED_PROFILE_PATTERNS.get(
             self.current_profile_name
         )
-        if not pattern:
+        has_pattern = (
+            bool(pattern)
+            or self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS
+        )
+        if not has_pattern:
             return None
 
         profile_step = getattr(self, "_profile_step_offset", 0) + 1
-        stage_high = bool(pattern[(profile_step - 1) % len(pattern)])
+        stage_high = self._scheduled_stage_high(profile_step)
         target_load = self._stage_loads(
             self.current_profile_name,
             stage_high,
@@ -1600,6 +1692,7 @@ class TrafficManager:
             self.current_profile_name
         )
         is_bursty = self.current_profile_category == "bursty"
+        self._bursty_cycle_patterns = {}
 
         # Apply the profile's first scheduled stage immediately. This keeps the
         # warmup and telemetry-coverage windows on the same offered workload as
@@ -1607,10 +1700,8 @@ class TrafficManager:
         # low-rate validation load.
         stages = self.PROFILE_STAGE_LOADS[self.current_profile_name]
         self._source_load = stages["source"].copy()
-        self._shaped_stage_high = bool(
-            self.SHAPED_PROFILE_PATTERNS[self.current_profile_name][0]
-        )
         self._profile_step_offset = 0
+        self._shaped_stage_high = self._scheduled_stage_high(1)
         self.current_load = self._stage_loads(
             self.current_profile_name,
             self._shaped_stage_high,
@@ -1618,6 +1709,15 @@ class TrafficManager:
         
         log.info(f"Starting profile '{self.current_profile_name}' ({self.current_profile_category})")
         log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
+        if is_bursty:
+            initial_pattern = "".join(
+                str(bit) for bit in self._bursty_pattern_for_cycle(0)
+            )
+            log.info(
+                f"  Bursty cycle 1 pattern: {initial_pattern} "
+                f"({sum(self._bursty_pattern_for_cycle(0))}/"
+                f"{PROFILE_CYCLE_STEPS} high steps)"
+            )
 
         # Track state for health monitoring
         self._last_packet_len = packet_len
