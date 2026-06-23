@@ -1,6 +1,8 @@
+import json
 import time
 import tempfile
 import unittest
+from pathlib import Path
 
 from report_collector.local_telemetry_cache import (
     LineProtocolSpoolWriter,
@@ -45,6 +47,37 @@ class LocalTelemetryCacheTests(unittest.TestCase):
         self.assertEqual(response["window"]["max_ns"], self.base_ns + 3_000_000)
         self.assertTrue(response["window"]["within_window"])
         self.assertEqual(response["window"]["by_measurement"]["flow_latency"]["count"], 3)
+
+    def test_preparsed_points_match_line_protocol_cache_shape(self):
+        tags = {"dst_ip": "10.0.0.2", "flow_id": "10", "queue_id": "0", "src_ip": "10.0.0.1"}
+        line_cache = LocalTelemetryCache(retention_seconds=10, max_points_per_measurement=1000)
+        structured_cache = LocalTelemetryCache(retention_seconds=10, max_points_per_measurement=1000)
+        lines = [
+            self._line("flow_latency", tags, 10.0, 1),
+            self._line("flow_latency", tags, 20.0, 2),
+            self._line("q_drop_rate_100ms", {**tags, "switch_id": "13", "egress_port": "1"}, 2.0, 3),
+            self._line("tx_utilization", {**tags, "switch_id": "13", "egress_port": "1"}, 50.0, 3),
+        ]
+        records = [
+            ("flow_latency", tags, 10.0, self.base_ns + 1_000_000),
+            ("flow_latency", tags, 20.0, self.base_ns + 2_000_000),
+            ("q_drop_rate_100ms", {**tags, "switch_id": 13, "egress_port": 1}, 2.0, self.base_ns + 3_000_000),
+            ("tx_utilization", {**tags, "switch_id": 13, "egress_port": 1}, 50.0, self.base_ns + 3_000_000),
+        ]
+        line_cache.add_line_points(lines)
+        structured_cache.add_preparsed_points(records)
+
+        request = {
+            "kind": "queue_summary",
+            "start_ns": self.base_ns,
+            "stop_ns": self.base_ns + 10_000_000,
+            "qids": [0],
+        }
+
+        self.assertEqual(
+            line_cache.handle_request(request),
+            structured_cache.handle_request(request),
+        )
 
     def test_window_audit_excludes_records_outside_requested_range(self):
         tags = {"dst_ip": "10.0.0.2", "flow_id": "10", "queue_id": "0", "src_ip": "10.0.0.1"}
@@ -203,6 +236,19 @@ class LocalTelemetryCacheTests(unittest.TestCase):
         self.assertEqual(response["window"]["max_ns"], self.base_ns + 3_000_000)
         self.assertTrue(response["window"]["within_window"])
 
+        wide_response = self.cache.handle_request({
+            "kind": "switch_metrics_multi",
+            "start_ns": self.base_ns,
+            "stop_ns": self.base_ns + 10_000_000,
+            "queries": {"0": [21, 23], "1": [22, 24]},
+        })
+
+        self.assertTrue(wide_response["ok"])
+        self.assertEqual(wide_response["switch_metrics"]["0"]["21"], {"drop": 0.5, "lat": 8.0, "util": 72.0})
+        self.assertEqual(wide_response["switch_metrics"]["1"]["22"], {"drop": 1.5, "lat": 12.0, "util": 82.0})
+        self.assertEqual(wide_response["switch_metrics"]["0"]["23"], {"drop": 0.0, "lat": 0.0, "util": 0.0})
+        self.assertEqual(wide_response["switch_metrics"]["1"]["24"], {"drop": 0.0, "lat": 0.0, "util": 0.0})
+
     def test_traffic_count_counts_flow_latency_by_queue(self):
         self.cache.add_line_points([
             self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 1),
@@ -314,6 +360,58 @@ class LocalTelemetryCacheTests(unittest.TestCase):
             manifest = writer.manifest_path.read_text()
             self.assertIn('"status": "closed"', manifest)
             self.assertIn('"records_written": 2', manifest)
+
+    def test_line_protocol_spool_rotates_by_training_step_segment(self):
+        line1 = self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 1)
+        line2 = self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "2"}, 2.0, 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "media"
+            fallback = Path(directory) / "fallback"
+            state_path = Path(directory) / "training_state.json"
+            run_id = "20260623-120000"
+            run_dir = root / run_id
+            collector_dir = run_dir / "collector"
+
+            def write_state(step):
+                state_path.write_text(json.dumps({
+                    "run_id": run_id,
+                    "run_dir": str(run_dir),
+                    "collector_dir": str(collector_dir),
+                    "total_step": step,
+                }))
+
+            write_state(1)
+            writer = LineProtocolSpoolWriter(
+                str(fallback),
+                flush_interval_seconds=0.1,
+                run_state_path=str(state_path),
+                external_artifact_root=str(root),
+                split_every_steps=5000,
+            )
+            writer.write_lines([line1])
+            writer.flush()
+
+            time.sleep(0.01)
+            write_state(5001)
+            writer.write_lines([line2])
+            writer.flush()
+            writer.close()
+
+            spool_files = sorted((collector_dir / "spool").glob("*.lp"))
+            self.assertEqual(len(spool_files), 2)
+            self.assertEqual(spool_files[0].read_text().splitlines(), [line1])
+            self.assertEqual(spool_files[1].read_text().splitlines(), [line2])
+
+            manifests = [
+                json.loads(path.with_suffix(".manifest.json").read_text())
+                for path in spool_files
+            ]
+            self.assertEqual(
+                [(m["segment_start_step"], m["segment_end_step"]) for m in manifests],
+                [(1, 5000), (5001, 10000)],
+            )
+            self.assertEqual({m["training_run_id"] for m in manifests}, {run_id})
 
 
 if __name__ == "__main__":

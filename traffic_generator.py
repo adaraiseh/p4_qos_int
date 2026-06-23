@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 
 
 PROFILE_CYCLE_STEPS = 10
+PROFILE_VERIFY_INTERVAL_STEPS = 20
 MEASUREMENT_SETTLE_SECONDS = 0.0
 COMMON_QUEUE_WEIGHTS = {0: 0.22327, 1: 0.34591, 7: 0.43082}
 
@@ -1391,37 +1392,59 @@ class TrafficManager:
         }[match.group("unit").lower()]
         return amount * factor
 
-    def _set_sender_rate_cap(self, hostname: str, rate_mbps: float) -> Dict:
-        """Set and verify the existing Mininet root HTB class rate."""
-        host_pid = self._get_host_pid(hostname)
-        if host_pid is None:
-            raise RuntimeError(f"Cannot find Mininet PID for sender {hostname}")
+    def _set_sender_rate_cap(
+        self,
+        hostname: str,
+        rate_mbps: float,
+        verify: bool = True,
+    ) -> Dict:
+        """Set the existing Mininet root HTB class rate.
 
-        interface = f"{hostname}-eth0"
+        The root class metadata is cached after the first verified lookup so
+        frequent profile transitions do not need to run ``tc class show`` for
+        every sender on every step.
+        """
+        cached = self._tc_original_classes.get(hostname)
+        if cached:
+            host_pid = cached["pid"]
+            interface = cached["interface"]
+            parsed = cached
+        else:
+            host_pid = self._get_host_pid(hostname)
+            if host_pid is None:
+                raise RuntimeError(f"Cannot find Mininet PID for sender {hostname}")
+
+            interface = f"{hostname}-eth0"
+            show_cmd = [
+                "mnexec", "-a", str(host_pid),
+                "tc", "class", "show", "dev", interface,
+            ]
+            before = subprocess.run(
+                show_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            ).stdout
+            parsed = self._parse_root_htb_class(before)
+            if parsed is None:
+                raise RuntimeError(
+                    f"Unable to identify root HTB class on {interface}: {before!r}"
+                )
+            self._tc_original_classes.setdefault(
+                hostname,
+                {
+                    **parsed,
+                    "pid": str(host_pid),
+                    "interface": interface,
+                },
+            )
+            parsed = self._tc_original_classes[hostname]
+
         show_cmd = [
             "mnexec", "-a", str(host_pid),
             "tc", "class", "show", "dev", interface,
         ]
-        before = subprocess.run(
-            show_cmd,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout
-        parsed = self._parse_root_htb_class(before)
-        if parsed is None:
-            raise RuntimeError(
-                f"Unable to identify root HTB class on {interface}: {before!r}"
-            )
-        self._tc_original_classes.setdefault(
-            hostname,
-            {
-                **parsed,
-                "pid": str(host_pid),
-                "interface": interface,
-            },
-        )
 
         rate_kbit = max(1, int(round(rate_mbps * 1000.0)))
         subprocess.run(
@@ -1439,6 +1462,17 @@ class TrafficManager:
             timeout=10,
             check=True,
         )
+        report = {
+            "host": hostname,
+            "interface": interface,
+            "classid": parsed["classid"],
+            "target_rate_mbps": rate_mbps,
+            "verified": False,
+            "verification_skipped": not verify,
+        }
+        if not verify:
+            return report
+
         after = subprocess.run(
             show_cmd,
             capture_output=True,
@@ -1463,17 +1497,23 @@ class TrafficManager:
                 f"target={rate_mbps:.6f} Mbps, "
                 f"rate={observed_rate:.6f}, ceil={observed_ceil:.6f}"
             )
-        return {
-            "host": hostname,
-            "interface": interface,
-            "classid": parsed["classid"],
-            "target_rate_mbps": rate_mbps,
-            "observed_rate_mbps": observed_rate,
-            "observed_ceil_mbps": observed_ceil,
-            "tc_state": verified,
-        }
+        report.update(
+            {
+                "observed_rate_mbps": observed_rate,
+                "observed_ceil_mbps": observed_ceil,
+                "tc_state": verified,
+                "verified": True,
+                "verification_skipped": False,
+            }
+        )
+        return report
 
-    def _apply_sender_caps(self, profile_name: str) -> Dict:
+    def _apply_sender_caps(
+        self,
+        profile_name: str,
+        verify: bool = True,
+        verify_reason: str = "startup",
+    ) -> Dict:
         """Shape each sender to the profile's exact aggregate offered load."""
         pair_counts = Counter(sender for sender, _, _ in self.traffic_pairs)
         per_pair_total = sum(self.current_load.values())
@@ -1484,6 +1524,7 @@ class TrafficManager:
                     self._set_sender_rate_cap(
                         sender,
                         per_pair_total * pair_counts[sender],
+                        verify=verify,
                     )
                 )
         except Exception:
@@ -1491,7 +1532,10 @@ class TrafficManager:
             raise
 
         self._tc_shape_report = {
-            "verified": True,
+            "verified": bool(verify),
+            "verification_skipped": not verify,
+            "verify_reason": verify_reason,
+            "verification_interval_steps": PROFILE_VERIFY_INTERVAL_STEPS,
             "profile": profile_name,
             "stage": (
                 "high"
@@ -1505,11 +1549,19 @@ class TrafficManager:
             "per_pair_total_mbps": per_pair_total,
             "senders": reports,
         }
+        verification_note = "verified" if verify else "verification skipped"
         log.info(
-            f"[Traffic] Applied verified sender HTB caps for {profile_name}: "
-            f"{per_pair_total:.4f} Mbps per demand"
+            f"[Traffic] Applied sender HTB caps for {profile_name}: "
+            f"{per_pair_total:.4f} Mbps per demand ({verification_note})"
         )
         return self._tc_shape_report
+
+    @staticmethod
+    def _should_verify_profile_step(current_step: int) -> bool:
+        return (
+            current_step > 0
+            and current_step % PROFILE_VERIFY_INTERVAL_STEPS == 0
+        )
 
     def apply_step_profile(
         self,
@@ -1530,7 +1582,23 @@ class TrafficManager:
             getattr(self, "_profile_step_offset", 0) if use_offset else 0
         )
         stage_high = self._scheduled_stage_high(profile_step)
+        verify_profile = self._should_verify_profile_step(current_step)
         if stage_high == self._shaped_stage_high:
+            if verify_profile:
+                report = self._apply_sender_caps(
+                    self.current_profile_name,
+                    verify=True,
+                    verify_reason=f"step_{current_step}",
+                )
+                report["step"] = current_step
+                report["profile_step"] = profile_step
+                report["stage_changed"] = False
+                log.info(
+                    f"[Traffic] Step {current_step}: "
+                    f"profile_step={profile_step} "
+                    f"{self.current_profile_name} periodic verification"
+                )
+                return report
             return None
 
         self._shaped_stage_high = stage_high
@@ -1539,10 +1607,13 @@ class TrafficManager:
             stage_high,
         )
         report = self._apply_sender_caps(
-            self.current_profile_name
+            self.current_profile_name,
+            verify=verify_profile,
+            verify_reason=f"step_{current_step}",
         )
         report["step"] = current_step
         report["profile_step"] = profile_step
+        report["stage_changed"] = True
         pattern_note = ""
         if self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS:
             cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS

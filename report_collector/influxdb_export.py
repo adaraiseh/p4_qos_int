@@ -22,6 +22,7 @@ from influxdb_client import InfluxDBClient
 from collector import *
 from local_telemetry_cache import (
     DEFAULT_SOCKET_PATH,
+    DEFAULT_TRAINING_STATE_PATH,
     LineProtocolSpoolWriter,
     LocalTelemetryCache,
     LocalTelemetryCacheServer,
@@ -33,6 +34,8 @@ INFLUX_URL = "http://192.168.56.1:8086"
 INFLUX_TOKEN = os.environ.get('INFLUX_TOKEN')
 INFLUX_ORG = "Research"
 INFLUX_BUCKET = "INT"
+DEFAULT_EXTERNAL_ARTIFACT_ROOT = "/media/sf_amjad/p4_qos_int/training_runs"
+DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS = 5000
 
 # Default interfaces (legacy Fat-Tree topology with 4 ToR switches)
 DEFAULT_INTERFACES = ['t1-eth10', 't2-eth10', 't3-eth10', 't4-eth10']
@@ -149,7 +152,23 @@ def main():
     parser.add_argument(
         '--local-spool-dir',
         default='training_files/collector_spool',
-        help='Directory for local collector telemetry line-protocol artifacts'
+        help='Fallback directory for local collector telemetry line-protocol artifacts'
+    )
+    parser.add_argument(
+        '--artifact-root',
+        default=DEFAULT_EXTERNAL_ARTIFACT_ROOT,
+        help='External media root containing training run folders'
+    )
+    parser.add_argument(
+        '--training-state-file',
+        default=DEFAULT_TRAINING_STATE_PATH,
+        help='Training state JSON file used to organize collector spool splits'
+    )
+    parser.add_argument(
+        '--local-spool-split-steps',
+        type=int,
+        default=DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS,
+        help='Rotate collector line-protocol spool every N training steps'
     )
     parser.add_argument(
         '--local-spool-flush-interval',
@@ -170,11 +189,20 @@ def main():
         choices=['debug', 'info', 'warning', 'error'],
         help='File log level (console always shows INFO)'
     )
+    parser.add_argument(
+        '--log-dir',
+        default=None,
+        help='Optional directory for collector process logs'
+    )
 
     args = parser.parse_args()
 
     # Set up unified logging
-    setup_unified_logging(module_name="collector", log_level=args.log_level)
+    setup_unified_logging(
+        module_name="collector",
+        log_level=args.log_level,
+        log_dir=args.log_dir,
+    )
 
     # Suppress Scapy's noisy internal loggers (Rx timeout spam every 50ms)
     logging.getLogger("Rx").setLevel(logging.WARNING)
@@ -235,6 +263,9 @@ def main():
             output_dir=args.local_spool_dir,
             flush_interval_seconds=args.local_spool_flush_interval,
             max_queue_batches=args.local_spool_queue_batches,
+            run_state_path=args.training_state_file,
+            external_artifact_root=args.artifact_root,
+            split_every_steps=args.local_spool_split_steps,
         )
     else:
         log.info("Local telemetry spool disabled")

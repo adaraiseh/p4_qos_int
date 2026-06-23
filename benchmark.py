@@ -220,6 +220,7 @@ def summarize_run_csv(path: Path) -> Dict:
             if math.isfinite(clean_float(row.get(column)))
         ]
 
+    sla_denominator = float(len(QIDS))
     summary = {
         "steps": len(rows),
         "valid_steps": len(valid_rows),
@@ -227,10 +228,10 @@ def summarize_run_csv(path: Path) -> Dict:
         "reward_mean_all": mean(values("reward", rows)),
         "reward_mean_valid": mean(values("reward")),
         "sla_compliance_all_pct": (
-            100.0 * sum(values("sla_met_count", rows)) / (3.0 * len(rows))
+            100.0 * sum(values("sla_met_count", rows)) / (sla_denominator * len(rows))
         ),
         "sla_compliance_valid_pct": (
-            100.0 * sum(values("sla_met_count")) / (3.0 * len(valid_rows))
+            100.0 * sum(values("sla_met_count")) / (sla_denominator * len(valid_rows))
             if valid_rows
             else math.nan
         ),

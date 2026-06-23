@@ -600,7 +600,13 @@ class ProductionRunner:
                     7: "multi",                            # Multi-queue
                 }
                 action_name = action_names.get(action, str(action))
-                log.info(f"[Step {self.step}] action={action_name:8s} reward={reward:+.2f} sla={len(info['sla_met'])}/3 streak={info['sla_streak']}")
+                log.info(
+                    f"[Step {self.step}] action={action_name:8s} "
+                    f"reward={reward:+.2f} "
+                    f"sla={len(info['sla_met'])}/"
+                    f"{info.get('sla_total', len(QIDS))} "
+                    f"streak={info['sla_streak']}"
+                )
 
                 # Write metrics to InfluxDB
                 metrics.write_metrics(self.step, action, reward, info, q_stats)

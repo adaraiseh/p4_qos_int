@@ -72,14 +72,19 @@ from logging_config import (
     set_console_level,
 )
 
-def setup_logging(log_level: str = "info"):
+def setup_logging(log_level: str = "info", log_dir: Optional[str] = None):
     """Configure logging with appropriate level and file output.
 
     Args:
         log_level: File log level ("debug", "info", "warning", "error")
+        log_dir: Optional directory for the process log file.
     """
     # Configure root logger with unified logging (file + console)
-    setup_unified_logging(module_name="rl_agent", log_level=log_level)
+    setup_unified_logging(
+        module_name="rl_agent",
+        log_level=log_level,
+        log_dir=log_dir,
+    )
 
     # Set level for this module
     log = logging.getLogger(__name__)
@@ -186,6 +191,15 @@ SLA_THRESHOLDS = {
 }
 QIDS = (0, 1, 7)
 
+
+def _flux_queue_filter(qids) -> str:
+    """Build a Flux queue_id predicate from the requested queue set."""
+    queue_ids = [int(qid) for qid in qids]
+    if not queue_ids:
+        return "false"
+    return " or ".join(f'r.queue_id == "{qid}"' for qid in queue_ids)
+
+
 # Normalization caps
 DROP_CAP = 5.0  # drops per 100ms
 UTIL_CAP = 100.0  # percentage
@@ -219,6 +233,11 @@ TARGET_UPDATE_FREQ = 4
 # =============================================================================
 #                          HELPER FUNCTIONS
 # =============================================================================
+DEFAULT_EXTERNAL_ARTIFACT_ROOT = "/media/sf_amjad/p4_qos_int/training_runs"
+DEFAULT_TRAINING_STATE_FILE = "/tmp/p4_qos_int_training_state.json"
+DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS = 5000
+
+
 def action_to_name(action: int) -> str:
     """Convert action index to human-readable name."""
     ACTION_NAMES = {
@@ -231,14 +250,63 @@ def action_to_name(action: int) -> str:
     return ACTION_NAMES.get(action, str(action))
 
 
-def resolve_checkpoint_path(save_dir: str, tag: str) -> Optional[str]:
-    """Find latest checkpoint matching tag, with fallback to legacy naming."""
+def _training_run_dir(artifact_root: str, run_id: str) -> Path:
+    return Path(artifact_root).expanduser() / run_id
+
+
+def _training_logs_dir(args: argparse.Namespace, run_id: str) -> Path:
+    if args.training_log_dir:
+        return Path(args.training_log_dir).expanduser() / run_id / "logs"
+    return _training_run_dir(args.artifact_root, run_id) / "logs"
+
+
+def _checkpoint_candidates(save_dir: str, tag: str) -> List[str]:
     pattern = os.path.join(save_dir, f"*-dqn_v4_{tag}.pth")
-    matching = sorted(glob.glob(pattern), reverse=True)
+    candidates = glob.glob(pattern)
+    legacy = os.path.join(save_dir, f"dqn_v4_{tag}.pth")
+    if os.path.exists(legacy):
+        candidates.append(legacy)
+    return candidates
+
+
+def resolve_checkpoint_path(
+    save_dir: str,
+    tag: str,
+    artifact_root: Optional[str] = None,
+) -> Optional[str]:
+    """Find latest checkpoint matching tag, with fallback to legacy naming."""
+    if tag.endswith(".pth") and os.path.exists(tag):
+        return tag
+
+    matching = _checkpoint_candidates(save_dir, tag)
+    if artifact_root:
+        root = Path(artifact_root).expanduser()
+        matching.extend(
+            str(path)
+            for path in root.glob(f"*/checkpoints/*-dqn_v4_{tag}.pth")
+        )
+    matching = sorted(
+        set(matching),
+        key=lambda path: (os.path.getmtime(path), path),
+        reverse=True,
+    )
     if matching:
         return matching[0]
-    legacy = os.path.join(save_dir, f"dqn_v4_{tag}.pth")
-    return legacy if os.path.exists(legacy) else None
+    return None
+
+
+def resolve_latest_ewc_path(save_dir: str, artifact_root: Optional[str]) -> Optional[str]:
+    candidates = glob.glob(os.path.join(save_dir, "*-ewc.pth"))
+    if artifact_root:
+        root = Path(artifact_root).expanduser()
+        candidates.extend(str(path) for path in root.glob("*/checkpoints/*-ewc.pth"))
+    if not candidates:
+        return None
+    return sorted(
+        set(candidates),
+        key=lambda path: (os.path.getmtime(path), path),
+        reverse=True,
+    )[0]
 
 
 def load_topology(args):
@@ -1070,40 +1138,16 @@ class QoSRoutingEnv:
         self._query_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="influx_query")
 
     def _required_qids_for_current_profile(self) -> Tuple[int, ...]:
-        """Queues that must have valid telemetry for the active workload."""
-        profile = self.current_traffic_profile or ""
-        if profile.startswith("bursty_vo_"):
-            return (0,)
-        if profile.startswith("bursty_vi_"):
-            return (1,)
-        if profile.startswith("bursty_be_"):
-            return (7,)
+        """Queues participating in RL reward, action, and validity logic."""
         return tuple(QIDS)
 
     def _normalize_optional_queue_telemetry(self, snapshot: Dict[int, Dict]) -> None:
-        """Keep non-focused burst queues from poisoning state/reward when idle."""
+        """Annotate telemetry requirement flags without changing queue metrics."""
         required = set(self._required_qids_for_current_profile())
         for qid in QIDS:
             q = snapshot[qid]
             q["profile_required"] = qid in required
-            q["telemetry_optional"] = qid not in required
-            if qid in required or q.get("data_valid", False):
-                continue
-
-            # Class-focused burst profiles intentionally starve the other two
-            # queues during low/off phases. Treat missing optional telemetry as
-            # neutral state, but do not invent routing context or alternatives.
-            q["lat_p95"] = SLA_THRESHOLDS[qid]
-            q["drop_p95"] = 0.0
-            q["util_p95"] = 0.0
-            q["bottleneck_sid"] = None
-            q["bottleneck_score"] = 0.0
-            q["bottleneck_drop"] = 0.0
-            q["bottleneck_lat"] = 0.0
-            q["bottleneck_util"] = 0.0
-            q["bottleneck_role"] = "optional"
-            q["alternatives"] = []
-            q["alt_exists"] = False
+            q["telemetry_optional"] = False
 
     def _required_valid_count(self, snapshot: Dict[int, Dict]) -> int:
         required = self._required_qids_for_current_profile()
@@ -1879,7 +1923,7 @@ class QoSRoutingEnv:
         Metric presence alone is insufficient for benchmark validity: a
         partially blackholed ECMP condition can look excellent when percentiles
         contain only surviving flows. This check requires exact flow-ID
-        coverage for Q0/Q1/Q7 over a multi-second window. Retries allow the
+        coverage for every RL queue over a multi-second window. Retries allow the
         INT collector and InfluxDB writer to catch up after a clean traffic
         start without weakening the exact all-flow requirement.
         """
@@ -1896,7 +1940,7 @@ class QoSRoutingEnv:
             from(bucket:"{self.bucket}")
                 |> range(start:{start}, stop:{stop})
                 |> filter(fn: (r) => r._measurement == "flow_latency")
-                |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+                |> filter(fn: (r) => {_flux_queue_filter(QIDS)})
                 |> group(columns:["queue_id", "flow_id"])
                 |> first()
             '''
@@ -1989,7 +2033,7 @@ class QoSRoutingEnv:
         flux = f'''
         base = from(bucket:"{self.bucket}")
             |> range(start:{start}, stop:{stop})
-            |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+            |> filter(fn: (r) => {_flux_queue_filter(QIDS)})
             |> toFloat()
 
         lat_p95 = base
@@ -2140,7 +2184,7 @@ class QoSRoutingEnv:
             flux = f'''
             from(bucket:"{self.bucket}")
                 |> range(start:{start}, stop:{current_stop})
-                |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+                |> filter(fn: (r) => {_flux_queue_filter(target_queues)})
                 |> filter(fn: (r) => r._measurement == "{measurement}")
                 |> toFloat()
                 |> group(columns:["queue_id"])
@@ -2252,6 +2296,8 @@ class QoSRoutingEnv:
             'bottleneck_sid': int,
         }
         """
+        snap_t0 = time.perf_counter()
+        snapshot_timing = {}
         start, stop = self._time_window()
 
         # Initialize snapshot with defaults
@@ -2289,6 +2335,7 @@ class QoSRoutingEnv:
             log.warning(f"[ThreadPool] Work queue backlog: {queue_size} (expected ~0)")
 
         if self._read_from_cache():
+            phase_t0 = time.perf_counter()
             try:
                 aggregated_result, all_hot_demands = self._cache_queue_summary(
                     start,
@@ -2317,8 +2364,10 @@ class QoSRoutingEnv:
                         'recovered_via_retry': set(),
                     }
                     all_hot_demands = {}
+            snapshot_timing['queue_summary'] = (time.perf_counter() - phase_t0) * 1000.0
 
         if aggregated_result is None:
+            phase_t0 = time.perf_counter()
             # InfluxDB path: keep the existing retry behavior as the optional
             # compatibility implementation.
             future_aggregated = self._query_executor.submit(
@@ -2346,8 +2395,10 @@ class QoSRoutingEnv:
                 all_hot_demands = future_hottest.result(timeout=6.0)
             except Exception as e:
                 log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
+            snapshot_timing['influx_queries'] = (time.perf_counter() - phase_t0) * 1000.0
 
         # Process aggregated metrics result
+        phase_t0 = time.perf_counter()
         metrics_received = {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS}
         metrics_counts = {qid: {'lat': 0, 'drop': 0, 'util': 0} for qid in QIDS}
         metrics_window = None
@@ -2431,6 +2482,7 @@ class QoSRoutingEnv:
                 prefix=f"[Telemetry Freshness S{self.global_step}]",
                 level=logging.WARNING,
             )
+        snapshot_timing['metrics_process'] = (time.perf_counter() - phase_t0) * 1000.0
 
         # 2. Get Path and Bottleneck Info (Queue-Specific)
         # Each queue gets its own bottleneck detection and alternative metrics
@@ -2439,8 +2491,14 @@ class QoSRoutingEnv:
 
         cache_path_context = {}
         cache_path_metrics = {}
+        phase_t0 = time.perf_counter()
         if self._read_from_cache():
             sw_ids_by_qid = {}
+            metric_switch_ids = [
+                int(sid)
+                for sid in self.controller.get_all_switch_ids()
+                if not self.controller._is_edge_switch(int(sid))
+            ]
             for qid in QIDS:
                 hot = all_hot_demands.get(qid)
                 if not hot:
@@ -2459,9 +2517,15 @@ class QoSRoutingEnv:
                     'path': list(path),
                     'sw_ids': sw_ids,
                 }
-                sw_ids_by_qid[qid] = sw_ids
+                # The cache scans the exact same time window either way. Asking
+                # for all reroutable switches once lets us reuse the result for
+                # both bottleneck and alternative ranking, avoiding a second
+                # full cache scan without changing the observation data.
+                sw_ids_by_qid[qid] = metric_switch_ids or sw_ids
+            snapshot_timing['path_context'] = (time.perf_counter() - phase_t0) * 1000.0
 
             if sw_ids_by_qid:
+                phase_t0 = time.perf_counter()
                 try:
                     cache_path_metrics = self._cache_switch_metrics_multi(
                         start,
@@ -2471,7 +2535,11 @@ class QoSRoutingEnv:
                 except Exception as e:
                     log.warning(f"[Query S{step}] local telemetry cache switch_metrics_multi failed: {e}")
                     cache_path_metrics = {}
+                snapshot_timing['switch_metrics'] = (time.perf_counter() - phase_t0) * 1000.0
+        else:
+            snapshot_timing['path_context'] = (time.perf_counter() - phase_t0) * 1000.0
 
+        phase_t0 = time.perf_counter()
         for qid in QIDS:
             cached_path = cache_path_context.get(qid)
             if cached_path is not None:
@@ -2549,7 +2617,10 @@ class QoSRoutingEnv:
                 snapshot[qid]['bottleneck_role'] = self.controller._normalize_role(self.controller._role_of_sid(best_sid))
 
                 # --- Step B: Alternatives (Queue-Specific) ---
-                # Get alternatives for this bottleneck and query their queue-specific metrics
+                # Get alternatives only for the selected bottleneck. The previous
+                # local-cache fast path eagerly expanded alternates for every
+                # switch on every path, which made route-context work dominate
+                # each step under CPU pressure.
                 alts = self.controller.find_all_alternates(best_sid, path)
                 log.debug(f"[Snapshot] Queue {qid}: bottleneck={best_sid}, role={snapshot[qid]['bottleneck_role']}, alternatives={alts}")
 
@@ -2564,57 +2635,80 @@ class QoSRoutingEnv:
 
                 # Query alternative metrics for THIS queue specifically
                 if alt_sids:
-                    alt_metrics = self._query_switch_metrics_for_queue(
-                        alt_sids,
-                        qid,
-                        start,
-                        stop,
-                    )
-
-                    # Use cached bottleneck score for relative comparison (CPU optimization)
-                    bn_score = best_score
-
-                    # Score each alternative RELATIVE to bottleneck (higher = better improvement)
-                    # Alternatives with NO metrics get max score (best, prioritized)
-                    scored_alts = []
-                    for name, sid in valid_alts:
-                        m = alt_metrics.get(sid)
-                        if m is None:
-                            # No traffic on this switch = best option (max improvement assumed)
-                            rel_score = bn_score  # Highest possible relative score
-                            scored_alts.append((rel_score, name, {'drop': 0, 'lat': 0, 'util': 0}))
-                        else:
-                            # Calculate alternative's absolute score
-                            alt_drop_norm = min(m['drop'], DROP_CAP) / DROP_CAP
-                            alt_lat_norm = min(m['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
-                            alt_score = 0.6 * alt_drop_norm + 0.4 * alt_lat_norm
-                            # Relative score = improvement over bottleneck (positive = better)
-                            rel_score = bn_score - alt_score
-                            scored_alts.append((rel_score, name, m))
-
-                    # Sort by relative score DESCENDING (higher = more improvement)
-                    # Shuffle first for random tie-breaking when scores are equal
-                    random.shuffle(scored_alts)
-                    scored_alts.sort(key=lambda x: x[0], reverse=True)
-
-                    # Take best MAX_ALTS (2) alternatives
-                    final_alts = []
-                    for rel_score, name, m in scored_alts[:self.MAX_ALTS]:
-                        final_alts.append({
-                            'name': name,
-                            'drop': m['drop'],
-                            'lat': m['lat'],
-                            'util': m['util'],
-                        })
-
-                    log.debug(f"[Snapshot] Q{qid} scored alts: {[(round(s[0], 3), s[1]) for s in scored_alts]}, selected: {[a['name'] for a in final_alts]}")
-                    snapshot[qid]['alternatives'] = final_alts
-                    snapshot[qid]['alt_exists'] = bool(final_alts)
+                    if self._read_from_cache() and qid in cache_path_metrics:
+                        final_alts = self._rank_alternatives(
+                            qid,
+                            best_score,
+                            valid_alts,
+                            cache_path_metrics.get(qid, {}),
+                        )
+                        snapshot[qid]['alternatives'] = final_alts
+                        snapshot[qid]['alt_exists'] = bool(final_alts)
+                    else:
+                        alt_metrics = self._query_switch_metrics_for_queue(
+                            alt_sids,
+                            qid,
+                            start,
+                            stop,
+                        )
+                        final_alts = self._rank_alternatives(
+                            qid,
+                            best_score,
+                            valid_alts,
+                            alt_metrics,
+                        )
+                        snapshot[qid]['alternatives'] = final_alts
+                        snapshot[qid]['alt_exists'] = bool(final_alts)
                 else:
                     snapshot[qid]['alternatives'] = []
                     snapshot[qid]['alt_exists'] = False
+        snapshot_timing['bottleneck_rank'] = (time.perf_counter() - phase_t0) * 1000.0
 
+        snapshot_timing['total'] = (time.perf_counter() - snap_t0) * 1000.0
+        self._last_snapshot_timing = {
+            key: round(value, 3)
+            for key, value in snapshot_timing.items()
+        }
         return snapshot
+
+    def _rank_alternatives(
+        self,
+        qid: int,
+        bottleneck_score: float,
+        valid_alts: List[Tuple[str, int]],
+        alt_metrics: Dict[int, Dict],
+    ) -> List[Dict]:
+        """Rank alternatives by queue-specific improvement over the bottleneck."""
+        scored_alts = []
+        for name, sid in valid_alts:
+            m = alt_metrics.get(sid)
+            if m is None:
+                rel_score = bottleneck_score
+                m = {'drop': 0, 'lat': 0, 'util': 0}
+            else:
+                alt_drop_norm = min(m['drop'], DROP_CAP) / DROP_CAP
+                alt_lat_norm = min(m['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
+                alt_score = 0.6 * alt_drop_norm + 0.4 * alt_lat_norm
+                rel_score = bottleneck_score - alt_score
+            scored_alts.append((rel_score, name, m))
+
+        random.shuffle(scored_alts)
+        scored_alts.sort(key=lambda x: x[0], reverse=True)
+        final_alts = [
+            {
+                'name': name,
+                'drop': m['drop'],
+                'lat': m['lat'],
+                'util': m['util'],
+            }
+            for _rel_score, name, m in scored_alts[:self.MAX_ALTS]
+        ]
+        log.debug(
+            f"[Snapshot] Q{qid} scored alts: "
+            f"{[(round(s[0], 3), s[1]) for s in scored_alts]}, "
+            f"selected: {[a['name'] for a in final_alts]}"
+        )
+        return final_alts
 
     def _query_switch_metrics_for_queue(
         self,
@@ -2701,9 +2795,7 @@ class QoSRoutingEnv:
         remaining_queues = set(requested_qids)
         max_retries = 5
         retry_delay = 1.0
-        queue_filter = " or ".join(
-            [f'r.queue_id == "{qid}"' for qid in requested_qids]
-        )
+        queue_filter = _flux_queue_filter(requested_qids)
 
         for attempt in range(max_retries):
             if attempt > 0:
@@ -3383,18 +3475,25 @@ class QoSRoutingEnv:
             - terminated: True if absorbing state (always False for this env)
             - truncated: True if horizon reached (episode_step >= MAX_EPISODE_STEPS)
         """
+        step_t0 = time.perf_counter()
+        phase_ms = {}
+
         # Increment global step counter (persists across episodes)
         self.global_step += 1
         self.episode_step += 1
 
+        phase_t0 = time.perf_counter()
         if self.traffic_manager:
             self.traffic_manager.apply_step_profile(self.episode_step)
+        phase_ms['profile'] = (time.perf_counter() - phase_t0) * 1000.0
         
         # Get current snapshot
         current_snapshot = self.last_snapshot
         
         # Apply action
+        phase_t0 = time.perf_counter()
         action_applied, alt_name, alt_idx = self._apply_action(action, current_snapshot)
+        phase_ms['action_apply'] = (time.perf_counter() - phase_t0) * 1000.0
         
         # Update last action tracking (only on applied actions for stability feature)
         if action_applied:
@@ -3405,10 +3504,13 @@ class QoSRoutingEnv:
         
         # Wait for network to settle
         delay = DELAY_AFTER_ACTION if action_applied else DELAY_NO_ACTION
+        phase_t0 = time.perf_counter()
         time.sleep(delay)
+        phase_ms['settle_sleep'] = (time.perf_counter() - phase_t0) * 1000.0
 
         # Post-reroute traffic verification: check if traffic is still flowing
         # This detects cases where a reroute broke packet forwarding
+        phase_t0 = time.perf_counter()
         if action_applied and action != 0:
             failed_reroute_qids = []
             mapping = self.ACTION_MAP.get(action)
@@ -3439,9 +3541,11 @@ class QoSRoutingEnv:
                     f"[Step {self.episode_step}] Marking action {action} invalid "
                     f"after rollback of Q{failed_reroute_qids}"
                 )
+        phase_ms['verify'] = (time.perf_counter() - phase_t0) * 1000.0
 
         # Check if traffic is stable before collecting metrics
         # During traffic transitions (burst start/end), telemetry is unreliable
+        phase_t0 = time.perf_counter()
         if self.traffic_manager and not self.traffic_manager.is_traffic_stable():
             elapsed = self.traffic_manager.get_transition_elapsed()
             log.info(f"[Step {self.episode_step}] Traffic transitioning ({elapsed:.1f}s elapsed), using last snapshot")
@@ -3454,8 +3558,10 @@ class QoSRoutingEnv:
         else:
             # Collect new snapshot
             next_snapshot = self._collect_snapshot()
+        phase_ms['snapshot'] = (time.perf_counter() - phase_t0) * 1000.0
         
         # Compute base reward (action cost applied separately below)
+        phase_t0 = time.perf_counter()
         reward, info = self._compute_reward(next_snapshot)
         
         # Always compute network pressure for state representation and logging
@@ -3561,7 +3667,7 @@ class QoSRoutingEnv:
         
         # DATA VALIDITY CHECK:
         # Key insight: validity must key off action != 0, not action_applied
-        # - If action == 0 (noop): relaxed (2/3 queues valid is OK)
+        # - If action == 0 (noop): relaxed (2 of the RL queues valid is OK)
         # - If action != 0: strict - ALL 3 queues valid AND action context AND action_applied
         #   (Failed actions should not be stored as they confuse learning)
         
@@ -3595,7 +3701,7 @@ class QoSRoutingEnv:
                     action_context_valid = False
                     log.debug(
                         f"[Step {self.episode_step}] Action {action} targeted "
-                        f"optional queue {targeted_qid} for profile "
+                        f"non-required queue {targeted_qid} for profile "
                         f"{self.current_traffic_profile}"
                     )
                 else:
@@ -3609,7 +3715,7 @@ class QoSRoutingEnv:
                         log.debug(f"[Step {self.episode_step}] Action {action} targeted queue {targeted_qid} lacked routing context")
         
         # Determine validity based on action type
-        # RELAXED: Allow 2/3 valid queues for all actions (not just noop)
+        # RELAXED: Allow the minimum required valid queues for all actions.
         # This reduces excessive data filtering in early training while maintaining quality
         if action == 0:
             # Noop: enough required queues valid for the active profile
@@ -3663,7 +3769,7 @@ class QoSRoutingEnv:
                 )
             elif valid_count < len(QIDS):
                 reasons.append(
-                    f"optional telemetry missing ({valid_count}/3): "
+                    f"queue telemetry missing ({valid_count}/{len(QIDS)}): "
                     f"queues {invalid_qs}"
                 )
             if action != 0 and not action_context_valid:
@@ -3671,9 +3777,11 @@ class QoSRoutingEnv:
             if action != 0 and not action_applied:
                 reasons.append("action was not applied (controller rejected)")
             log.warning(f"[Step {self.episode_step}] Invalid transition (action={action}) - {', '.join(reasons)}")
+        phase_ms['reward_info'] = (time.perf_counter() - phase_t0) * 1000.0
         
         # Build raw observation - ONLY update state stacks if data is valid
         # This prevents corrupting observation history with invalid/stale data
+        phase_t0 = time.perf_counter()
         raw_state = self._build_raw_state(next_snapshot)
         
         if data_valid:
@@ -3690,6 +3798,26 @@ class QoSRoutingEnv:
         next_state = self._build_stacked_state()
         info['next_valid_mask'] = self._get_valid_actions(next_snapshot)
         self.last_snapshot = next_snapshot
+        phase_ms['state'] = (time.perf_counter() - phase_t0) * 1000.0
+        total_ms = (time.perf_counter() - step_t0) * 1000.0
+        info['step_timing_ms'] = {
+            **{key: round(value, 3) for key, value in phase_ms.items()},
+            'total': round(total_ms, 3),
+            'snapshot_detail': getattr(self, '_last_snapshot_timing', {}),
+        }
+        if total_ms >= 1800.0 or phase_ms.get('snapshot', 0.0) >= 750.0:
+            detail = info['step_timing_ms']['snapshot_detail']
+            log.info(
+                f"[Timing S{self.global_step}] total={total_ms:.0f}ms "
+                f"profile={phase_ms.get('profile', 0.0):.0f} "
+                f"action={phase_ms.get('action_apply', 0.0):.0f} "
+                f"settle={phase_ms.get('settle_sleep', 0.0):.0f} "
+                f"verify={phase_ms.get('verify', 0.0):.0f} "
+                f"snapshot={phase_ms.get('snapshot', 0.0):.0f} "
+                f"reward={phase_ms.get('reward_info', 0.0):.0f} "
+                f"state={phase_ms.get('state', 0.0):.0f} "
+                f"snapshot_detail={detail}"
+            )
         
         return next_state, reward, terminated, truncated, info
     
@@ -3885,11 +4013,98 @@ def _replay_max_priority(replay_buffer) -> Optional[float]:
     return None
 
 
+class TrainingRunStatePublisher:
+    """Publish current training run state for the external collector spool."""
+
+    def __init__(
+        self,
+        path: Optional[str],
+        *,
+        run_id: str,
+        run_dir: Path,
+        logs_dir: Path,
+        checkpoint_dir: Path,
+        collector_dir: Path,
+        artifact_root: Path,
+        split_every_steps: int,
+        args: argparse.Namespace,
+    ):
+        self.path = Path(path).expanduser() if path else None
+        self.payload: Dict[str, Any] = {
+            "schema_version": 1,
+            "status": "starting",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "logs_dir": str(logs_dir),
+            "checkpoint_dir": str(checkpoint_dir),
+            "collector_dir": str(collector_dir),
+            "artifact_root": str(artifact_root),
+            "collector_spool_split_steps": split_every_steps,
+            "command": " ".join(sys.argv),
+            "argv": sys.argv,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "started_at_utc": datetime.utcnow().isoformat() + "Z",
+            "topology_config": args.config,
+            "log_file": get_log_file_path("rl_agent"),
+        }
+
+    def publish(
+        self,
+        *,
+        status: str = "running",
+        total_step: int = 0,
+        episode: int = 0,
+        episode_step: int = 0,
+        reset_type: Optional[str] = None,
+        traffic_profile: Optional[str] = None,
+        traffic_category: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.path is None:
+            return
+        self.payload.update({
+            "status": status,
+            "total_step": int(total_step),
+            "episode": int(episode),
+            "episode_step": int(episode_step),
+            "updated_at_utc": datetime.utcnow().isoformat() + "Z",
+        })
+        if reset_type is not None:
+            self.payload["reset_type"] = reset_type
+        if traffic_profile is not None:
+            self.payload["traffic_profile"] = traffic_profile
+        if traffic_category is not None:
+            self.payload["traffic_category"] = traffic_category
+        if extra:
+            self.payload["extra"] = _json_safe(extra)
+        self._write()
+
+    def _write(self) -> None:
+        assert self.path is not None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            normalize_artifact_permissions(self.path.parent, dir_mode=0o775)
+            tmp_path = self.path.with_name(
+                f".{self.path.name}.{os.getpid()}.tmp"
+            )
+            tmp_path.write_text(json.dumps(_json_safe(self.payload), sort_keys=True))
+            normalize_artifact_permissions(tmp_path, file_mode=0o664)
+            os.replace(tmp_path, self.path)
+            normalize_artifact_permissions(self.path, file_mode=0o664)
+        except OSError:
+            log.debug("failed to publish training run state", exc_info=True)
+
+
 class TrainingArtifactLogger:
     """Persist enough training data to rebuild a full report without InfluxDB.
 
-    Files written under ``training_files/training_logs/<run_id>/``:
+    Files written under ``<artifact-root>/<run_id>/``:
       - metadata.json: command, args, topology, git/source hashes, checkpoints.
+      - logs/: durable per-step, per-episode, snapshot, and checkpoint indexes.
+      - checkpoints/: model checkpoints and checkpoint sidecar metadata.
+      - collector/: collector spool segments and collector metadata.
+    Log files under ``logs/``:
       - step_metrics.csv: flat per-step training and INT-derived metrics.
       - int_snapshots.jsonl: full pre/post INT snapshot context per step.
       - episode_metrics.csv: per-episode reward/profile summaries.
@@ -3957,20 +4172,28 @@ class TrainingArtifactLogger:
     ):
         self.args = args
         self.run_id = run_id
-        base_dir = Path(args.training_log_dir) if args.training_log_dir else (
-            Path(args.save_dir) / "training_logs"
-        )
-        self.run_dir = base_dir / run_id
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.artifact_root = Path(args.artifact_root).expanduser()
+        self.run_dir = _training_run_dir(args.artifact_root, run_id)
+        self.logs_dir = _training_logs_dir(args, run_id)
+        self.checkpoint_dir = self.run_dir / "checkpoints"
+        self.collector_dir = self.run_dir / "collector"
+        for directory in (
+            self.run_dir,
+            self.logs_dir,
+            self.checkpoint_dir,
+            self.collector_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            normalize_artifact_permissions(directory, dir_mode=0o775)
         normalize_artifact_permissions(self.run_dir, dir_mode=0o775)
         self.flush_every = max(
             1, int(getattr(args, "training_log_flush_every", 25) or 25)
         )
         self.snapshot_every = 1
-        self.step_path = self.run_dir / "step_metrics.csv"
-        self.snapshot_path = self.run_dir / "int_snapshots.jsonl"
-        self.episode_path = self.run_dir / "episode_metrics.csv"
-        self.checkpoint_path = self.run_dir / "checkpoints.csv"
+        self.step_path = self.logs_dir / "step_metrics.csv"
+        self.snapshot_path = self.logs_dir / "int_snapshots.jsonl"
+        self.episode_path = self.logs_dir / "episode_metrics.csv"
+        self.checkpoint_path = self.logs_dir / "checkpoints.csv"
         self.metadata_path = self.run_dir / "metadata.json"
         self.started_at_utc = datetime.utcnow().isoformat() + "Z"
         self.checkpoints: List[Dict[str, Any]] = []
@@ -4005,10 +4228,16 @@ class TrainingArtifactLogger:
             "schema_version": 1,
             "run_id": run_id,
             "started_at_utc": self.started_at_utc,
+            "artifact_root": str(self.artifact_root),
             "run_dir": str(self.run_dir),
+            "logs_dir": str(self.logs_dir),
+            "checkpoint_dir": str(self.checkpoint_dir),
+            "collector_dir": str(self.collector_dir),
+            "training_state_file": args.training_state_file,
             "command": " ".join(sys.argv),
             "argv": sys.argv,
             "args": _sanitized_args(args),
+            "process_log": get_log_file_path("rl_agent"),
             "host": socket.gethostname(),
             "platform": platform.platform(),
             "python": sys.version,
@@ -4078,13 +4307,23 @@ class TrainingArtifactLogger:
                 "int_snapshots_jsonl": str(self.snapshot_path),
                 "episode_metrics_csv": str(self.episode_path),
                 "checkpoints_csv": str(self.checkpoint_path),
+                "checkpoint_dir": str(self.checkpoint_dir),
+                "collector_dir": str(self.collector_dir),
             },
             "logging_policy": {
-                "local_artifacts": "single durable run directory; no extra Influx stream",
+                "external_artifacts": (
+                    "single media-backed run directory with logs, checkpoints, "
+                    "and collector subdirectories"
+                ),
                 "flush_every_steps": self.flush_every,
                 "int_snapshot_every_steps": 1,
                 "influx_detail": getattr(args, "training_influx_detail", "minimal"),
                 "checkpoint_sidecars": "one metadata JSON beside each checkpoint",
+                "collector_spool_split_steps": getattr(
+                    args,
+                    "collector_spool_split_steps",
+                    DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS,
+                ),
             },
             "checkpoints": self.checkpoints,
         }
@@ -4098,6 +4337,14 @@ class TrainingArtifactLogger:
     def _write_json(path: Path, payload: Dict[str, Any]) -> None:
         path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True))
         normalize_artifact_permissions(path, file_mode=0o664)
+
+    def checkpoint_file(self, tag: str, *, ewc: bool = False) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if ewc:
+            filename = f"{timestamp}-ewc.pth"
+        else:
+            filename = f"{timestamp}-dqn_v4_{tag}.pth"
+        return str(self.checkpoint_dir / filename)
 
     def _flush_if_needed(self, *, force: bool = False) -> None:
         if not force and self._rows_since_flush < self.flush_every:
@@ -4383,6 +4630,10 @@ class TrainingArtifactLogger:
                 "rolling_avg_100": rolling_avg_100,
                 "run_metadata_path": str(self.metadata_path),
                 "run_dir": str(self.run_dir),
+                "logs_dir": str(self.logs_dir),
+                "checkpoint_dir": str(self.checkpoint_dir),
+                "collector_dir": str(self.collector_dir),
+                "process_log": get_log_file_path("rl_agent"),
             },
             "extra": extra or {},
         }
@@ -4547,7 +4798,15 @@ def train(args):
 
     # Resume from checkpoint if specified
     if args.resume:
-        resume_path = args.resume if args.resume.endswith('.pth') else resolve_checkpoint_path(args.save_dir, args.resume)
+        resume_path = (
+            args.resume
+            if args.resume.endswith('.pth')
+            else resolve_checkpoint_path(
+                args.save_dir,
+                args.resume,
+                artifact_root=args.artifact_root,
+            )
+        )
         if resume_path and os.path.exists(resume_path):
             agent.load(resume_path)
             log.info(f"Resumed training from {resume_path}")
@@ -4571,13 +4830,24 @@ def train(args):
         if not os.path.exists(ewc_path):
             # Try glob pattern for timestamped EWC files
             # Pattern: YYYYMMDD-HHMMSS-ewc.pth or user-provided glob
-            if '*' in ewc_path:
+            if ewc_path == "latest":
+                matching_ewc = []
+                latest_ewc = resolve_latest_ewc_path(
+                    args.save_dir,
+                    args.artifact_root,
+                )
+                if latest_ewc:
+                    matching_ewc = [latest_ewc]
+            elif '*' in ewc_path:
                 # User provided a glob pattern
                 matching_ewc = sorted(glob.glob(ewc_path), reverse=True)
             else:
                 # Try standard timestamped pattern in save_dir
-                pattern = os.path.join(args.save_dir, "*-ewc.pth")
-                matching_ewc = sorted(glob.glob(pattern), reverse=True)
+                latest_ewc = resolve_latest_ewc_path(
+                    args.save_dir,
+                    args.artifact_root,
+                )
+                matching_ewc = [latest_ewc] if latest_ewc else []
 
             if matching_ewc:
                 ewc_path = matching_ewc[0]
@@ -4628,7 +4898,7 @@ def train(args):
 
     # Durable training artifacts for post-hoc reporting even if terminal logs
     # or InfluxDB retention are lost.
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
     artifact_logger = TrainingArtifactLogger(
         args,
         run_id=run_id,
@@ -4637,6 +4907,18 @@ def train(args):
         buffer_capacity=buffer_capacity,
         lr=lr,
     )
+    state_publisher = TrainingRunStatePublisher(
+        args.training_state_file,
+        run_id=run_id,
+        run_dir=artifact_logger.run_dir,
+        logs_dir=artifact_logger.logs_dir,
+        checkpoint_dir=artifact_logger.checkpoint_dir,
+        collector_dir=artifact_logger.collector_dir,
+        artifact_root=artifact_logger.artifact_root,
+        split_every_steps=args.collector_spool_split_steps,
+        args=args,
+    )
+    state_publisher.publish(status="running", total_step=0, episode=0)
     
     # Training state
     total_steps = 0
@@ -4645,8 +4927,7 @@ def train(args):
     episode_rewards = deque(maxlen=100)  # Track episode rewards for rolling average (bounded)
     force_recovery_reset_next = False
     
-    # Checkpoints
-    os.makedirs(args.save_dir, exist_ok=True)
+    # Checkpoints are stored in the media-backed run directory.
     checkpoint_steps = {
         int(args.steps * 0.25): '25pct',
         int(args.steps * 0.50): '50pct',
@@ -4695,10 +4976,28 @@ def train(args):
             log.info(f"\n{'='*50}")
             log.info(f"Episode {episode} [{reset_type}] (total steps: {total_steps}, reset_prob={reset_prob:.2f})")
             log.info(f"Traffic profile: {env.current_traffic_profile} ({env.current_traffic_category})")
+            state_publisher.publish(
+                status="running",
+                total_step=total_steps,
+                episode=episode,
+                episode_step=0,
+                reset_type=reset_type,
+                traffic_profile=env.current_traffic_profile,
+                traffic_category=env.current_traffic_category,
+            )
             
             while not done and total_steps < args.steps:
                 total_steps += 1
                 episode_steps += 1
+                state_publisher.publish(
+                    status="running",
+                    total_step=total_steps,
+                    episode=episode,
+                    episode_step=episode_steps,
+                    reset_type=reset_type,
+                    traffic_profile=env.current_traffic_profile,
+                    traffic_category=env.current_traffic_category,
+                )
                 
                 # Get valid actions and select action
                 valid_mask = env.get_valid_actions()
@@ -4766,7 +5065,7 @@ def train(args):
                         f"buffer={stats['buffer_size']:5d} "
                         f"loss={loss_str:>8} "
                         f"sla={len(info['sla_met'])}/"
-                        f"{info.get('sla_total', 3)} "
+                        f"{info.get('sla_total', len(QIDS))} "
                         f"streak={info['sla_streak']}"
                     )
                 
@@ -4791,8 +5090,7 @@ def train(args):
                 # Save checkpoints
                 if total_steps in checkpoint_steps:
                     tag = checkpoint_steps[total_steps]
-                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_{tag}.pth")
+                    path = artifact_logger.checkpoint_file(tag)
                     agent.save(path)
                     artifact_logger.log_checkpoint(
                         tag=tag,
@@ -4845,11 +5143,12 @@ def train(args):
             # Track best model (based on rolling 100-episode average)
             if rolling_100 > best_avg_reward and len(episode_rewards) >= 50:
                 best_avg_reward = rolling_100
-                timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                new_path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_best.pth")
+                new_path = artifact_logger.checkpoint_file("best")
 
                 # Find old best checkpoints (to delete after successful save)
-                old_bests = glob.glob(os.path.join(args.save_dir, "*-dqn_v4_best.pth"))
+                old_bests = glob.glob(
+                    str(artifact_logger.checkpoint_dir / "*-dqn_v4_best.pth")
+                )
 
                 # Save new checkpoint first
                 agent.save(new_path)
@@ -4883,8 +5182,7 @@ def train(args):
     
     finally:
         # Save final model
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        path = os.path.join(args.save_dir, f"{timestamp}-dqn_v4_final.pth")
+        path = artifact_logger.checkpoint_file("final")
         agent.save(path)
         artifact_logger.log_checkpoint(
             tag="final",
@@ -4902,7 +5200,7 @@ def train(args):
 
         # Compute and save EWC Fisher matrix if requested (for next topology)
         if args.compute_ewc and not interrupted:
-            ewc_path = os.path.join(args.save_dir, f"{timestamp}-ewc.pth")
+            ewc_path = artifact_logger.checkpoint_file("ewc", ewc=True)
             log.info("Computing EWC Fisher matrix for next topology...")
             agent.save_ewc(ewc_path, env, EWC_FISHER_SAMPLES)
             artifact_logger.log_checkpoint(
@@ -4928,6 +5226,16 @@ def train(args):
             episodes=episode,
             best_avg_reward=best_avg_reward,
             final_stats=agent.get_stats(),
+        )
+        state_publisher.publish(
+            status="interrupted" if interrupted else "complete",
+            total_step=total_steps,
+            episode=episode,
+            episode_step=locals().get("episode_steps", 0),
+            extra={
+                "final_checkpoint": path,
+                "best_avg_reward": best_avg_reward,
+            },
         )
 
     log.info("\nTraining complete!")
@@ -4969,7 +5277,11 @@ def evaluate(args):
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
 
     # Load weights - find latest checkpoint with datetime prefix or fallback to legacy
-    weights_path = resolve_checkpoint_path(args.save_dir, args.weights_tag)
+    weights_path = resolve_checkpoint_path(
+        args.save_dir,
+        args.weights_tag,
+        artifact_root=args.artifact_root,
+    )
     if not weights_path:
         log.error(f"Weights file not found for tag: {args.weights_tag}")
         return
@@ -5000,7 +5312,8 @@ def evaluate(args):
                     f"[Eval Step {step}] "
                     f"action={action_to_name(action):6s} "
                     f"reward={reward:+.2f} "
-                    f"sla_met={len(info['sla_met'])}/3"
+                    f"sla_met={len(info['sla_met'])}/"
+                    f"{info.get('sla_total', len(QIDS))}"
                 )
             
             state = next_state
@@ -5053,10 +5366,26 @@ def main():
     
     # Model
     parser.add_argument('--save-dir', default='training_files',
-                        help='Directory to save/load model weights')
+                        help='Legacy directory to load model weights from; new '
+                             'training checkpoints are written under '
+                             '<artifact-root>/<run-id>/checkpoints')
+    parser.add_argument('--artifact-root',
+                        default=DEFAULT_EXTERNAL_ARTIFACT_ROOT,
+                        help='External media root for organized training runs '
+                             f'(default: {DEFAULT_EXTERNAL_ARTIFACT_ROOT})')
+    parser.add_argument('--run-id', default=None,
+                        help='Training run id. Defaults to YYYYMMDD-HHMMSS.')
     parser.add_argument('--training-log-dir', default=None,
                         help='Directory for durable training report artifacts '
-                             '(default: <save-dir>/training_logs)')
+                             '(default: <artifact-root>/<run-id>/logs)')
+    parser.add_argument('--training-state-file',
+                        default=DEFAULT_TRAINING_STATE_FILE,
+                        help='Small JSON state file consumed by the collector '
+                             f'(default: {DEFAULT_TRAINING_STATE_FILE})')
+    parser.add_argument('--collector-spool-split-steps', type=int,
+                        default=DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS,
+                        help='Training-step range per collector spool split '
+                             f'(default: {DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS})')
     parser.add_argument('--training-log-flush-every', type=int, default=25,
                         help='Flush durable local training logs every N steps '
                              '(default: 25; checkpoints/episodes always flush)')
@@ -5161,7 +5490,15 @@ def main():
     args = parser.parse_args()
 
     # Setup logging based on log level
-    setup_logging(log_level=args.log_level)
+    log_dir = None
+    if args.mode == 'train':
+        if not args.run_id:
+            args.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir_path = _training_logs_dir(args, args.run_id)
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        normalize_artifact_permissions(log_dir_path, dir_mode=0o775)
+        log_dir = str(log_dir_path)
+    setup_logging(log_level=args.log_level, log_dir=log_dir)
 
     needs_influx = (
         args.telemetry_backend in ('influx', 'cache-fallback-influx')

@@ -42,9 +42,13 @@ TRAFFIC_TEST_INFLUX_DETAIL ?= off
 TELEMETRY_BACKEND ?= cache
 TELEMETRY_CACHE_SOCKET ?= /tmp/p4_qos_int_telemetry.sock
 TELEMETRY_CACHE_TIMEOUT ?= 1.0
+EXTERNAL_ARTIFACT_ROOT ?= /media/sf_amjad/p4_qos_int/training_runs
+TRAINING_STATE_FILE ?= /tmp/p4_qos_int_training_state.json
+COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS ?= 5000
 COLLECTOR_INFLUX_WRITE ?= off
 COLLECTOR_LOCAL_SPOOL ?= on
-COLLECTOR_LOCAL_SPOOL_DIR ?= training_files/collector_spool
+COLLECTOR_LOCAL_SPOOL_DIR ?= $(EXTERNAL_ARTIFACT_ROOT)/_collector_pending
+COLLECTOR_PROCESS_LOG_DIR ?= $(EXTERNAL_ARTIFACT_ROOT)/_collector_logs
 PRODUCTION_INFLUX_WRITE ?= off
 TRAIN_LOG_DIR ?=
 ALL_TRAFFIC_PROFILES ?= light_1 light_2 medium_1 medium_2 high_1 high_2 bursty_vo_1 bursty_vo_2 bursty_vo_3 bursty_vi_1 bursty_vi_2 bursty_vi_3 bursty_be_1 bursty_be_2 bursty_be_3
@@ -82,11 +86,13 @@ DETECT_TOPOLOGY = $(shell cat .active_topology 2>/dev/null || echo "$(TOPO_DIR)/
 LOG_LEVEL_FLAG := --log-level $(LOG_LEVEL)
 BENCH_OUTPUT_FLAG := $(if $(BENCH_OUTPUT),--output-dir $(BENCH_OUTPUT),)
 TRAIN_LOG_DIR_FLAG = $(if $(TRAIN_LOG_DIR),--training-log-dir $(TRAIN_LOG_DIR),)
-TRAIN_LOGGING_FLAGS = --training-log-flush-every $(TRAIN_LOG_FLUSH_EVERY) $(TRAIN_LOG_DIR_FLAG)
+TRAIN_ARTIFACT_FLAGS = --artifact-root $(EXTERNAL_ARTIFACT_ROOT) --training-state-file $(TRAINING_STATE_FILE) --collector-spool-split-steps $(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)
+TRAIN_LOGGING_FLAGS = --training-log-flush-every $(TRAIN_LOG_FLUSH_EVERY) $(TRAIN_LOG_DIR_FLAG) $(TRAIN_ARTIFACT_FLAGS)
 TRAIN_RESET_FLAGS = --reset-prob-start $(TRAIN_RESET_PROB_START) --reset-prob-end $(TRAIN_RESET_PROB_END) --baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) --warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN)
 TRAIN_COMMON_FLAGS = $(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_RESET_FLAGS) --training-influx-detail $(TRAIN_INFLUX_DETAIL)
 TELEMETRY_FLAGS = --telemetry-backend $(TELEMETRY_BACKEND) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --telemetry-cache-timeout $(TELEMETRY_CACHE_TIMEOUT)
-COLLECTOR_TELEMETRY_FLAGS = --influx-write $(COLLECTOR_INFLUX_WRITE) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --local-spool $(COLLECTOR_LOCAL_SPOOL) --local-spool-dir $(COLLECTOR_LOCAL_SPOOL_DIR)
+COLLECTOR_ARTIFACT_FLAGS = --artifact-root $(EXTERNAL_ARTIFACT_ROOT) --training-state-file $(TRAINING_STATE_FILE) --local-spool-split-steps $(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)
+COLLECTOR_TELEMETRY_FLAGS = --influx-write $(COLLECTOR_INFLUX_WRITE) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --local-spool $(COLLECTOR_LOCAL_SPOOL) --local-spool-dir $(COLLECTOR_LOCAL_SPOOL_DIR) $(COLLECTOR_ARTIFACT_FLAGS)
 
 # =============================================
 # Common Command Variables
@@ -144,9 +150,9 @@ clean_bench clean-benchmark:
 # Remove durable training report artifacts while preserving model checkpoints
 # and the tracked training_logs/.gitkeep placeholder.
 clean_training_logs clean-training-logs:
-	@echo "Removing durable training logs from training_files/training_logs..."
+	@echo "Removing legacy local durable training logs from training_files/training_logs..."
 	sudo rm -rf training_files/training_logs/*
-	@echo "Training logs cleaned; model checkpoints preserved."
+	@echo "Legacy local training logs cleaned; media-backed runs are preserved."
 
 bench:
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
@@ -162,8 +168,10 @@ endif
 collect:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Telemetry cache socket: $(TELEMETRY_CACHE_SOCKET), Influx writes: $(COLLECTOR_INFLUX_WRITE)"
-	@echo "Local telemetry spool: $(COLLECTOR_LOCAL_SPOOL) ($(COLLECTOR_LOCAL_SPOOL_DIR))"
-	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY) $(LOG_LEVEL_FLAG) $(COLLECTOR_TELEMETRY_FLAGS)
+	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
+	@echo "Training state file: $(TRAINING_STATE_FILE)"
+	@echo "Local telemetry spool: $(COLLECTOR_LOCAL_SPOOL) ($(COLLECTOR_LOCAL_SPOOL_DIR)), split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
+	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY) $(LOG_LEVEL_FLAG) --log-dir $(COLLECTOR_PROCESS_LOG_DIR) $(COLLECTOR_TELEMETRY_FLAGS)
 
 monitor:
 	$(PYTHON) monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
@@ -180,6 +188,8 @@ train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
 	@echo "Training steps: $(TRAIN_STEPS), Influx training detail: $(TRAIN_INFLUX_DETAIL)"
+	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
+	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
 	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
 	@echo "Reset schedule: $(TRAIN_RESET_PROB_START) -> $(TRAIN_RESET_PROB_END); cooldowns baseline=$(TRAIN_BASELINE_COOLDOWN)s warm=$(TRAIN_WARM_COOLDOWN)s"
 	@echo "Profile weights: $(TRAIN_PROFILE_WEIGHTS)"
@@ -406,9 +416,10 @@ help:
 	@echo "  make train_profile profile=<name> CHECKPOINT=final"
 	@echo "  make train_test           Test all profiles ($(TRAIN_TEST_STEPS) steps each)"
 	@echo "  make resume               Resume training from checkpoint"
-	@echo "  Training log artifacts: training_files/training_logs/<run_id>/"
+	@echo "  Training artifacts: $(EXTERNAL_ARTIFACT_ROOT)/<run_id>/{logs,checkpoints,collector}/"
 	@echo "  TRAIN_STEPS=55000 TRAIN_INFLUX_DETAIL=minimal|off"
-	@echo "  TRAIN_LOG_FLUSH_EVERY=25 TRAIN_LOG_DIR=<optional-dir>"
+	@echo "  TRAIN_LOG_FLUSH_EVERY=25 EXTERNAL_ARTIFACT_ROOT=/media/sf_amjad/p4_qos_int/training_runs"
+	@echo "  TRAINING_STATE_FILE=$(TRAINING_STATE_FILE) COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS=5000"
 	@echo "  TRAIN_PROFILE_WEIGHTS=<profile:weight,...>"
 	@echo "  TRAIN_RESET_PROB_START=0.80 TRAIN_RESET_PROB_END=0.25"
 	@echo "  TRAIN_BASELINE_COOLDOWN=5 TRAIN_WARM_COOLDOWN=3"
@@ -436,7 +447,7 @@ help:
 	@echo "    BENCH_PROFILES=$(ALL_TRAFFIC_PROFILES_CSV)"
 	@echo "    BENCH_REPETITIONS=6 STEPS=300 BENCH_COOLDOWN=30"
 	@echo "  make clean_bench           Remove benchmark_results/ and run logs"
-	@echo "  make clean_training_logs   Remove training_files/training_logs contents"
+	@echo "  make clean_training_logs   Remove legacy training_files/training_logs contents"
 	@echo ""
 	@echo "Monitoring:"
 	@echo "  make collect              Run INT collector"

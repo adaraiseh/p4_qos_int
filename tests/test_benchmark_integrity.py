@@ -1,4 +1,5 @@
 import csv
+import copy
 import json
 import random
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import rl_agent_4
 from benchmark import (
     BenchmarkOrchestrator,
     parse_args,
@@ -19,6 +21,7 @@ from benchmark import (
     validate_runner_summary,
 )
 from ecmp_baseline import ECMPGroup, ECMPProgrammer
+from rl_agent_4 import QIDS, SLA_THRESHOLDS, QoSRoutingEnv
 from traffic_generator import TrafficManager
 
 
@@ -113,6 +116,274 @@ class ECMPProgrammingIntegrityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "expected 0 entries"):
             programmer.clear(required=True)
+
+
+class RLRoutingLogicIntegrityTests(unittest.TestCase):
+    PROFILES = (
+        "light_1",
+        "medium_2",
+        "high_1",
+        "bursty_vo_1",
+        "bursty_vi_2",
+        "bursty_be_3",
+    )
+
+    @staticmethod
+    def _env(profile):
+        env = object.__new__(QoSRoutingEnv)
+        env.current_traffic_profile = profile
+        env.last_action_time = 0.0
+        return env
+
+    @staticmethod
+    def _reward_snapshot():
+        return {
+            0: {"lat_p95": 50.0, "drop_p95": 0.0, "util_p95": 10.0},
+            1: {"lat_p95": 100.0, "drop_p95": 0.0, "util_p95": 20.0},
+            7: {"lat_p95": 250.0, "drop_p95": 1.0, "util_p95": 30.0},
+        }
+
+    @staticmethod
+    def _action_snapshot():
+        return {
+            qid: {
+                "lat_p95": SLA_THRESHOLDS[qid] * 1.25,
+                "bottleneck_sid": qid + 10,
+                "alternatives": [{"name": "alt0"}, {"name": "alt1"}],
+            }
+            for qid in QIDS
+        }
+
+    @staticmethod
+    def _valid_cache_queue_summary():
+        return {
+            "ok": True,
+            "metrics": {
+                str(qid): {
+                    "lat_p95": SLA_THRESHOLDS[qid] * 0.5,
+                    "drop_p95": 0.0,
+                    "util_p95": 20.0,
+                }
+                for qid in QIDS
+            },
+            "metrics_received": {
+                str(qid): {"lat": True, "drop": True, "util": True}
+                for qid in QIDS
+            },
+            "counts": {
+                str(qid): {"lat": 1, "drop": 1, "util": 1}
+                for qid in QIDS
+            },
+            "demands": {},
+        }
+
+    class CapturingCache:
+        def __init__(self, responses=None):
+            self.requests = []
+            self.responses = responses or {}
+
+        def request(self, payload):
+            self.requests.append(copy.deepcopy(payload))
+            return copy.deepcopy(self.responses.get(payload["kind"], {"ok": True}))
+
+    class EmptyController:
+        @staticmethod
+        def get_all_switch_ids():
+            return []
+
+    class QueryRecord:
+        def __init__(self, qid, value=None, measurement=None, src_ip=None, dst_ip=None):
+            self.values = {"queue_id": str(qid)}
+            if src_ip is not None:
+                self.values["src_ip"] = src_ip
+            if dst_ip is not None:
+                self.values["dst_ip"] = dst_ip
+            self._value = value
+            self._measurement = measurement
+
+        def get_value(self):
+            return self._value
+
+        def get_measurement(self):
+            return self._measurement
+
+    class QueryTable:
+        def __init__(self, records):
+            self.records = records
+
+    class CapturingQueryApi:
+        def __init__(self, records):
+            self.records = records
+            self.queries = []
+
+        def query(self, org, query):
+            self.queries.append(query)
+            return [RLRoutingLogicIntegrityTests.QueryTable(self.records)]
+
+    @staticmethod
+    def _influx_env(profile, query_api):
+        env = RLRoutingLogicIntegrityTests._env(profile)
+        env.telemetry_cache = None
+        env.telemetry_backend = "influx"
+        env.bucket = "telemetry"
+        env.org = "test-org"
+        env.query_api = query_api
+        return env
+
+    def test_required_qids_are_profile_invariant(self):
+        for profile in self.PROFILES:
+            env = self._env(profile)
+
+            self.assertEqual(env._required_qids_for_current_profile(), QIDS)
+            self.assertEqual(env._min_required_valid_count(), 2)
+
+    def test_reward_accounts_for_all_queue_slas_for_every_profile(self):
+        reference = None
+        for profile in self.PROFILES:
+            env = self._env(profile)
+            reward, info = env._compute_reward(self._reward_snapshot())
+
+            self.assertEqual(tuple(info["reward_qids"]), QIDS)
+            self.assertEqual(info["sla_total"], len(QIDS))
+            self.assertEqual(set(info["per_queue"]), set(QIDS))
+
+            observed = (
+                round(float(reward), 6),
+                tuple(info["sla_met"]),
+                tuple(info["sla_violated"]),
+            )
+            if reference is None:
+                reference = observed
+            else:
+                self.assertEqual(observed, reference)
+
+    def test_action_mask_is_profile_invariant(self):
+        expected = [True] * 8
+        for profile in self.PROFILES:
+            env = self._env(profile)
+
+            self.assertEqual(
+                env._get_valid_actions(self._action_snapshot()).tolist(),
+                expected,
+            )
+
+    def test_bursty_profiles_do_not_neutralize_nonfocused_queues(self):
+        env = self._env("bursty_be_1")
+        snapshot = {
+            qid: {
+                "lat_p95": SLA_THRESHOLDS[qid] * 9.0,
+                "drop_p95": 3.0,
+                "util_p95": 77.0,
+                "data_valid": False,
+                "bottleneck_sid": qid + 20,
+                "alternatives": [{"name": "keep"}],
+            }
+            for qid in QIDS
+        }
+        before = copy.deepcopy(snapshot)
+
+        env._normalize_optional_queue_telemetry(snapshot)
+
+        for qid in QIDS:
+            self.assertEqual(snapshot[qid]["lat_p95"], before[qid]["lat_p95"])
+            self.assertEqual(snapshot[qid]["drop_p95"], before[qid]["drop_p95"])
+            self.assertEqual(snapshot[qid]["util_p95"], before[qid]["util_p95"])
+            self.assertEqual(
+                snapshot[qid]["alternatives"],
+                before[qid]["alternatives"],
+            )
+            self.assertTrue(snapshot[qid]["profile_required"])
+            self.assertFalse(snapshot[qid]["telemetry_optional"])
+
+    def test_bursty_local_cache_snapshot_requests_all_queues(self):
+        cache = self.CapturingCache({
+            "queue_summary": self._valid_cache_queue_summary(),
+        })
+        env = self._env("bursty_vi_1")
+        env.telemetry_cache = cache
+        env.telemetry_backend = "cache"
+        env.global_step = 1
+        env._query_executor = SimpleNamespace(
+            _work_queue=SimpleNamespace(qsize=lambda: 0)
+        )
+        env.controller = self.EmptyController()
+
+        snapshot = env._collect_snapshot()
+
+        self.assertEqual(cache.requests[0]["kind"], "queue_summary")
+        self.assertEqual(cache.requests[0]["qids"], list(QIDS))
+        self.assertTrue(all(snapshot[qid]["data_valid"] for qid in QIDS))
+
+    def test_bursty_local_cache_freshness_requests_all_queues(self):
+        cache = self.CapturingCache()
+        env = self._env("bursty_be_2")
+        env.telemetry_cache = cache
+        env.telemetry_backend = "cache"
+
+        env._cache_freshness(
+            start="2026-01-01T00:00:00Z",
+            stop="2026-01-01T00:00:01Z",
+        )
+
+        self.assertEqual(cache.requests[0]["kind"], "freshness")
+        self.assertEqual(cache.requests[0]["qids"], list(QIDS))
+
+    def test_influx_aggregated_metric_filter_tracks_qids(self):
+        extended_qids = (0, 1, 7, 9)
+        records = [
+            self.QueryRecord(qid, 1.0, measurement)
+            for qid in extended_qids
+            for measurement in ("lat_p95", "drop_p95", "util_p95")
+        ]
+        query_api = self.CapturingQueryApi(records)
+        env = self._influx_env("bursty_be_1", query_api)
+
+        with patch.object(rl_agent_4, "QIDS", extended_qids):
+            result = env._query_aggregated_metrics(
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:01Z",
+                step=1,
+            )
+
+        self.assertIn('r.queue_id == "9"', query_api.queries[0])
+        self.assertTrue(result["metrics_received"][9]["lat"])
+        self.assertTrue(result["metrics_received"][9]["drop"])
+        self.assertTrue(result["metrics_received"][9]["util"])
+
+    def test_influx_retry_metric_filter_uses_requested_queues(self):
+        query_api = self.CapturingQueryApi([
+            self.QueryRecord(9, 12.5),
+        ])
+        env = self._influx_env("bursty_be_1", query_api)
+
+        result = env._retry_metric_query(
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+            [9],
+            "flow_latency",
+            "flow_latency",
+            step=1,
+        )
+
+        self.assertEqual(result, {9: 12.5})
+        self.assertIn('r.queue_id == "9"', query_api.queries[0])
+        self.assertNotIn('r.queue_id == "0"', query_api.queries[0])
+
+    def test_bursty_influx_hot_demands_request_all_queues(self):
+        query_api = self.CapturingQueryApi([
+            self.QueryRecord(qid, src_ip=f"10.0.{qid}.1", dst_ip=f"10.0.{qid}.2")
+            for qid in QIDS
+        ])
+        env = self._influx_env("bursty_vo_1", query_api)
+
+        result = env._get_all_hottest_demands(
+            step=1,
+            target_qids=list(env._required_qids_for_current_profile()),
+        )
+
+        self.assertEqual(set(result), set(QIDS))
+        for qid in QIDS:
+            self.assertIn(f'r.queue_id == "{qid}"', query_api.queries[0])
 
 
 class BenchmarkReportingIntegrityTests(unittest.TestCase):
@@ -592,8 +863,96 @@ class TrafficIntegrityTests(unittest.TestCase):
             TrafficManager.PROFILE_STAGE_LOADS["bursty_be_1"]["high"],
         )
         manager._apply_sender_caps.assert_called_once_with(
-            "bursty_be_1"
+            "bursty_be_1",
+            verify=False,
+            verify_reason="step_3",
         )
+
+    def test_bursty_step_profile_keeps_schedule_with_periodic_verification(self):
+        manager = object.__new__(TrafficManager)
+        manager.current_profile_name = "bursty_be_1"
+        manager.current_load = TrafficManager.PROFILE_STAGE_LOADS[
+            "bursty_be_1"
+        ]["low"].copy()
+        manager._shaped_stage_high = False
+        manager._bursty_cycle_patterns = {
+            0: (0, 0, 1, 1, 1, 0, 0, 0, 0, 0),
+            1: (0, 0, 1, 0, 0, 0, 0, 0, 1, 1),
+        }
+
+        def fake_apply(profile_name, verify=True, verify_reason="startup"):
+            return {
+                "profile": profile_name,
+                "verified": verify,
+                "verify_reason": verify_reason,
+            }
+
+        manager._apply_sender_caps = Mock(side_effect=fake_apply)
+
+        reports = {}
+        for step in range(1, 21):
+            report = manager.apply_step_profile(step)
+            if report is not None:
+                reports[step] = report
+
+        self.assertEqual(sorted(reports), [3, 6, 13, 14, 19, 20])
+        self.assertEqual(
+            manager.current_load,
+            TrafficManager.PROFILE_STAGE_LOADS["bursty_be_1"]["high"],
+        )
+        self.assertEqual(reports[19]["profile_cycle"], 2)
+        self.assertEqual(reports[19]["cycle_pattern"], "0010000011")
+        self.assertFalse(reports[19]["verified"])
+        self.assertTrue(reports[20]["verified"])
+        self.assertFalse(reports[20]["stage_changed"])
+        self.assertEqual(
+            [call.kwargs["verify"] for call in manager._apply_sender_caps.call_args_list],
+            [False, False, False, False, False, True],
+        )
+
+    def test_step_profile_verifies_every_twenty_steps(self):
+        manager = object.__new__(TrafficManager)
+        manager.current_profile_name = "light_1"
+        manager.current_load = TrafficManager.PROFILE_STAGE_LOADS[
+            "light_1"
+        ]["low"].copy()
+        manager._shaped_stage_high = False
+        manager._apply_sender_caps = Mock(
+            return_value={"verified": True}
+        )
+
+        report = manager.apply_step_profile(20)
+
+        self.assertEqual(report["step"], 20)
+        self.assertEqual(report["profile_step"], 20)
+        self.assertFalse(report["stage_changed"])
+        manager._apply_sender_caps.assert_called_once_with(
+            "light_1",
+            verify=True,
+            verify_reason="step_20",
+        )
+
+    def test_sender_cap_skip_verification_uses_cached_tc_metadata(self):
+        manager = object.__new__(TrafficManager)
+        manager._tc_original_classes = {
+            "h1": {
+                "pid": "1234",
+                "interface": "h1-eth0",
+                "classid": "1:1",
+                "rate": "10Mbit",
+                "ceil": "10Mbit",
+                "burst": "15Kb",
+                "cburst": "15Kb",
+            }
+        }
+
+        with patch("traffic_generator.subprocess.run") as run:
+            run.return_value = SimpleNamespace(stdout="")
+            report = manager._set_sender_rate_cap("h1", 3.2, verify=False)
+
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("change", run.call_args.args[0])
+        self.assertTrue(report["verification_skipped"])
 
     def test_begin_measurement_applies_target_without_restarting_flows(self):
         manager = object.__new__(TrafficManager)

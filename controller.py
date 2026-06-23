@@ -6,6 +6,7 @@ import glob
 import os
 import threading
 import logging
+import time
 from collections import deque
 from contextlib import redirect_stdout, redirect_stderr
 from functools import lru_cache
@@ -192,6 +193,7 @@ class Controller:
             self.controllers[sw_name] = SimpleSwitchThriftAPI(thrift_port)
 
     def build_network_graph(self):
+        self.net_graph.clear()
         p4switches = list(self.topo.get_p4switches().keys())
         hosts = list(self.topo.get_hosts().keys())
 
@@ -230,8 +232,10 @@ class Controller:
                         1,
                     )
                     self.net_graph.add_edge(node, neighbor, weight=weight)
+        self._invalidate_route_caches()
 
     def compute_forwarding_entries(self):
+        self._invalidate_route_caches()
         hosts = list(self.topo.get_hosts().keys())
 
         # Exclude collector hosts (they're for INT reports only, not traffic)
@@ -439,6 +443,7 @@ class Controller:
 
             for qid in self.paths_per_queue:
                 self.paths_per_queue[qid].clear()
+            self._invalidate_route_caches()
 
         if failures:
             message = "P4 table clear verification failed: " + "; ".join(
@@ -679,8 +684,13 @@ class Controller:
         return tuple(self._find_all_alternates_unlocked(worst_switch_id, list(path_tuple)))
 
     def _invalidate_alternates_cache(self):
-        """Clear the alternates cache after topology changes or reroutes."""
+        """Clear the alternates cache after topology or baseline path rebuilds."""
         self._cached_find_all_alternates.cache_clear()
+
+    def _invalidate_route_caches(self):
+        """Clear route-planning caches after topology or baseline path rebuilds."""
+        self._cached_find_all_alternates.cache_clear()
+        self._cached_plan_safe_reroute_path.cache_clear()
 
     def _find_all_alternates_unlocked(self, worst_switch_id: int, path: list[str]) -> list[str]:
         """Internal implementation without locking."""
@@ -1075,6 +1085,33 @@ class Controller:
         worst_name: str,
         alt_switch_name: str,
     ) -> tuple[Optional[list[str]], str]:
+        planned, msg = self._cached_plan_safe_reroute_path(
+            tuple(original_path or ()),
+            worst_name,
+            alt_switch_name,
+        )
+        return (list(planned) if planned is not None else None), msg
+
+    @lru_cache(maxsize=2048)
+    def _cached_plan_safe_reroute_path(
+        self,
+        original_path_tuple: Tuple[str, ...],
+        worst_name: str,
+        alt_switch_name: str,
+    ) -> Tuple[Optional[Tuple[str, ...]], str]:
+        planned, msg = self._plan_safe_reroute_path_uncached(
+            list(original_path_tuple),
+            worst_name,
+            alt_switch_name,
+        )
+        return (tuple(planned) if planned is not None else None), msg
+
+    def _plan_safe_reroute_path_uncached(
+        self,
+        original_path: list[str],
+        worst_name: str,
+        alt_switch_name: str,
+    ) -> tuple[Optional[list[str]], str]:
         """
         Plan a safe reroute for a queue path.
 
@@ -1184,6 +1221,8 @@ class Controller:
     def _reroute_one_demand_symmetric_unlocked(self, src_ip: str, dst_ip: str, qid: int,
                                  worst_switch_id: int, alt_switch_name: str):
         """Internal implementation without locking."""
+        reroute_t0 = time.perf_counter()
+        timing = {}
         dscp = self._dscp_for_qid(qid)
         worst_name = self.switch_id_to_name.get(int(worst_switch_id))
         if not worst_name:
@@ -1206,11 +1245,13 @@ class Controller:
         if not path_fwd_orig or worst_name not in path_fwd_orig:
             return False, "no stored forward path or worst not in path"
             
+        phase_t0 = time.perf_counter()
         fwd_new_path, plan_msg = self._plan_safe_reroute_path(
             path_fwd_orig,
             worst_name,
             alt_switch_name,
         )
+        timing["plan_ms"] = (time.perf_counter() - phase_t0) * 1000.0
         if not fwd_new_path:
             return False, f"unsafe reroute rejected: {plan_msg}"
 
@@ -1246,9 +1287,21 @@ class Controller:
 
         # --- INSTALL OVERLAYS ---
 
-        def _install_overlay_along_path(path: list[str], dst_h: str, dst_ip_: str):
+        def _install_overlay_along_path(
+            path: list[str],
+            dst_h: str,
+            dst_ip_: str,
+            label: str,
+        ):
+            install_t0 = time.perf_counter()
+            upsert_ms = 0.0
+            upsert_count = 0
             if not path or len(path) < 3:
                 log.warning(f"[Reroute] Path too short for overlay: path={path}, len={len(path) if path else 0}, dst={dst_ip_}")
+                timing[f"{label}_install_ms"] = (time.perf_counter() - install_t0) * 1000.0
+                timing[f"{label}_upsert_ms"] = 0.0
+                timing[f"{label}_upserts"] = 0
+                timing[f"{label}_changes"] = 0
                 return None
             dst_prefix = f"{dst_ip_}/32"
             changes = []
@@ -1269,7 +1322,17 @@ class Controller:
                 
                 # Only upsert if different from current
                 if before != (nh_ip, eport):
+                    upsert_t0 = time.perf_counter()
                     ok = self._upsert_lpm(sw, dst_prefix, dscp, nh_ip, eport)
+                    op_ms = (time.perf_counter() - upsert_t0) * 1000.0
+                    upsert_ms += op_ms
+                    upsert_count += 1
+                    if op_ms >= 750.0:
+                        log.warning(
+                            f"[Reroute Timing] slow LPM upsert "
+                            f"qid={qid} dir={label} sw={sw} dst={dst_prefix} "
+                            f"dscp={dscp} ms={op_ms:.0f}"
+                        )
                     if not ok:
                         log.warning(f"[Reroute] LPM upsert failed at sw={sw}, rolling back {len(changes)} changes")
                         # Rollback this path's changes on failure
@@ -1290,6 +1353,10 @@ class Controller:
                                         pass
                                 except Exception:
                                     pass
+                        timing[f"{label}_install_ms"] = (time.perf_counter() - install_t0) * 1000.0
+                        timing[f"{label}_upsert_ms"] = upsert_ms
+                        timing[f"{label}_upserts"] = upsert_count
+                        timing[f"{label}_changes"] = len(changes)
                         return None
 
                     # Only record change if upsert was actually performed
@@ -1300,11 +1367,15 @@ class Controller:
                         "before": before,
                         "after": (nh_ip, eport),
                     })
+            timing[f"{label}_install_ms"] = (time.perf_counter() - install_t0) * 1000.0
+            timing[f"{label}_upsert_ms"] = upsert_ms
+            timing[f"{label}_upserts"] = upsert_count
+            timing[f"{label}_changes"] = len(changes)
             return changes
 
         log.debug(f"[Reroute] Installing overlays: fwd_path={' -> '.join(fwd_new_path)}, rev_path={' -> '.join(rev_new_path)}")
-        fwd_changes = _install_overlay_along_path(fwd_new_path, dst_host, dst_ip)
-        rev_changes = _install_overlay_along_path(rev_new_path, src_host, src_ip)
+        fwd_changes = _install_overlay_along_path(fwd_new_path, dst_host, dst_ip, "fwd")
+        rev_changes = _install_overlay_along_path(rev_new_path, src_host, src_ip, "rev")
 
         # CRITICAL: If EITHER direction fails, we must rollback and fail the entire operation
         # to prevent asymmetric routing (packets going one way but not returning correctly)
@@ -1388,10 +1459,24 @@ class Controller:
         if int(qid) not in self.change_history_by_qid:
             self.change_history_by_qid[int(qid)] = deque(maxlen=self.MAX_HISTORY_DEPTH)
         self.change_history_by_qid[int(qid)].append(rec)
+        phase_t0 = time.perf_counter()
         self.dump_paths_json()
+        timing["dump_paths_ms"] = (time.perf_counter() - phase_t0) * 1000.0
+        total_ms = (time.perf_counter() - reroute_t0) * 1000.0
 
-        # Invalidate alternates cache since path changed (CPU optimization cache management)
-        self._invalidate_alternates_cache()
+        if total_ms >= 1500.0 or any(float(v) >= 750.0 for v in timing.values()):
+            log.info(
+                f"[Reroute Timing] qid={qid} src={src_ip} dst={dst_ip} "
+                f"worst={worst_name} alt={alt_switch_name} total={total_ms:.0f}ms "
+                f"plan={timing.get('plan_ms', 0.0):.0f}ms "
+                f"fwd_install={timing.get('fwd_install_ms', 0.0):.0f}ms "
+                f"rev_install={timing.get('rev_install_ms', 0.0):.0f}ms "
+                f"fwd_upserts={int(timing.get('fwd_upserts', 0))} "
+                f"rev_upserts={int(timing.get('rev_upserts', 0))} "
+                f"fwd_upsert_ms={timing.get('fwd_upsert_ms', 0.0):.0f} "
+                f"rev_upsert_ms={timing.get('rev_upsert_ms', 0.0):.0f} "
+                f"dump_paths={timing.get('dump_paths_ms', 0.0):.0f}ms"
+            )
 
         return True, "ok"
 

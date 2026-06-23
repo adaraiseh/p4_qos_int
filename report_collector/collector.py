@@ -463,6 +463,7 @@ class Collector:
             # Reusable buffer for points
             # Pre-allocating somewhat helps avoid resizing overhead
             points = [] 
+            cache_points = []
             
             # --- Extract Flow Metadata Once ---
             dst_ip = flow_info.dst_ip
@@ -552,12 +553,37 @@ class Collector:
                     points.append(
                         f"switch_latency,{base_tags},{hop_tags_no_port} value={hop_lats[i] / 1000.0} {report_time}"
                     )
+                    cache_points.append((
+                        "switch_latency",
+                        {
+                            "dst_ip": dst_ip,
+                            "flow_id": flow_id,
+                            "queue_id": queue_id,
+                            "src_ip": src_ip,
+                            "switch_id": switch_id,
+                        },
+                        hop_lats[i] / 1000.0,
+                        report_time,
+                    ))
 
                     # 2. tx_utilization
                     # measurement=tx_utilization,dst_ip=...,egress_port=...,flow_id=...,queue_id=...,src_ip=...,switch_id=... value=... ts
                     points.append(
                         f"tx_utilization,{base_tags},{hop_tags_with_port} value={tx_utils[i]} {report_time}"
                     )
+                    cache_points.append((
+                        "tx_utilization",
+                        {
+                            "dst_ip": dst_ip,
+                            "egress_port": egress_port,
+                            "flow_id": flow_id,
+                            "queue_id": queue_id,
+                            "src_ip": src_ip,
+                            "switch_id": switch_id,
+                        },
+                        tx_utils[i],
+                        report_time,
+                    ))
 
                     # 3. queue_occupancy (Optional)
                     if enable_occupancy:
@@ -579,6 +605,12 @@ class Collector:
                         points.append(
                            f"q_drop_rate_100ms,{base_tags},{hop_tags_with_port} value={dr['value']} {dr['ts_ns']}"
                         )
+                        cache_points.append((
+                            dr["measurement"],
+                            dr["tags"],
+                            dr["value"],
+                            dr["ts_ns"],
+                        ))
 
             else:
                 # --- AGGREGATION PATH (Legacy/Slow) ---
@@ -688,6 +720,17 @@ class Collector:
                      points.append(
                         f"flow_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={int_queue_id},src_ip={src_ip} value={float(flow_latency)} {report_time}"
                      )
+                     cache_points.append((
+                        "flow_latency",
+                        {
+                            "dst_ip": dst_ip,
+                            "flow_id": flow_id,
+                            "queue_id": int_queue_id,
+                            "src_ip": src_ip,
+                        },
+                        float(flow_latency),
+                        report_time,
+                     ))
                      self._lat_count = getattr(self, '_lat_count', 0) + 1
                      # Track per-queue flow_latency distribution for diagnostics
                      if not hasattr(self, '_lat_per_queue'):
@@ -739,7 +782,10 @@ class Collector:
             # Write batch
             if points:
                 if self.telemetry_cache is not None:
-                    self.telemetry_cache.add_line_points(points)
+                    if cache_points:
+                        self.telemetry_cache.add_preparsed_points(cache_points)
+                    else:
+                        self.telemetry_cache.add_line_points(points)
                 if self.telemetry_spool is not None:
                     self.telemetry_spool.write_lines(points)
 

@@ -15,6 +15,7 @@ import socketserver
 import threading
 import time
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
@@ -25,6 +26,7 @@ from logging_config import normalize_artifact_permissions
 log = logging.getLogger(__name__)
 
 DEFAULT_SOCKET_PATH = "/tmp/p4_qos_int_telemetry.sock"
+DEFAULT_TRAINING_STATE_PATH = "/tmp/p4_qos_int_training_state.json"
 RELEVANT_MEASUREMENTS = {
     "flow_latency",
     "q_drop_rate_100ms",
@@ -58,21 +60,67 @@ class LocalTelemetryCache:
         """Cache relevant records from the exact line protocol sent to Influx."""
         now_ns = time.time_ns()
         seen = 0
-        parsed_points = []
+        points_by_measurement = defaultdict(list)
+        cached_count = 0
         for line in lines:
             seen += 1
             parsed = _parse_line_protocol(line)
             if parsed is None:
                 continue
             measurement, tags, value, ts_ns = parsed
-            parsed_points.append((measurement, ts_ns, value, tags, now_ns))
+            points_by_measurement[measurement].append((ts_ns, value, tags, now_ns))
+            cached_count += 1
 
         with self._lock:
-            for measurement, ts_ns, value, tags, ingest_ns in parsed_points:
-                self._points[measurement].append((ts_ns, value, tags, ingest_ns))
+            for measurement, points in points_by_measurement.items():
+                self._points[measurement].extend(points)
 
             self._records_seen += seen
-            self._records_cached += len(parsed_points)
+            self._records_cached += cached_count
+            if now_ns - self._last_prune_ns >= 500_000_000:
+                self._prune_locked(now_ns)
+                self._last_prune_ns = now_ns
+
+    def add_preparsed_points(
+        self,
+        records: Iterable[Tuple[str, Dict[str, Any], Any, int]],
+    ) -> None:
+        """Cache records already built by the collector.
+
+        This is the low-CPU path for live training. The collector still writes
+        the exact line-protocol strings to the durable spool/Influx path; this
+        method avoids parsing those same strings a second time for the in-memory
+        cache.
+        """
+        now_ns = time.time_ns()
+        seen = 0
+        points_by_measurement = defaultdict(list)
+        cached_count = 0
+        for measurement, tags, value, ts_ns in records:
+            seen += 1
+            if measurement not in RELEVANT_MEASUREMENTS:
+                continue
+            try:
+                value = float(value)
+                ts_ns = int(ts_ns)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            points_by_measurement[str(measurement)].append((
+                ts_ns,
+                value,
+                {str(key): str(val) for key, val in tags.items()},
+                now_ns,
+            ))
+            cached_count += 1
+
+        with self._lock:
+            for measurement, points in points_by_measurement.items():
+                self._points[measurement].extend(points)
+
+            self._records_seen += seen
+            self._records_cached += cached_count
             if now_ns - self._last_prune_ns >= 500_000_000:
                 self._prune_locked(now_ns)
                 self._last_prune_ns = now_ns
@@ -791,13 +839,42 @@ class LocalTelemetryClient:
         return response
 
 
+def _safe_path_component(value: Optional[str], fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+    cleaned = "".join(
+        ch if ch.isalnum() or ch in ("-", "_", ".") else "_"
+        for ch in text
+    )
+    cleaned = cleaned.strip("._-")
+    return cleaned or fallback
+
+
+@dataclass
+class _SpoolTarget:
+    run_id: str
+    run_dir: Path
+    collector_dir: Path
+    spool_dir: Path
+    path: Path
+    manifest_path: Path
+    segment_index: int
+    segment_start_step: Optional[int]
+    segment_end_step: Optional[int]
+    current_step: Optional[int]
+    state: Dict[str, Any]
+
+
 class LineProtocolSpoolWriter:
     """Background writer for durable local INT telemetry artifacts.
 
     The spool stores the exact Influx line-protocol records produced by the
     collector. If the disk writer falls behind, ``write_lines`` applies
     backpressure instead of dropping records; that is the only way to make the
-    artifact complete when Influx is disabled.
+    artifact complete when Influx is disabled. When attached to a training
+    state file, records are split into reusable run-scoped line-protocol files
+    by training step range.
     """
 
     def __init__(
@@ -806,11 +883,20 @@ class LineProtocolSpoolWriter:
         prefix: str = "int_metrics",
         flush_interval_seconds: float = 1.0,
         max_queue_batches: int = 8192,
+        run_state_path: Optional[str] = None,
+        external_artifact_root: Optional[str] = None,
+        split_every_steps: int = 5000,
     ):
         started_at = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        self.prefix = prefix
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         normalize_artifact_permissions(self.output_dir, dir_mode=0o775)
+        self.external_artifact_root = (
+            Path(external_artifact_root) if external_artifact_root else None
+        )
+        self.run_state_path = Path(run_state_path) if run_state_path else None
+        self.split_every_steps = max(0, int(split_every_steps or 0))
         self.path = self.output_dir / f"{started_at}_{prefix}.lp"
         self.manifest_path = self.output_dir / f"{started_at}_{prefix}.manifest.json"
         self.flush_interval_seconds = max(0.1, float(flush_interval_seconds))
@@ -827,6 +913,12 @@ class LineProtocolSpoolWriter:
         self.records_written = 0
         self.batches_written = 0
         self.started_at = started_at
+        self._state_cache: Dict[str, Any] = {}
+        self._state_mtime_ns: Optional[int] = None
+        self._active_target: Optional[_SpoolTarget] = None
+        self._active_records_written = 0
+        self._active_batches_written = 0
+        self._last_index_event: Optional[Tuple[str, str]] = None
         self._thread.start()
         self._write_manifest("running")
         log.info("Local telemetry spool writing %s", self.path)
@@ -843,8 +935,16 @@ class LineProtocolSpoolWriter:
         self._queue.join()
 
     def stats(self) -> Dict[str, Any]:
+        target = self._active_target
         return {
             "path": str(self.path),
+            "run_id": target.run_id if target else None,
+            "segment_index": target.segment_index if target else None,
+            "segment_start_step": (
+                target.segment_start_step if target else None
+            ),
+            "segment_end_step": target.segment_end_step if target else None,
+            "split_every_steps": self.split_every_steps,
             "records_written": self.records_written,
             "batches_written": self.batches_written,
             "queued_batches": self._queue.qsize(),
@@ -861,50 +961,240 @@ class LineProtocolSpoolWriter:
 
     def _run(self) -> None:
         last_flush = time.monotonic()
+        handle = None
         try:
-            with self.path.open("a", buffering=1024 * 1024) as handle:
-                normalize_artifact_permissions(self.path, file_mode=0o664)
-                while True:
-                    batch = self._queue.get()
-                    try:
-                        if batch is None:
+            while True:
+                batch = self._queue.get()
+                try:
+                    if batch is None:
+                        if handle is not None:
                             handle.flush()
                             os.fsync(handle.fileno())
-                            return
-                        handle.write("\n".join(batch))
-                        handle.write("\n")
-                        self.records_written += len(batch)
-                        self.batches_written += 1
-                        now = time.monotonic()
-                        if now - last_flush >= self.flush_interval_seconds:
+                            handle.close()
+                            self._write_manifest("closed")
+                        return
+
+                    target = self._resolve_target()
+                    if (
+                        self._active_target is None
+                        or target.path != self._active_target.path
+                    ):
+                        if handle is not None:
                             handle.flush()
-                            last_flush = now
-                    finally:
-                        self._queue.task_done()
+                            os.fsync(handle.fileno())
+                            handle.close()
+                            self._write_manifest("rotated")
+                        self._activate_target(target)
+                        handle = self.path.open("a", buffering=1024 * 1024)
+                        normalize_artifact_permissions(self.path, file_mode=0o664)
+                        self._write_manifest("running")
+                    else:
+                        self._active_target = target
+
+                    handle.write("\n".join(batch))
+                    handle.write("\n")
+                    self.records_written += len(batch)
+                    self.batches_written += 1
+                    self._active_records_written += len(batch)
+                    self._active_batches_written += 1
+                    now = time.monotonic()
+                    if now - last_flush >= self.flush_interval_seconds:
+                        handle.flush()
+                        last_flush = now
+                        self._write_manifest("running")
+                finally:
+                    self._queue.task_done()
         except Exception as exc:
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
             self._error = f"local telemetry spool failed: {exc}"
             log.error(self._error)
 
+    def _load_run_state(self) -> Dict[str, Any]:
+        if self.run_state_path is None:
+            return {}
+        try:
+            stat = self.run_state_path.stat()
+            if stat.st_mtime_ns == self._state_mtime_ns:
+                return self._state_cache
+            payload = json.loads(self.run_state_path.read_text())
+            if not isinstance(payload, dict):
+                payload = {}
+            self._state_cache = payload
+            self._state_mtime_ns = stat.st_mtime_ns
+            return payload
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError):
+            log.debug("failed to read training state file", exc_info=True)
+            return self._state_cache
+
+    def _resolve_target(self) -> _SpoolTarget:
+        state = self._load_run_state()
+        run_id = _safe_path_component(
+            state.get("run_id"),
+            f"unassigned-{self.started_at}",
+        )
+        current_step = self._state_int(state.get("total_step"))
+        if self.split_every_steps > 0 and current_step and current_step > 0:
+            segment_index = (current_step - 1) // self.split_every_steps
+            segment_start_step = segment_index * self.split_every_steps + 1
+            segment_end_step = (segment_index + 1) * self.split_every_steps
+        else:
+            segment_index = 0
+            segment_start_step = None
+            segment_end_step = None
+
+        run_dir = self._state_path(state.get("run_dir"))
+        if run_dir is None:
+            if self.external_artifact_root is not None:
+                run_dir = self.external_artifact_root / run_id
+            else:
+                run_dir = self.output_dir
+
+        collector_dir = self._state_path(state.get("collector_dir"))
+        if collector_dir is None:
+            collector_dir = run_dir / "collector"
+        spool_dir = collector_dir / "spool"
+
+        if segment_start_step is not None and segment_end_step is not None:
+            step_range = f"steps_{segment_start_step:09d}-{segment_end_step:09d}"
+        else:
+            step_range = "steps_unassigned"
+        filename = (
+            f"{run_id}_{self.started_at}_{self.prefix}_"
+            f"{step_range}_part{segment_index:04d}.lp"
+        )
+        path = spool_dir / filename
+        manifest_path = path.with_suffix(".manifest.json")
+        return _SpoolTarget(
+            run_id=run_id,
+            run_dir=run_dir,
+            collector_dir=collector_dir,
+            spool_dir=spool_dir,
+            path=path,
+            manifest_path=manifest_path,
+            segment_index=segment_index,
+            segment_start_step=segment_start_step,
+            segment_end_step=segment_end_step,
+            current_step=current_step,
+            state=state,
+        )
+
+    @staticmethod
+    def _state_int(value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _state_path(value: Any) -> Optional[Path]:
+        if not value:
+            return None
+        try:
+            return Path(str(value))
+        except TypeError:
+            return None
+
+    def _activate_target(self, target: _SpoolTarget) -> None:
+        target.spool_dir.mkdir(parents=True, exist_ok=True)
+        normalize_artifact_permissions(target.run_dir, dir_mode=0o775)
+        normalize_artifact_permissions(target.collector_dir, dir_mode=0o775)
+        normalize_artifact_permissions(target.spool_dir, dir_mode=0o775)
+        self._active_target = target
+        self._active_records_written = 0
+        self._active_batches_written = 0
+        self.path = target.path
+        self.manifest_path = target.manifest_path
+        log.info("Local telemetry spool segment writing %s", self.path)
+
     def _write_manifest(self, status: str) -> None:
+        target = self._active_target
+        record_path = self.path
+        manifest_path = self.manifest_path
         payload = {
+            "schema_version": 2,
             "status": status,
             "started_at": self.started_at,
+            "updated_at_utc": datetime.utcnow().isoformat() + "Z",
             "format": "influx_line_protocol",
-            "record_path": str(self.path),
-            "records_written": self.records_written,
-            "batches_written": self.batches_written,
+            "record_path": str(record_path),
+            "records_written": (
+                self._active_records_written if target else self.records_written
+            ),
+            "batches_written": (
+                self._active_batches_written if target else self.batches_written
+            ),
+            "session_records_written": self.records_written,
+            "session_batches_written": self.batches_written,
             "flush_interval_seconds": self.flush_interval_seconds,
+            "split_every_steps": self.split_every_steps,
             "error": self._error,
             "description": (
                 "Exact collector line-protocol telemetry records. Each line can "
                 "be replayed into InfluxDB or parsed locally for paper analysis."
             ),
+            "reuse": {
+                "line_protocol": True,
+                "append_order": "collector write order within this segment",
+                "suggested_analysis_key": "training_run_id + step range + measurement tags",
+            },
         }
+        if target is not None:
+            payload.update({
+                "training_run_id": target.run_id,
+                "run_dir": str(target.run_dir),
+                "collector_dir": str(target.collector_dir),
+                "spool_dir": str(target.spool_dir),
+                "segment_index": target.segment_index,
+                "segment_start_step": target.segment_start_step,
+                "segment_end_step": target.segment_end_step,
+                "latest_training_step": target.current_step,
+                "training_state_path": (
+                    str(self.run_state_path) if self.run_state_path else None
+                ),
+                "training_state": target.state,
+            })
         try:
-            self.manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
-            normalize_artifact_permissions(self.manifest_path, file_mode=0o664)
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            normalize_artifact_permissions(manifest_path, file_mode=0o664)
+            self._append_spool_index(status, payload)
         except OSError:
             log.debug("failed to write local telemetry spool manifest", exc_info=True)
+
+    def _append_spool_index(self, status: str, payload: Dict[str, Any]) -> None:
+        target = self._active_target
+        if target is None or status == "running":
+            return
+        event_key = (str(target.path), status)
+        if event_key == self._last_index_event:
+            return
+        self._last_index_event = event_key
+        index_path = target.collector_dir / "spool_index.jsonl"
+        row = {
+            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "status": status,
+            "training_run_id": target.run_id,
+            "segment_index": target.segment_index,
+            "segment_start_step": target.segment_start_step,
+            "segment_end_step": target.segment_end_step,
+            "record_path": payload["record_path"],
+            "manifest_path": str(target.manifest_path),
+            "records_written": payload["records_written"],
+            "session_started_at": self.started_at,
+            "format": payload["format"],
+        }
+        try:
+            with index_path.open("a") as handle:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+            normalize_artifact_permissions(index_path, file_mode=0o664)
+        except OSError:
+            log.debug("failed to append local telemetry spool index", exc_info=True)
 
 
 def iso_to_ns(value: str) -> int:

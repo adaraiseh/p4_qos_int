@@ -106,7 +106,11 @@ def normalize_artifact_tree(
         normalize_artifact_permissions(item, file_mode=file_mode, dir_mode=dir_mode)
 
 
-def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug") -> logging.Logger:
+def setup_unified_logging(
+    module_name: str = "rl_agent",
+    log_level: str = "debug",
+    log_dir: Optional[str] = None,
+) -> logging.Logger:
     """Configure unified logging with console and file handlers.
 
     Args:
@@ -114,6 +118,8 @@ def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug
                      Log file will be named: <module_name>_<timestamp>.log
         log_level: File log level ("debug", "info", "warning", "error").
                    Console always shows INFO level.
+        log_dir: Optional directory for the file log. Defaults to ``LOG_DIR``
+                 or ``P4_QOS_LOG_DIR`` when that environment variable is set.
 
     Returns:
         Configured root logger instance.
@@ -129,14 +135,19 @@ def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug
     }
     file_level = level_map.get(log_level.lower(), logging.DEBUG)
 
+    active_log_dir = log_dir or os.environ.get("P4_QOS_LOG_DIR") or LOG_DIR
+
     # Ensure log directory exists
-    os.makedirs(LOG_DIR, exist_ok=True)
-    normalize_artifact_permissions(LOG_DIR, dir_mode=0o775)
+    os.makedirs(active_log_dir, exist_ok=True)
+    normalize_artifact_permissions(active_log_dir, dir_mode=0o775)
 
     # Create timestamped log file for this module (once per module per session)
     if module_name not in _log_files:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _log_files[module_name] = os.path.join(LOG_DIR, f"{module_name}_{timestamp}.log")
+        _log_files[module_name] = os.path.join(
+            active_log_dir,
+            f"{module_name}_{timestamp}.log",
+        )
 
     log_file_path = _log_files[module_name]
 

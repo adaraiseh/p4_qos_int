@@ -276,7 +276,8 @@ class OSPFBenchmark:
                 ):
                     log.info(
                         f"[Step {completed_steps}] reward={reward:+.2f} "
-                        f"sla={len(info.get('sla_met', []))}/3 "
+                        f"sla={len(info.get('sla_met', []))}/"
+                        f"{info.get('sla_total', len(QIDS))} "
                         f"pressure={pressure:.3f}"
                     )
 
