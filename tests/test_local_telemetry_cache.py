@@ -387,13 +387,13 @@ class LocalTelemetryCacheTests(unittest.TestCase):
                 flush_interval_seconds=0.1,
                 run_state_path=str(state_path),
                 external_artifact_root=str(root),
-                split_every_steps=5000,
+                split_every_steps=10000,
             )
             writer.write_lines([line1])
             writer.flush()
 
             time.sleep(0.01)
-            write_state(5001)
+            write_state(10001)
             writer.write_lines([line2])
             writer.flush()
             writer.close()
@@ -409,7 +409,7 @@ class LocalTelemetryCacheTests(unittest.TestCase):
             ]
             self.assertEqual(
                 [(m["segment_start_step"], m["segment_end_step"]) for m in manifests],
-                [(1, 5000), (5001, 10000)],
+                [(1, 10000), (10001, 20000)],
             )
             self.assertEqual({m["training_run_id"] for m in manifests}, {run_id})
 

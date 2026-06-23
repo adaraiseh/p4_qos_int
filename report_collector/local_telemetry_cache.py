@@ -885,7 +885,7 @@ class LineProtocolSpoolWriter:
         max_queue_batches: int = 8192,
         run_state_path: Optional[str] = None,
         external_artifact_root: Optional[str] = None,
-        split_every_steps: int = 5000,
+        split_every_steps: int = 10000,
     ):
         started_at = time.strftime("%Y%m%d-%H%M%S", time.localtime())
         self.prefix = prefix
@@ -896,6 +896,7 @@ class LineProtocolSpoolWriter:
             Path(external_artifact_root) if external_artifact_root else None
         )
         self.run_state_path = Path(run_state_path) if run_state_path else None
+        self._dynamic_targets = bool(self.run_state_path or self.external_artifact_root)
         self.split_every_steps = max(0, int(split_every_steps or 0))
         self.path = self.output_dir / f"{started_at}_{prefix}.lp"
         self.manifest_path = self.output_dir / f"{started_at}_{prefix}.manifest.json"
@@ -1033,6 +1034,21 @@ class LineProtocolSpoolWriter:
             return self._state_cache
 
     def _resolve_target(self) -> _SpoolTarget:
+        if not self._dynamic_targets:
+            return _SpoolTarget(
+                run_id="standalone",
+                run_dir=self.output_dir,
+                collector_dir=self.output_dir,
+                spool_dir=self.output_dir,
+                path=self.path,
+                manifest_path=self.manifest_path,
+                segment_index=0,
+                segment_start_step=None,
+                segment_end_step=None,
+                current_step=None,
+                state={},
+            )
+
         state = self._load_run_state()
         run_id = _safe_path_component(
             state.get("run_id"),

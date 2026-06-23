@@ -12,6 +12,7 @@ import signal
 import argparse
 import logging
 from pathlib import Path
+from typing import Optional
 
 # Add parent directory for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -35,12 +36,48 @@ INFLUX_TOKEN = os.environ.get('INFLUX_TOKEN')
 INFLUX_ORG = "Research"
 INFLUX_BUCKET = "INT"
 DEFAULT_EXTERNAL_ARTIFACT_ROOT = "/media/sf_amjad/p4_qos_int/training_runs"
-DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS = 5000
+DEFAULT_LOCAL_ARTIFACT_ROOT = "training_files/training_runs"
+DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS = 10000
 
 # Default interfaces (legacy Fat-Tree topology with 4 ToR switches)
 DEFAULT_INTERFACES = ['t1-eth10', 't2-eth10', 't3-eth10', 't4-eth10']
 
 BPF = "udp and dst port 1234"
+
+
+def _path_under(path: Path, parent: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(parent.expanduser().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_artifact_root(artifact_root: str) -> Path:
+    root = Path(artifact_root).expanduser()
+    media_anchor = Path("/media/sf_amjad")
+    if not _path_under(root, media_anchor):
+        return root
+    if not media_anchor.exists() or not os.path.ismount(media_anchor):
+        fallback = Path(DEFAULT_LOCAL_ARTIFACT_ROOT)
+        print(
+            f"External artifact media {media_anchor} is not mounted; "
+            f"using local artifact root {fallback}",
+            file=sys.stderr,
+        )
+        return fallback
+    return root
+
+
+def _replace_root_if_under(path_value: Optional[str], old_root: Path, new_root: Path) -> Optional[str]:
+    if not path_value:
+        return path_value
+    path = Path(path_value).expanduser()
+    try:
+        suffix = path.resolve().relative_to(old_root.resolve())
+    except ValueError:
+        return path_value
+    return str(new_root / suffix)
 
 
 def get_interfaces_from_config(config_path: str) -> list:
@@ -196,6 +233,21 @@ def main():
     )
 
     args = parser.parse_args()
+
+    requested_artifact_root = Path(args.artifact_root).expanduser()
+    effective_artifact_root = resolve_artifact_root(args.artifact_root)
+    if effective_artifact_root != requested_artifact_root:
+        args.local_spool_dir = _replace_root_if_under(
+            args.local_spool_dir,
+            requested_artifact_root,
+            effective_artifact_root,
+        ) or args.local_spool_dir
+        args.log_dir = _replace_root_if_under(
+            args.log_dir,
+            requested_artifact_root,
+            effective_artifact_root,
+        )
+        args.artifact_root = str(effective_artifact_root)
 
     # Set up unified logging
     setup_unified_logging(

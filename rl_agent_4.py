@@ -234,8 +234,33 @@ TARGET_UPDATE_FREQ = 4
 #                          HELPER FUNCTIONS
 # =============================================================================
 DEFAULT_EXTERNAL_ARTIFACT_ROOT = "/media/sf_amjad/p4_qos_int/training_runs"
+DEFAULT_LOCAL_ARTIFACT_ROOT = "training_files/training_runs"
 DEFAULT_TRAINING_STATE_FILE = "/tmp/p4_qos_int_training_state.json"
-DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS = 5000
+DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS = 10000
+
+
+def _path_under(path: Path, parent: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(parent.expanduser().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _artifact_root_path(artifact_root: str) -> Path:
+    root = Path(artifact_root).expanduser()
+    media_anchor = Path("/media/sf_amjad")
+    if _path_under(root, media_anchor):
+        if not media_anchor.exists() or not os.path.ismount(media_anchor):
+            fallback = Path(DEFAULT_LOCAL_ARTIFACT_ROOT)
+            logging.getLogger(__name__).warning(
+                "External artifact media %s is not mounted; using local "
+                "artifact root %s",
+                media_anchor,
+                fallback,
+            )
+            return fallback
+    return root
 
 
 def action_to_name(action: int) -> str:
@@ -251,7 +276,7 @@ def action_to_name(action: int) -> str:
 
 
 def _training_run_dir(artifact_root: str, run_id: str) -> Path:
-    return Path(artifact_root).expanduser() / run_id
+    return _artifact_root_path(artifact_root) / run_id
 
 
 def _training_logs_dir(args: argparse.Namespace, run_id: str) -> Path:
@@ -280,7 +305,7 @@ def resolve_checkpoint_path(
 
     matching = _checkpoint_candidates(save_dir, tag)
     if artifact_root:
-        root = Path(artifact_root).expanduser()
+        root = _artifact_root_path(artifact_root)
         matching.extend(
             str(path)
             for path in root.glob(f"*/checkpoints/*-dqn_v4_{tag}.pth")
@@ -298,7 +323,7 @@ def resolve_checkpoint_path(
 def resolve_latest_ewc_path(save_dir: str, artifact_root: Optional[str]) -> Optional[str]:
     candidates = glob.glob(os.path.join(save_dir, "*-ewc.pth"))
     if artifact_root:
-        root = Path(artifact_root).expanduser()
+        root = _artifact_root_path(artifact_root)
         candidates.extend(str(path) for path in root.glob("*/checkpoints/*-ewc.pth"))
     if not candidates:
         return None
@@ -4172,7 +4197,7 @@ class TrainingArtifactLogger:
     ):
         self.args = args
         self.run_id = run_id
-        self.artifact_root = Path(args.artifact_root).expanduser()
+        self.artifact_root = _artifact_root_path(args.artifact_root)
         self.run_dir = _training_run_dir(args.artifact_root, run_id)
         self.logs_dir = _training_logs_dir(args, run_id)
         self.checkpoint_dir = self.run_dir / "checkpoints"
@@ -4187,7 +4212,7 @@ class TrainingArtifactLogger:
             normalize_artifact_permissions(directory, dir_mode=0o775)
         normalize_artifact_permissions(self.run_dir, dir_mode=0o775)
         self.flush_every = max(
-            1, int(getattr(args, "training_log_flush_every", 25) or 25)
+            1, int(getattr(args, "training_log_flush_every", 100) or 100)
         )
         self.snapshot_every = 1
         self.step_path = self.logs_dir / "step_metrics.csv"
@@ -5386,9 +5411,9 @@ def main():
                         default=DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS,
                         help='Training-step range per collector spool split '
                              f'(default: {DEFAULT_COLLECTOR_SPOOL_SPLIT_STEPS})')
-    parser.add_argument('--training-log-flush-every', type=int, default=25,
+    parser.add_argument('--training-log-flush-every', type=int, default=100,
                         help='Flush durable local training logs every N steps '
-                             '(default: 25; checkpoints/episodes always flush)')
+                             '(default: 100; checkpoints/episodes always flush)')
     parser.add_argument('--invalid-recovery-streak', type=int,
                         default=INVALID_RECOVERY_STREAK,
                         help='End the current episode and force a baseline '
@@ -5494,7 +5519,11 @@ def main():
     if args.mode == 'train':
         if not args.run_id:
             args.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        log_dir_path = _training_logs_dir(args, args.run_id)
+        try:
+            log_dir_path = _training_logs_dir(args, args.run_id)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
         log_dir_path.mkdir(parents=True, exist_ok=True)
         normalize_artifact_permissions(log_dir_path, dir_mode=0o775)
         log_dir = str(log_dir_path)
