@@ -11,11 +11,13 @@ from logging.handlers import RotatingFileHandler
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 LOG_DIR = "log"
 _log_files: dict = {}  # module_name -> log_file_path
 _console_initialized = False
+_artifact_owner: Optional[tuple[int, int]] = None
 
 
 class BatchFlushHandler(logging.StreamHandler):
@@ -32,6 +34,76 @@ class BatchFlushHandler(logging.StreamHandler):
         if self.message_count >= self.flush_interval:
             self.flush()
             self.message_count = 0
+
+
+def _resolve_artifact_owner() -> Optional[tuple[int, int]]:
+    """Return the real workspace user for files created from sudo-run processes."""
+    global _artifact_owner
+    if _artifact_owner is not None:
+        return None if _artifact_owner == (-1, -1) else _artifact_owner
+
+    uid = os.environ.get("P4_QOS_ARTIFACT_UID") or os.environ.get("SUDO_UID")
+    gid = os.environ.get("P4_QOS_ARTIFACT_GID") or os.environ.get("SUDO_GID")
+    if uid and gid:
+        try:
+            _artifact_owner = (int(uid), int(gid))
+            return _artifact_owner
+        except ValueError:
+            pass
+
+    # When running directly as root from the repo, prefer the workspace owner.
+    # This keeps artifacts editable by the normal login user after the run.
+    try:
+        cwd_stat = Path.cwd().stat()
+        if os.geteuid() == 0 and cwd_stat.st_uid != 0:
+            _artifact_owner = (cwd_stat.st_uid, cwd_stat.st_gid)
+            return _artifact_owner
+    except OSError:
+        pass
+
+    _artifact_owner = (-1, -1)
+    return None
+
+
+def normalize_artifact_permissions(
+    path: str | os.PathLike,
+    *,
+    file_mode: Optional[int] = None,
+    dir_mode: Optional[int] = None,
+) -> None:
+    """Best-effort owner/mode fix for generated logs and training artifacts."""
+    artifact_path = Path(path)
+    try:
+        owner = _resolve_artifact_owner()
+        if owner is not None:
+            uid, gid = owner
+            try:
+                os.chown(artifact_path, uid, gid)
+            except PermissionError:
+                pass
+        mode = dir_mode if artifact_path.is_dir() else file_mode
+        if mode is not None:
+            try:
+                os.chmod(artifact_path, mode)
+            except PermissionError:
+                pass
+    except OSError:
+        pass
+
+
+def normalize_artifact_tree(
+    path: str | os.PathLike,
+    *,
+    file_mode: int = 0o664,
+    dir_mode: int = 0o775,
+) -> None:
+    """Normalize a directory tree without failing the caller on permission errors."""
+    root = Path(path)
+    normalize_artifact_permissions(root, dir_mode=dir_mode)
+    if not root.is_dir():
+        return
+    for item in root.rglob("*"):
+        normalize_artifact_permissions(item, file_mode=file_mode, dir_mode=dir_mode)
 
 
 def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug") -> logging.Logger:
@@ -59,6 +131,7 @@ def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug
 
     # Ensure log directory exists
     os.makedirs(LOG_DIR, exist_ok=True)
+    normalize_artifact_permissions(LOG_DIR, dir_mode=0o775)
 
     # Create timestamped log file for this module (once per module per session)
     if module_name not in _log_files:
@@ -86,6 +159,7 @@ def setup_unified_logging(module_name: str = "rl_agent", log_level: str = "debug
             maxBytes=50 * 1024 * 1024,  # 50 MB
             backupCount=0,
         )
+        normalize_artifact_permissions(log_file_path, file_mode=0o664)
         file_handler.setLevel(file_level)
         file_formatter = logging.Formatter(
             "%(asctime)s.%(msecs)03d [%(levelname)s] [%(name)s] %(message)s",

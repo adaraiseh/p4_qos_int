@@ -32,7 +32,7 @@ from p4utils.utils.task_scheduler import Task, TaskClient
 from network import _traffic_dst_port, QID_TOS, ALL_QUEUES
 
 # Import unified logging
-from logging_config import setup_unified_logging
+from logging_config import normalize_artifact_permissions, setup_unified_logging
 
 log = logging.getLogger(__name__)
 
@@ -61,10 +61,14 @@ def _source_load_for(stages: Dict[str, Dict[int, float]]) -> Dict[int, float]:
     }
 
 
-def _queue_biased_stages(weights: Dict[int, float]) -> Dict[str, Dict[int, float]]:
+def _queue_biased_stages(
+    weights: Dict[int, float],
+    low_total_mbps: float,
+    high_total_mbps: float,
+) -> Dict[str, Dict[int, float]]:
     stages = {
-        "low": _weighted_load(0.5, weights),
-        "high": _weighted_load(3.2, weights),
+        "low": _weighted_load(low_total_mbps, weights),
+        "high": _weighted_load(high_total_mbps, weights),
     }
     stages["source"] = _source_load_for(stages)
     return stages
@@ -90,33 +94,33 @@ STEADY_PROFILE_SPECS = {
     # and high profiles use deterministic high/low cycles around the knee so
     # they exercise partial SLA behavior without unbounded queue buildup.
     "light_1": {
-        "low": 1.50,
-        "high": 1.50,
+        "low": 2.75,
+        "high": 2.75,
         "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     },
     "light_2": {
-        "low": 1.62,
-        "high": 1.62,
+        "low": 2.78,
+        "high": 2.78,
         "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     },
     "medium_1": {
-        "low": 1.50,
-        "high": 1.80,
+        "low": 2.65,
+        "high": 3.15,
         "pattern": (0, 1, 0, 0, 1, 0, 0, 1, 0, 0),
     },
     "medium_2": {
-        "low": 1.50,
-        "high": 1.92,
+        "low": 2.45,
+        "high": 3.20,
         "pattern": (0, 1, 0, 1, 0, 0, 1, 0, 1, 0),
     },
     "high_1": {
-        "low": 1.50,
-        "high": 1.85,
+        "low": 2.55,
+        "high": 3.25,
         "pattern": (0, 1, 1, 0, 1, 1, 0, 1, 1, 0),
     },
     "high_2": {
-        "low": 1.85,
-        "high": 1.85,
+        "low": 3.25,
+        "high": 3.25,
         "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     },
 }
@@ -126,17 +130,29 @@ BURST_QUEUE_WEIGHTS = {
     "vi": {0: 0.12, 1: 0.70, 7: 0.18},
     "be": {0: 0.10, 1: 0.15, 7: 0.75},
 }
-BURST_HIGH_STEPS = {
-    1: 3,
-    2: 6,
+BURST_TIER_SPECS = {
+    # Suffixes mirror the steady profile difficulty bands:
+    # _1 light, _2 medium, _3 high.
+    1: {"low": 0.5, "high_steps": 3},
+    2: {"low": 0.5, "high_steps": 6},
+    3: {"low": 0.5, "high_steps": 8},
+}
+BURST_HIGH_TOTALS = {
+    # Class-specific burst totals calibrated against the focused queue SLA:
+    # voice=Q0, video=Q1, best-effort=Q7.
+    "vo": {1: 3.20, 2: 3.55, 3: 3.75},
+    "vi": {1: 3.20, 2: 3.30, 3: 4.00},
+    "be": {1: 3.20, 2: 3.80, 3: 3.50},
 }
 BURSTY_PROFILE_SPECS = {
     f"bursty_{traffic_class}_{tier}": {
         "weights": weights,
-        "high_steps": high_steps,
+        "low": tier_spec["low"],
+        "high": BURST_HIGH_TOTALS[traffic_class][tier],
+        "high_steps": tier_spec["high_steps"],
     }
     for traffic_class, weights in BURST_QUEUE_WEIGHTS.items()
-    for tier, high_steps in BURST_HIGH_STEPS.items()
+    for tier, tier_spec in BURST_TIER_SPECS.items()
 }
 
 
@@ -167,7 +183,11 @@ SHAPED_PROFILE_STAGES = {
     for name, spec in STEADY_PROFILE_SPECS.items()
 }
 SHAPED_PROFILE_STAGES.update({
-    name: _queue_biased_stages(spec["weights"])
+    name: _queue_biased_stages(
+        spec["weights"],
+        spec["low"],
+        spec["high"],
+    )
     for name, spec in BURSTY_PROFILE_SPECS.items()
 })
 
@@ -403,6 +423,7 @@ class TrafficManager:
         # Traffic logging - stores traffic configurations to CSV for analysis
         self._traffic_log_dir = Path("log")
         self._traffic_log_dir.mkdir(exist_ok=True)
+        normalize_artifact_permissions(self._traffic_log_dir, dir_mode=0o775)
         self._traffic_log_file = self._traffic_log_dir / "traffic_log.csv"
         self._traffic_log_initialized = False
 
@@ -457,10 +478,12 @@ class TrafficManager:
                             'load_q0', 'load_q1', 'load_q7', 'is_bursty',
                             'baseline_profile', 'num_traffic_pairs', 'extra_info'
                         ])
+                    normalize_artifact_permissions(self._traffic_log_file, file_mode=0o664)
                 self._traffic_log_initialized = True
 
             # Write traffic configuration row
             with open(self._traffic_log_file, 'a', newline='') as f:
+                normalize_artifact_permissions(self._traffic_log_file, file_mode=0o664)
                 writer = csv.writer(f)
                 writer.writerow([
                     datetime.now().isoformat(),

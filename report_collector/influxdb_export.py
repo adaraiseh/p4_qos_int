@@ -20,6 +20,12 @@ from logging_config import setup_unified_logging
 from scapy.all import AsyncSniffer, conf
 from influxdb_client import InfluxDBClient
 from collector import *
+from local_telemetry_cache import (
+    DEFAULT_SOCKET_PATH,
+    LineProtocolSpoolWriter,
+    LocalTelemetryCache,
+    LocalTelemetryCacheServer,
+)
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +113,57 @@ def main():
         help='InfluxDB bucket'
     )
     parser.add_argument(
+        '--influx-write',
+        choices=['on', 'off'],
+        default='on',
+        help='Write collector telemetry to InfluxDB (default: on)'
+    )
+    parser.add_argument(
+        '--telemetry-cache-socket',
+        default=DEFAULT_SOCKET_PATH,
+        help='Unix socket path for the local RL telemetry cache'
+    )
+    parser.add_argument(
+        '--disable-telemetry-cache',
+        action='store_true',
+        help='Disable the local in-memory telemetry cache'
+    )
+    parser.add_argument(
+        '--telemetry-cache-retention-seconds',
+        type=float,
+        default=20.0,
+        help='Seconds of recent collector records to keep in local memory'
+    )
+    parser.add_argument(
+        '--telemetry-cache-max-points',
+        type=int,
+        default=120000,
+        help='Maximum cached points per measurement'
+    )
+    parser.add_argument(
+        '--local-spool',
+        choices=['on', 'off'],
+        default='on',
+        help='Persist exact collector line-protocol telemetry locally (default: on)'
+    )
+    parser.add_argument(
+        '--local-spool-dir',
+        default='training_files/collector_spool',
+        help='Directory for local collector telemetry line-protocol artifacts'
+    )
+    parser.add_argument(
+        '--local-spool-flush-interval',
+        type=float,
+        default=1.0,
+        help='Seconds between local telemetry spool flushes'
+    )
+    parser.add_argument(
+        '--local-spool-queue-batches',
+        type=int,
+        default=8192,
+        help='Buffered collector batches before the local spool applies backpressure'
+    )
+    parser.add_argument(
         '--log-level',
         type=str,
         default='debug',
@@ -138,7 +195,8 @@ def main():
 
     log.info(f"Sniffing on {iface} with BPF: {BPF}")
 
-    if not args.influx_token:
+    influx_enabled = args.influx_write == 'on'
+    if influx_enabled and not args.influx_token:
         log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
         sys.exit(1)
 
@@ -146,18 +204,50 @@ def main():
     conf.use_pcap = True
     conf.sniff_promisc = 0
 
-    influx_client = InfluxDBClient(
-        url=args.influx_url,
-        token=args.influx_token,
-        org=args.influx_org
-    )
+    influx_client = None
+    if influx_enabled:
+        influx_client = InfluxDBClient(
+            url=args.influx_url,
+            token=args.influx_token,
+            org=args.influx_org
+        )
+    else:
+        log.info("InfluxDB writes disabled; collector will serve local telemetry cache only")
+
+    telemetry_cache = None
+    telemetry_server = None
+    if not args.disable_telemetry_cache:
+        telemetry_cache = LocalTelemetryCache(
+            retention_seconds=args.telemetry_cache_retention_seconds,
+            max_points_per_measurement=args.telemetry_cache_max_points,
+        )
+        telemetry_server = LocalTelemetryCacheServer(
+            telemetry_cache,
+            args.telemetry_cache_socket,
+        )
+        telemetry_server.start()
+    else:
+        log.info("Local telemetry cache disabled")
+
+    telemetry_spool = None
+    if args.local_spool == 'on':
+        telemetry_spool = LineProtocolSpoolWriter(
+            output_dir=args.local_spool_dir,
+            flush_interval_seconds=args.local_spool_flush_interval,
+            max_queue_batches=args.local_spool_queue_batches,
+        )
+    else:
+        log.info("Local telemetry spool disabled")
 
     # Async writer
     c = Collector(
         influx_client, args.influx_org, args.influx_bucket,
         write_async=True, flush_interval_ms=50, batch_size=1000,
         use_device_time=False,  # P4 device timestamps are NOT Unix epoch - must use system time
-        aggregate_enabled=False
+        aggregate_enabled=False,
+        telemetry_cache=telemetry_cache,
+        telemetry_spool=telemetry_spool,
+        influx_enabled=influx_enabled,
     )
 
     stop = False
@@ -167,6 +257,8 @@ def main():
         stop = True
         log.info("Stopping...")
         c.flush_buffer()
+        if telemetry_server is not None:
+            telemetry_server.stop()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -199,8 +291,13 @@ def main():
         except Exception:
             pass
     c.flush_buffer()
+    if telemetry_spool is not None:
+        telemetry_spool.close()
+    if telemetry_server is not None:
+        telemetry_server.stop()
     try:
-        influx_client.close()
+        if influx_client is not None:
+            influx_client.close()
     except Exception:
         pass
 

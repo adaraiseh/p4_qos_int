@@ -33,6 +33,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from logging_config import normalize_artifact_permissions
 from traffic_generator import TrafficManager
 
 
@@ -333,13 +334,24 @@ def validate_runner_summary(item: Dict, path: Path) -> Tuple[Dict, List[str]]:
         isinstance(routing_state, dict) and routing_state.get("plan_sha256")
     ):
         errors.append("ECMP route-plan digest is missing")
+    if item["method"] == "ecmp":
+        audit_required = payload.get("ecmp_path_audit_required")
+        audit_verified = payload.get("ecmp_path_audit_verified")
+        if audit_required is True and audit_verified is not True:
+            errors.append(
+                "ECMP INT-observed path audit is required but not verified"
+            )
+        elif audit_verified is False:
+            errors.append("ECMP INT-observed path audit failed")
 
     return payload, errors
 
 
 def write_csv(path: Path, rows: Sequence[Dict], fieldnames: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    normalize_artifact_permissions(path.parent, dir_mode=0o775)
     with path.open("w", newline="") as handle:
+        normalize_artifact_permissions(path, file_mode=0o664)
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
@@ -428,7 +440,11 @@ class BenchmarkOrchestrator:
     def preflight(self) -> None:
         if os.geteuid() != 0:
             raise RuntimeError("Run the benchmark through `make benchmark` (sudo -E)")
-        if not os.environ.get("INFLUX_TOKEN"):
+        needs_influx = (
+            self.args.telemetry_backend in ("influx", "cache-fallback-influx")
+            or self.args.production_influx_write == "on"
+        )
+        if needs_influx and not os.environ.get("INFLUX_TOKEN"):
             raise RuntimeError("INFLUX_TOKEN is not set")
 
         config = Path(self.args.config)
@@ -468,6 +484,8 @@ class BenchmarkOrchestrator:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "runs").mkdir(exist_ok=True)
+        normalize_artifact_permissions(self.output_dir, dir_mode=0o775)
+        normalize_artifact_permissions(self.output_dir / "runs", dir_mode=0o775)
 
     def build_schedule(self) -> None:
         permutations = list(itertools.permutations(METHODS))
@@ -605,9 +623,9 @@ class BenchmarkOrchestrator:
                 "ACM Artifact Review and Badging Version 1.1",
             ],
         }
-        (self.output_dir / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True)
-        )
+        manifest_path = self.output_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        normalize_artifact_permissions(manifest_path, file_mode=0o664)
         environment_lines = [
             f"created_at_utc={manifest['created_at_utc']}",
             f"hostname={manifest['hostname']}",
@@ -621,9 +639,9 @@ class BenchmarkOrchestrator:
             "pip_freeze:",
             command_output([sys.executable, "-m", "pip", "freeze"]) or "unavailable",
         ]
-        (self.output_dir / "environment.txt").write_text(
-            "\n".join(environment_lines) + "\n"
-        )
+        environment_path = self.output_dir / "environment.txt"
+        environment_path.write_text("\n".join(environment_lines) + "\n")
+        normalize_artifact_permissions(environment_path, file_mode=0o664)
 
     def _clean_traffic(self) -> None:
         commands = [
@@ -643,6 +661,7 @@ class BenchmarkOrchestrator:
             f"rep_{item['repetition']:02d}_seed_{item['seed']}"
         )
         run_dir.mkdir(parents=True, exist_ok=True)
+        normalize_artifact_permissions(run_dir, dir_mode=0o775)
         return {
             "dir": run_dir,
             "csv": run_dir / f"{stem}.csv",
@@ -677,6 +696,12 @@ class BenchmarkOrchestrator:
             str(paths["summary"]),
             "--log-level",
             self.args.log_level,
+            "--telemetry-backend",
+            self.args.telemetry_backend,
+            "--telemetry-cache-socket",
+            self.args.telemetry_cache_socket,
+            "--telemetry-cache-timeout",
+            str(self.args.telemetry_cache_timeout),
         ]
         if item["method"] == "rl":
             common.extend(
@@ -686,6 +711,8 @@ class BenchmarkOrchestrator:
                     self.args.save_dir,
                     "--weights-tag",
                     self.args.weights_tag,
+                    "--production-influx-write",
+                    self.args.production_influx_write,
                 ]
             )
         return common
@@ -702,6 +729,7 @@ class BenchmarkOrchestrator:
             else None
         )
         with log_path.open("w") as log_file:
+            normalize_artifact_permissions(log_path, file_mode=0o664)
             log_file.write("COMMAND: " + " ".join(command) + "\n\n")
             log_file.flush()
             self.current_process = subprocess.Popen(
@@ -786,6 +814,7 @@ class BenchmarkOrchestrator:
             paths["result"].write_text(
                 json.dumps(result, indent=2, sort_keys=True)
             )
+            normalize_artifact_permissions(paths["result"], file_mode=0o664)
             self._clean_traffic()
             return result
 
@@ -866,6 +895,60 @@ class BenchmarkOrchestrator:
                         if isinstance(routing_state, dict)
                         else None
                     )
+                    top_bottlenecks = runner_payload.get(
+                        "top_bottleneck_egresses"
+                    )
+                    if not top_bottlenecks and isinstance(routing_state, dict):
+                        top_bottlenecks = routing_state.get(
+                            "top_bottleneck_egresses"
+                        )
+                    if top_bottlenecks:
+                        top = top_bottlenecks[0]
+                        final_summary["top_bottleneck_egress"] = top.get(
+                            "label"
+                        )
+                        final_summary["top_bottleneck_p95_util"] = top.get(
+                            "p95_util"
+                        )
+                        final_summary["top_bottleneck_mean_util"] = top.get(
+                            "mean_util"
+                        )
+                        final_summary["top_bottleneck_max_util"] = top.get(
+                            "max_util"
+                        )
+                        final_summary["top_bottleneck_samples"] = top.get(
+                            "count"
+                        )
+                        final_summary["top_bottleneck_flow_count"] = top.get(
+                            "flow_count"
+                        )
+                    final_summary["top_bottleneck_count"] = len(
+                        top_bottlenecks or []
+                    )
+                    if item["method"] == "ecmp":
+                        audit = (
+                            routing_state.get("ecmp_observed_path_audit", {})
+                            if isinstance(routing_state, dict)
+                            else {}
+                        )
+                        final_summary["ecmp_path_audit_verified"] = (
+                            runner_payload.get("ecmp_path_audit_verified")
+                        )
+                        final_summary["ecmp_path_audit_required"] = (
+                            runner_payload.get("ecmp_path_audit_required")
+                        )
+                        final_summary["ecmp_path_mismatch_count"] = (
+                            runner_payload.get(
+                                "ecmp_path_mismatch_count",
+                                audit.get("mismatch_count"),
+                            )
+                        )
+                        final_summary[
+                            "ecmp_queue_independence_violations"
+                        ] = runner_payload.get(
+                            "ecmp_queue_independence_violations",
+                            audit.get("queue_independence_violations"),
+                        )
 
                     quality_errors = list(runner_errors)
                     if (
@@ -921,6 +1004,7 @@ class BenchmarkOrchestrator:
         if final_status == "interrupted":
             result["interrupt_signal"] = self.interrupt_signal
         paths["result"].write_text(json.dumps(result, indent=2, sort_keys=True))
+        normalize_artifact_permissions(paths["result"], file_mode=0o664)
         self._clean_traffic()
         return result
 
@@ -1070,6 +1154,32 @@ class BenchmarkOrchestrator:
         comparison_rows: Sequence[Dict],
         all_results: Sequence[Dict],
     ) -> str:
+        def _audit_text(value) -> str:
+            if value is True:
+                return "yes"
+            if value is False:
+                return "NO"
+            return "n/a"
+
+        def _count_text(value) -> str:
+            try:
+                if value is None or (
+                    isinstance(value, float) and not math.isfinite(value)
+                ):
+                    return "n/a"
+                return str(int(value))
+            except (TypeError, ValueError):
+                return "n/a"
+
+        def _percent_text(value) -> str:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return "n/a"
+            if not math.isfinite(value):
+                return "n/a"
+            return f"{value:.2f}%"
+
         aggregate = self._aggregate_lookup(aggregate_rows)
         successful = sum(row.get("status") == "success" for row in all_results)
         interrupted = sum(
@@ -1158,6 +1268,9 @@ class BenchmarkOrchestrator:
                     if row.get("telemetry_state_verified") is True
                     else "NO"
                 )
+                ecmp_path_audit = _audit_text(
+                    row.get("ecmp_path_audit_verified")
+                )
                 lines.append(
                     f"    rep={int(row.get('repetition', 0)):>2} "
                     f"seed={int(row.get('seed', 0)):>5} "
@@ -1167,8 +1280,17 @@ class BenchmarkOrchestrator:
                     f"traffic_verified={traffic_verified:<3} "
                     f"telemetry_verified={telemetry_verified:<3} "
                     f"SLA={float(row.get('sla_compliance_valid_pct', math.nan)):>7.2f}% "
-                    f"reward={float(row.get('reward_mean_valid', math.nan)):>8.4f}"
+                    f"reward={float(row.get('reward_mean_valid', math.nan)):>8.4f} "
+                    f"ecmp_path={ecmp_path_audit:<3} "
+                    f"mismatches={_count_text(row.get('ecmp_path_mismatch_count'))} "
+                    f"qsplit={_count_text(row.get('ecmp_queue_independence_violations'))}"
                 )
+                if row.get("top_bottleneck_egress"):
+                    lines.append(
+                        f"      top_bottleneck={row.get('top_bottleneck_egress')} "
+                        f"p95_util={_percent_text(row.get('top_bottleneck_p95_util'))} "
+                        f"flows={_count_text(row.get('top_bottleneck_flow_count'))}"
+                    )
             lines.append("  Paired RL comparisons (positive improvement favors RL):")
             for baseline in ("ospf", "ecmp"):
                 selected = [
@@ -1261,7 +1383,9 @@ class BenchmarkOrchestrator:
             comparison_rows,
             results,
         )
-        (self.output_dir / "summary.txt").write_text(summary_text + "\n")
+        summary_path = self.output_dir / "summary.txt"
+        summary_path.write_text(summary_text + "\n")
+        normalize_artifact_permissions(summary_path, file_mode=0o664)
         print("\n" + summary_text, flush=True)
 
     def run(self) -> int:
@@ -1321,6 +1445,7 @@ class BenchmarkOrchestrator:
                 manifest_path.write_text(
                     json.dumps(manifest, indent=2, sort_keys=True)
                 )
+                normalize_artifact_permissions(manifest_path, file_mode=0o664)
         return exit_code
 
 
@@ -1334,7 +1459,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--profiles",
-        default="light_2,medium_2,high_1",
+        default=",".join(TrafficManager.TRAFFIC_PROFILES),
         help="Comma-separated traffic profiles",
     )
     parser.add_argument("--repetitions", type=int, default=6)
@@ -1354,6 +1479,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--telemetry-backend",
+        choices=["cache", "influx", "cache-fallback-influx"],
+        default="cache",
+        help="Telemetry source passed to RL, ECMP, and OSPF runners",
+    )
+    parser.add_argument(
+        "--telemetry-cache-socket",
+        default="/tmp/p4_qos_int_telemetry.sock",
+        help="Unix socket path for local telemetry cache",
+    )
+    parser.add_argument(
+        "--telemetry-cache-timeout",
+        type=float,
+        default=1.0,
+        help="Local telemetry cache request timeout in seconds",
+    )
+    parser.add_argument(
+        "--production-influx-write",
+        choices=["on", "off"],
+        default="off",
+        help="Write RL production metrics to InfluxDB during benchmark",
+    )
     parser.add_argument("--confidence", type=float, default=0.95)
     parser.add_argument("--bootstrap-resamples", type=int, default=10000)
     args = parser.parse_args()

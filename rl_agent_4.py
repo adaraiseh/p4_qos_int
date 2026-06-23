@@ -65,7 +65,12 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 # Import unified logging configuration
-from logging_config import setup_unified_logging, get_log_file_path, set_console_level
+from logging_config import (
+    get_log_file_path,
+    normalize_artifact_permissions,
+    setup_unified_logging,
+    set_console_level,
+)
 
 def setup_logging(log_level: str = "info"):
     """Configure logging with appropriate level and file output.
@@ -99,6 +104,11 @@ log.setLevel(logging.INFO)
 from controller import Controller
 from traffic_generator import TrafficManager
 from config.schema import MAX_SWITCHES
+from report_collector.local_telemetry_cache import (
+    DEFAULT_SOCKET_PATH,
+    LocalTelemetryClient,
+    iso_to_ns,
+)
 
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -163,6 +173,10 @@ MIN_POINTS_PER_METRIC = 1   # Require at least 1 point (2 is too strict)
 # Episode
 MAX_EPISODE_STEPS = 100
 # Note: No early termination - let agent learn to maintain good state, not just fix bad state
+INVALID_RECOVERY_STREAK = 8
+TELEMETRY_LIVENESS_RETRIES = 6
+TELEMETRY_LIVENESS_INTERVAL_SECONDS = 0.5
+TELEMETRY_LIVENESS_RESTARTS = 1
 
 # QoS thresholds (ms) - for reward calculation
 SLA_THRESHOLDS = {
@@ -743,6 +757,7 @@ class DQNAgent:
                 'replay_max_priority': self.replay_buffer.max_priority,
             })
         torch.save(checkpoint, path)
+        normalize_artifact_permissions(path, file_mode=0o664)
         log.info(f"Model saved to {path} (with replay buffer: {len(self.replay_buffer)} experiences)")
     
     def load(self, path: str):
@@ -936,16 +951,39 @@ class QoSRoutingEnv:
                  verbose: bool = False, reset_network: bool = True,
                  production_mode: bool = False, topology_builder=None,
                  rules_dir: str = None, config_path: str = None,
-                 traffic_seed: Optional[int] = None):
+                 traffic_seed: Optional[int] = None,
+                 telemetry_backend: str = "influx",
+                 telemetry_cache_socket: str = DEFAULT_SOCKET_PATH,
+                 telemetry_cache_timeout: float = 1.0):
         self.bucket = bucket
         self.org = org
         self.url = url
+        self.telemetry_backend = telemetry_backend
+        self.telemetry_cache_socket = telemetry_cache_socket
+        self.telemetry_cache = (
+            LocalTelemetryClient(
+                socket_path=telemetry_cache_socket,
+                timeout=telemetry_cache_timeout,
+            )
+            if telemetry_backend in ("cache", "cache-fallback-influx")
+            else None
+        )
 
-        # InfluxDB client
-        # PHASE 2.4: Reduced timeout from 5000ms to 2000ms for faster failure detection
-        self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
-        self.query_api = self.client.query_api()
-        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        # InfluxDB client. Pure cache mode can run without host InfluxDB.
+        # PHASE 2.4: Reduced timeout from 5000ms to 2000ms for faster failure detection.
+        self.client = None
+        self.query_api = None
+        self.write_api = None
+        if token:
+            self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
+            self.query_api = self.client.query_api()
+            self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        elif telemetry_backend in ("influx", "cache-fallback-influx"):
+            log.warning("InfluxDB token missing; Influx telemetry fallback is unavailable")
+
+        log.info(f"Telemetry backend: {self.telemetry_backend}")
+        if self.telemetry_cache is not None:
+            log.info(f"Local telemetry cache socket: {self.telemetry_cache_socket}")
 
         # Store topology builder for reference
         self._topology_builder = topology_builder
@@ -984,6 +1022,7 @@ class QoSRoutingEnv:
         
         # Cache snapshots for comparison
         self.last_snapshot = None
+        self._last_rerouted_qids = []
 
         # Frame stacking for velocity/trend detection
         # Stores last STACK_SIZE raw observation states (each 50-dim)
@@ -1014,11 +1053,238 @@ class QoSRoutingEnv:
         self.traffic_category_weights = None  # Optional: {'light': 0.1, 'medium': 0.2, 'high': 0.3, 'bursty': 0.4}
         self.traffic_profile_weights = None   # Optional: {'light_1': 1.0, 'bursty_vo_1': 2.0, ...}
         self.fixed_traffic_profile = None    # Optional: override to use specific profile for all episodes
+        self._required_qids_cache = tuple(QIDS)
+        self.telemetry_liveness_enabled = True
+        self.telemetry_liveness_retries = TELEMETRY_LIVENESS_RETRIES
+        self.telemetry_liveness_interval_seconds = TELEMETRY_LIVENESS_INTERVAL_SECONDS
+        self.telemetry_liveness_restarts = TELEMETRY_LIVENESS_RESTARTS
+        self.telemetry_liveness_window_seconds = WINDOW_SECONDS
+        self._telemetry_epoch_id = None
+        self._telemetry_epoch_ns = None
+        self._last_telemetry_freshness = None
+        self._episode_start_telemetry_valid = True
 
         # CPU Optimization: Persistent ThreadPoolExecutor for parallel InfluxDB queries
         # Avoids thread creation/destruction overhead on every _collect_snapshot() call
         # 5 workers: 2 main queries + up to 3 parallel retries (lat, drop, util)
         self._query_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="influx_query")
+
+    def _required_qids_for_current_profile(self) -> Tuple[int, ...]:
+        """Queues that must have valid telemetry for the active workload."""
+        profile = self.current_traffic_profile or ""
+        if profile.startswith("bursty_vo_"):
+            return (0,)
+        if profile.startswith("bursty_vi_"):
+            return (1,)
+        if profile.startswith("bursty_be_"):
+            return (7,)
+        return tuple(QIDS)
+
+    def _normalize_optional_queue_telemetry(self, snapshot: Dict[int, Dict]) -> None:
+        """Keep non-focused burst queues from poisoning state/reward when idle."""
+        required = set(self._required_qids_for_current_profile())
+        for qid in QIDS:
+            q = snapshot[qid]
+            q["profile_required"] = qid in required
+            q["telemetry_optional"] = qid not in required
+            if qid in required or q.get("data_valid", False):
+                continue
+
+            # Class-focused burst profiles intentionally starve the other two
+            # queues during low/off phases. Treat missing optional telemetry as
+            # neutral state, but do not invent routing context or alternatives.
+            q["lat_p95"] = SLA_THRESHOLDS[qid]
+            q["drop_p95"] = 0.0
+            q["util_p95"] = 0.0
+            q["bottleneck_sid"] = None
+            q["bottleneck_score"] = 0.0
+            q["bottleneck_drop"] = 0.0
+            q["bottleneck_lat"] = 0.0
+            q["bottleneck_util"] = 0.0
+            q["bottleneck_role"] = "optional"
+            q["alternatives"] = []
+            q["alt_exists"] = False
+
+    def _required_valid_count(self, snapshot: Dict[int, Dict]) -> int:
+        required = self._required_qids_for_current_profile()
+        return sum(
+            1 for qid in required
+            if snapshot[qid].get("data_valid", False)
+        )
+
+    def _required_invalid_queues(self, snapshot: Dict[int, Dict]) -> List[int]:
+        required = self._required_qids_for_current_profile()
+        return [
+            qid for qid in required
+            if not snapshot[qid].get("data_valid", False)
+        ]
+
+    def _min_required_valid_count(self) -> int:
+        required_count = len(self._required_qids_for_current_profile())
+        return required_count if required_count <= 2 else 2
+
+    def _program_baseline_routing(self) -> None:
+        """Clear P4 state and restore the OSPF baseline."""
+        self.controller.clear_all_tables(verify=True)
+        log.info("Cleared all P4 tables")
+        self.controller.compute_forwarding_entries()
+        log.info("Recomputed OSPF forwarding entries")
+        self.controller.program_switches()
+        log.info("Programmed switches with baseline routing")
+
+    def _reset_local_telemetry_epoch(self, reason: str) -> None:
+        """Clear only the live in-memory cache between traffic profiles."""
+        if not self._read_from_cache():
+            return
+        try:
+            response = self._cache_request({
+                "kind": "reset_epoch",
+                "clear": True,
+                "reason": reason,
+            })
+        except Exception as exc:
+            log.warning(f"[Telemetry Gate] Local cache epoch reset failed: {exc}")
+            return
+        if not response:
+            return
+        self._telemetry_epoch_id = response.get("epoch_id")
+        self._telemetry_epoch_ns = response.get("epoch_started_ns")
+        log.info(
+            "[Telemetry Gate] Reset live cache epoch "
+            f"{self._telemetry_epoch_id} for {reason}"
+        )
+
+    def _cache_freshness(
+        self,
+        *,
+        qids: Optional[List[int]] = None,
+        start: Optional[str] = None,
+        stop: Optional[str] = None,
+        window_seconds: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._read_from_cache():
+            return None
+        if start is None or stop is None:
+            stop_dt = datetime.utcnow() - timedelta(milliseconds=SAFETY_LAG_MS)
+            seconds = (
+                float(window_seconds)
+                if window_seconds is not None
+                else float(self.telemetry_liveness_window_seconds)
+            )
+            start_dt = stop_dt - timedelta(seconds=max(WINDOW_SECONDS, seconds))
+            start = start_dt.isoformat() + 'Z'
+            stop = stop_dt.isoformat() + 'Z'
+        target_qids = list(qids) if qids is not None else list(self._required_qids_for_current_profile())
+        try:
+            return self._cache_request({
+                "kind": "freshness",
+                "start_ns": iso_to_ns(start),
+                "stop_ns": iso_to_ns(stop),
+                "qids": target_qids,
+                "required_labels": ["lat", "drop", "util"],
+            })
+        except Exception as exc:
+            log.warning(f"[Telemetry Freshness] local cache freshness failed: {exc}")
+            return None
+
+    @staticmethod
+    def _ns_to_iso(ns_value: Any) -> str:
+        if ns_value is None:
+            return "none"
+        try:
+            return datetime.utcfromtimestamp(int(ns_value) / 1_000_000_000).isoformat() + "Z"
+        except Exception:
+            return str(ns_value)
+
+    def _freshness_missing_required(
+        self,
+        report: Optional[Dict[str, Any]],
+        required_qids: Optional[List[int]] = None,
+    ) -> Dict[int, List[str]]:
+        if not report:
+            return {qid: ["freshness_query_failed"] for qid in (required_qids or [])}
+        required = [int(qid) for qid in (required_qids or self._required_qids_for_current_profile())]
+        missing_raw = report.get("missing", {}) or {}
+        missing = {}
+        for qid in required:
+            labels = missing_raw.get(str(qid), [])
+            if labels:
+                missing[qid] = list(labels)
+        return missing
+
+    def _log_freshness_report(
+        self,
+        report: Optional[Dict[str, Any]],
+        required_qids: Optional[List[int]] = None,
+        *,
+        prefix: str,
+        level: int = logging.WARNING,
+    ) -> None:
+        if not report:
+            log.log(level, f"{prefix} freshness unavailable")
+            return
+        required = [int(qid) for qid in (required_qids or self._required_qids_for_current_profile())]
+        window = report.get("window", {}) or {}
+        log.log(
+            level,
+            f"{prefix} window={self._ns_to_iso(window.get('start_ns'))}.."
+            f"{self._ns_to_iso(window.get('stop_ns'))} "
+            f"epoch={report.get('epoch_id')} complete={report.get('complete')} "
+            f"missing={report.get('missing', {})}"
+        )
+        queues = report.get("queues", {}) or {}
+        for qid in required:
+            pieces = []
+            by_label = queues.get(str(qid), {}) or {}
+            for label in ("lat", "drop", "util"):
+                item = by_label.get(label, {}) or {}
+                pieces.append(
+                    f"{label}:count={item.get('window_count', 0)} "
+                    f"win_latest={self._ns_to_iso(item.get('window_latest_ns'))} "
+                    f"cache_latest={self._ns_to_iso(item.get('cache_latest_ns'))}"
+                )
+            log.log(level, f"{prefix} Q{qid} " + "; ".join(pieces))
+
+    def _wait_for_required_telemetry(self) -> bool:
+        """Gate episode start on fresh cache records for required queues."""
+        if not self.telemetry_liveness_enabled or not self._read_from_cache():
+            self._episode_start_telemetry_valid = True
+            return True
+
+        required_qids = list(self._required_qids_for_current_profile())
+        retries = max(1, int(self.telemetry_liveness_retries))
+        interval = max(0.0, float(self.telemetry_liveness_interval_seconds))
+        for attempt in range(1, retries + 1):
+            report = self._cache_freshness(
+                qids=required_qids,
+                window_seconds=self.telemetry_liveness_window_seconds,
+            )
+            self._last_telemetry_freshness = report
+            missing = self._freshness_missing_required(report, required_qids)
+            if not missing:
+                self._episode_start_telemetry_valid = True
+                self._log_freshness_report(
+                    report,
+                    required_qids,
+                    prefix=f"[Telemetry Gate] ready attempt {attempt}/{retries}",
+                    level=logging.INFO,
+                )
+                return True
+            self._episode_start_telemetry_valid = False
+            self._log_freshness_report(
+                report,
+                required_qids,
+                prefix=f"[Telemetry Gate] waiting attempt {attempt}/{retries}",
+                level=logging.WARNING,
+            )
+            if attempt < retries and interval > 0:
+                time.sleep(interval)
+
+        log.warning(
+            "[Telemetry Gate] Required telemetry did not become fresh for "
+            f"Q{required_qids} after {retries} attempts"
+        )
+        return False
 
     def reset(self, force_reset: Optional[bool] = None,
               cooldown_seconds: Optional[float] = None,
@@ -1050,49 +1316,93 @@ class QoSRoutingEnv:
         # Perform full network reset if requested
         if do_reset:
             log.info("=== BASELINE START: Resetting network to OSPF ===")
-            
-            # Step 1: Clear all P4 tables
-            self.controller.clear_all_tables(verify=True)
-            log.info("Cleared all P4 tables")
-            
-            # Step 2: Recompute baseline OSPF paths
-            self.controller.compute_forwarding_entries()
-            log.info("Recomputed OSPF forwarding entries")
-            
-            # Step 3: Program switches with baseline
-            self.controller.program_switches()
-            log.info("Programmed switches with baseline routing")
+            self._program_baseline_routing()
         else:
             log.info("=== WARM START: Continuing from current routing state ===")
-        
-        # Start traffic for new episode (training mode only)
-        if self.traffic_manager:
-            if self.fixed_traffic_profile:
-                log.info(f"Starting FIXED traffic profile: {self.fixed_traffic_profile}")
-                profile_info = self.traffic_manager.start_traffic(profile_name=self.fixed_traffic_profile)
-            else:
-                log.info("Starting randomized traffic profile...")
-                profile_info = self.traffic_manager.start_traffic(
-                    category_weights=self.traffic_category_weights,
-                    profile_weights=self.traffic_profile_weights,
+
+        profile_retry_count = 0
+        profile_override = None
+        baseline_recovery_used = bool(do_reset)
+        while True:
+            # Start traffic for new episode (training mode only)
+            if self.traffic_manager:
+                if self.fixed_traffic_profile:
+                    profile_name = self.fixed_traffic_profile
+                    log.info(f"Starting FIXED traffic profile: {profile_name}")
+                    profile_info = self.traffic_manager.start_traffic(profile_name=profile_name)
+                elif profile_override:
+                    log.info(
+                        f"Restarting same traffic profile after telemetry gate "
+                        f"failure: {profile_override}"
+                    )
+                    profile_info = self.traffic_manager.start_traffic(profile_name=profile_override)
+                else:
+                    log.info("Starting randomized traffic profile...")
+                    profile_info = self.traffic_manager.start_traffic(
+                        category_weights=self.traffic_category_weights,
+                        profile_weights=self.traffic_profile_weights,
+                    )
+
+                self.current_traffic_profile = profile_info['profile_name']
+                self.current_traffic_category = profile_info['profile_category']
+                self._reset_local_telemetry_epoch(
+                    f"profile_start:{self.current_traffic_profile}"
                 )
-            
-            self.current_traffic_profile = profile_info['profile_name']
-            self.current_traffic_category = profile_info['profile_category']
-            log.info(f"Traffic started: {self.current_traffic_profile} ({self.current_traffic_category})")
-        
-        # Cool-down period for traffic to stabilize (traffic is now running)
-        cooldown = (
-            float(cooldown_seconds)
-            if cooldown_seconds is not None
-            else (5.0 if do_reset else 2.0)
-        )
-        log.info(f"Traffic running, waiting {cooldown}s for metrics to stabilize...")
-        if self.traffic_manager:
-            self.traffic_manager.warm_profile_for(cooldown)
-            self.traffic_manager.begin_measurement()
-        else:
-            time.sleep(cooldown)
+                log.info(f"Traffic started: {self.current_traffic_profile} ({self.current_traffic_category})")
+                log.info(
+                    "Required telemetry queues for this profile: "
+                    f"Q{list(self._required_qids_for_current_profile())}"
+                )
+
+            # Cool-down period for traffic to stabilize (traffic is now running)
+            cooldown = (
+                float(cooldown_seconds)
+                if cooldown_seconds is not None
+                else (5.0 if do_reset else 2.0)
+            )
+            log.info(f"Traffic running, waiting {cooldown}s for metrics to stabilize...")
+            if self.traffic_manager:
+                self.traffic_manager.warm_profile_for(cooldown)
+                self.traffic_manager.begin_measurement()
+            else:
+                time.sleep(cooldown)
+
+            if not collect_initial_snapshot or self._wait_for_required_telemetry():
+                break
+
+            if (
+                self.traffic_manager
+                and profile_retry_count < max(0, int(self.telemetry_liveness_restarts))
+            ):
+                profile_retry_count += 1
+                profile_override = self.current_traffic_profile
+                log.warning(
+                    "[Telemetry Gate] Restarting and re-warming profile "
+                    f"{profile_override} ({profile_retry_count}/"
+                    f"{self.telemetry_liveness_restarts}) before episode start"
+                )
+                continue
+
+            if self.traffic_manager and not baseline_recovery_used:
+                profile_override = self.current_traffic_profile
+                log.warning(
+                    "[Telemetry Gate] Forcing baseline reset before retrying "
+                    f"profile {profile_override}"
+                )
+                log.info("=== BASELINE START: Resetting network to OSPF ===")
+                self._program_baseline_routing()
+                do_reset = True
+                baseline_recovery_used = True
+                profile_retry_count = 0
+                continue
+
+            log.warning(
+                "[Telemetry Gate] Proceeding with episode start without fresh "
+                "required telemetry; learning will remain disabled until "
+                "data_valid=True"
+            )
+            break
+
         log.info("Episode start complete")
         
         preserve_action_history = (
@@ -1176,6 +1486,10 @@ class QoSRoutingEnv:
         Returns:
             Query result tables, or None if all retries failed
         """
+        if self.query_api is None:
+            log.warning("InfluxDB query requested but InfluxDB client is unavailable")
+            return None
+
         backoff_delays = [0.1, 0.2, 0.4]  # 100ms, 200ms, 400ms
         start_time = time.monotonic()
 
@@ -1196,6 +1510,355 @@ class QoSRoutingEnv:
                     elapsed_ms = (time.monotonic() - start_time) * 1000
                     log.error(f"Query failed after {max_retries} attempts ({elapsed_ms:.0f}ms): {e}")
                     return None
+
+    def _read_from_cache(self) -> bool:
+        return self.telemetry_cache is not None
+
+    def _allow_influx_fallback(self) -> bool:
+        return self.telemetry_backend in ("influx", "cache-fallback-influx")
+
+    def _cache_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if self.telemetry_cache is None:
+            return None
+        response = self.telemetry_cache.request(payload)
+        self._validate_cache_window(payload, response)
+        return response
+
+    def _validate_cache_window(self, payload: Dict[str, Any], response: Dict[str, Any]) -> None:
+        """Fail fast if the local cache returns records outside the requested window."""
+        window = response.get("window")
+        if not window:
+            return
+
+        expected_start = int(payload["start_ns"])
+        expected_stop = int(payload["stop_ns"])
+        kind = payload.get("kind", "unknown")
+        errors = []
+
+        actual_start = int(window.get("start_ns", -1))
+        actual_stop = int(window.get("stop_ns", -1))
+        if actual_start != expected_start or actual_stop != expected_stop:
+            errors.append(
+                f"request window mismatch expected=[{expected_start},{expected_stop}) "
+                f"actual=[{actual_start},{actual_stop})"
+            )
+
+        min_ns = window.get("min_ns")
+        max_ns = window.get("max_ns")
+        if min_ns is not None and int(min_ns) < expected_start:
+            errors.append(f"min_ns {min_ns} precedes start_ns {expected_start}")
+        if max_ns is not None and int(max_ns) >= expected_stop:
+            errors.append(f"max_ns {max_ns} reaches/exceeds stop_ns {expected_stop}")
+        if not bool(window.get("within_window", True)):
+            errors.append("aggregate window audit reports out-of-window records")
+
+        for measurement, stat in (window.get("by_measurement") or {}).items():
+            stat_min = stat.get("min_ns")
+            stat_max = stat.get("max_ns")
+            if stat_min is not None and int(stat_min) < expected_start:
+                errors.append(f"{measurement} min_ns {stat_min} precedes start_ns {expected_start}")
+            if stat_max is not None and int(stat_max) >= expected_stop:
+                errors.append(f"{measurement} max_ns {stat_max} reaches/exceeds stop_ns {expected_stop}")
+            if not bool(stat.get("within_window", True)):
+                errors.append(f"{measurement} audit reports out-of-window records")
+
+        now_ns = time.time_ns()
+        if expected_stop > now_ns + 50_000_000:
+            errors.append(
+                f"requested stop_ns {expected_stop} is more than 50ms in the future "
+                f"relative to RL clock {now_ns}"
+            )
+
+        if errors:
+            raise RuntimeError(
+                f"local telemetry cache window audit failed for {kind}: "
+                + "; ".join(errors)
+            )
+
+        count = int(window.get("count", 0) or 0)
+        log.debug(
+            "[Telemetry Window] kind=%s count=%d start_ns=%d stop_ns=%d "
+            "min_ns=%s max_ns=%s stop_age_ms=%.1f",
+            kind,
+            count,
+            expected_start,
+            expected_stop,
+            min_ns,
+            max_ns,
+            (now_ns - expected_stop) / 1_000_000.0,
+        )
+
+    def _cache_queue_metrics(self, start: str, stop: str) -> Dict:
+        response = self._cache_request({
+            "kind": "queue_metrics",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": QIDS,
+        })
+        result = {
+            'metrics': {qid: {'lat_p95': None, 'drop_p95': None, 'util_p95': None} for qid in QIDS},
+            'metrics_received': {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS},
+            'counts': {qid: {'lat': 0, 'drop': 0, 'util': 0} for qid in QIDS},
+            'window': None,
+            'recovered_via_retry': set(),
+        }
+        if response is None:
+            return result
+
+        metrics = response.get("metrics", {})
+        received = response.get("metrics_received", {})
+        counts = response.get("counts", {})
+        result['window'] = response.get("window")
+        for qid in QIDS:
+            key = str(qid)
+            src_metrics = metrics.get(key, {})
+            src_received = received.get(key, {})
+            src_counts = counts.get(key, {})
+            for metric_name in ('lat_p95', 'drop_p95', 'util_p95'):
+                value = src_metrics.get(metric_name)
+                if value is not None:
+                    result['metrics'][qid][metric_name] = float(value)
+            for received_name in ('lat', 'drop', 'util'):
+                result['metrics_received'][qid][received_name] = bool(src_received.get(received_name, False))
+                result['counts'][qid][received_name] = int(src_counts.get(received_name, 0) or 0)
+        return result
+
+    def _cache_metric_query(self, start: str, stop: str, target_queues: List[int],
+                            measurement: str, metric_name: str) -> Dict[int, float]:
+        response = self._cache_request({
+            "kind": "queue_metrics",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": target_queues,
+        })
+        if response is None:
+            return {}
+
+        field_by_measurement = {
+            "flow_latency": "lat_p95",
+            "q_drop_rate_100ms": "drop_p95",
+            "tx_utilization": "util_p95",
+        }
+        field = field_by_measurement[measurement]
+        metrics = response.get("metrics", {})
+        recovered = {}
+        for qid in target_queues:
+            value = metrics.get(str(qid), {}).get(field)
+            if value is not None:
+                recovered[qid] = float(value)
+        return recovered
+
+    def _cache_queue_summary(
+        self,
+        start: str,
+        stop: str,
+        target_queues: List[int],
+    ) -> Tuple[Dict, Dict[int, Tuple[str, str]]]:
+        response = self._cache_request({
+            "kind": "queue_summary",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": target_queues,
+        })
+        result = {
+            'metrics': {qid: {'lat_p95': None, 'drop_p95': None, 'util_p95': None} for qid in QIDS},
+            'metrics_received': {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS},
+            'counts': {qid: {'lat': 0, 'drop': 0, 'util': 0} for qid in QIDS},
+            'window': None,
+            'recovered_via_retry': set(),
+        }
+        demands: Dict[int, Tuple[str, str]] = {}
+        if response is None:
+            return result, demands
+
+        metrics = response.get("metrics", {})
+        received = response.get("metrics_received", {})
+        counts = response.get("counts", {})
+        result['window'] = response.get("window")
+        for qid in QIDS:
+            key = str(qid)
+            src_metrics = metrics.get(key, {})
+            src_received = received.get(key, {})
+            src_counts = counts.get(key, {})
+            for metric_name in ('lat_p95', 'drop_p95', 'util_p95'):
+                value = src_metrics.get(metric_name)
+                if value is not None:
+                    result['metrics'][qid][metric_name] = float(value)
+            for received_name in ('lat', 'drop', 'util'):
+                result['metrics_received'][qid][received_name] = bool(
+                    src_received.get(received_name, False)
+                )
+                result['counts'][qid][received_name] = int(
+                    src_counts.get(received_name, 0) or 0
+                )
+
+        for qid_text, item in response.get("demands", {}).items():
+            try:
+                qid = int(qid_text)
+            except (TypeError, ValueError):
+                continue
+            src = item.get("src_ip")
+            dst = item.get("dst_ip")
+            if qid in target_queues and src and dst:
+                demands[qid] = (str(src), str(dst))
+
+        return result, demands
+
+    def _cache_hot_demands(self, start: str, stop: str, target_queues: List[int]) -> Dict[int, Tuple[str, str]]:
+        response = self._cache_request({
+            "kind": "hot_demands",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": target_queues,
+        })
+        if response is None:
+            return {}
+        demands = {}
+        for qid_text, item in response.get("demands", {}).items():
+            try:
+                qid = int(qid_text)
+            except (TypeError, ValueError):
+                continue
+            src = item.get("src_ip")
+            dst = item.get("dst_ip")
+            if qid in target_queues and src and dst:
+                demands[qid] = (str(src), str(dst))
+        return demands
+
+    def _cache_switch_metrics_for_queue(self, start: str, stop: str,
+                                        sw_ids: List[int], qid: int) -> Dict[int, Dict]:
+        response = self._cache_request({
+            "kind": "switch_metrics",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "switch_ids": sw_ids,
+            "qid": qid,
+        })
+        if response is None:
+            return {}
+        results = {}
+        for sid_text, metrics in response.get("switch_metrics", {}).items():
+            try:
+                sid = int(sid_text)
+            except (TypeError, ValueError):
+                continue
+            results[sid] = {
+                'drop': float(metrics.get('drop', 0) or 0),
+                'lat': float(metrics.get('lat', 0) or 0),
+                'util': float(metrics.get('util', 0) or 0),
+            }
+        return results
+
+    def _cache_switch_metrics_multi(
+        self,
+        start: str,
+        stop: str,
+        sw_ids_by_qid: Dict[int, List[int]],
+    ) -> Dict[int, Dict[int, Dict]]:
+        if not sw_ids_by_qid:
+            return {}
+        response = self._cache_request({
+            "kind": "switch_metrics_multi",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "queries": {
+                str(int(qid)): [int(sid) for sid in sw_ids]
+                for qid, sw_ids in sw_ids_by_qid.items()
+                if sw_ids
+            },
+        })
+        if response is None:
+            return {}
+        parsed: Dict[int, Dict[int, Dict]] = {}
+        for qid_text, by_sid in response.get("switch_metrics", {}).items():
+            try:
+                qid = int(qid_text)
+            except (TypeError, ValueError):
+                continue
+            parsed[qid] = {}
+            for sid_text, metrics in by_sid.items():
+                try:
+                    sid = int(sid_text)
+                except (TypeError, ValueError):
+                    continue
+                parsed[qid][sid] = {
+                    'drop': float(metrics.get('drop', 0) or 0),
+                    'lat': float(metrics.get('lat', 0) or 0),
+                    'util': float(metrics.get('util', 0) or 0),
+                }
+        return parsed
+
+    def _cache_traffic_count(self, qid: int, start: str, stop: str) -> int:
+        response = self._cache_request({
+            "kind": "traffic_count",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qid": qid,
+        })
+        if response is None:
+            return 0
+        return int(response.get("count", 0) or 0)
+
+    def _cache_traffic_counts(self, qids: List[int], start: str, stop: str) -> Dict[int, int]:
+        if not qids:
+            return {}
+        response = self._cache_request({
+            "kind": "traffic_count_multi",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": qids,
+        })
+        if response is None:
+            return {int(qid): 0 for qid in qids}
+        counts = response.get("counts", {})
+        return {
+            int(qid): int(counts.get(str(int(qid)), 0) or 0)
+            for qid in qids
+        }
+
+    def _cache_flow_coverage(self, start: str, stop: str) -> Dict[int, set]:
+        response = self._cache_request({
+            "kind": "flow_coverage",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": QIDS,
+        })
+        observed = {qid: set() for qid in QIDS}
+        if response is None:
+            return observed
+        for qid_text, flow_ids in response.get("observed", {}).items():
+            try:
+                qid = int(qid_text)
+            except (TypeError, ValueError):
+                continue
+            if qid in observed:
+                observed[qid] = {str(flow_id) for flow_id in flow_ids}
+        return observed
+
+    def get_local_egress_observations(
+        self,
+        window_seconds: float = 5.0,
+        top_n: int = 10,
+    ) -> Dict[str, Any]:
+        """Return compact INT egress-path and bottleneck evidence from cache."""
+        if not self._read_from_cache():
+            return {
+                "ok": False,
+                "error": "local telemetry cache is not enabled",
+                "flows": {},
+                "top_egresses": [],
+            }
+        stop_dt = datetime.utcnow()
+        start_dt = stop_dt - timedelta(seconds=float(window_seconds))
+        start = start_dt.isoformat() + 'Z'
+        stop = stop_dt.isoformat() + 'Z'
+        return self._cache_request({
+            "kind": "egress_observations",
+            "start_ns": iso_to_ns(start),
+            "stop_ns": iso_to_ns(stop),
+            "qids": QIDS,
+            "top_n": int(top_n),
+        })
 
     def _time_window(self) -> Tuple[str, str]:
         """Get time window for queries."""
@@ -1238,17 +1901,20 @@ class QoSRoutingEnv:
                 |> first()
             '''
             try:
-                tables = self.query_api.query(org=self.org, query=flux)
-                observed = {qid: set() for qid in QIDS}
-                for table in tables or []:
-                    for record in table.records:
-                        try:
-                            qid = int(record.values.get('queue_id', -1))
-                        except (TypeError, ValueError):
-                            continue
-                        flow_id = record.values.get('flow_id')
-                        if qid in observed and flow_id is not None:
-                            observed[qid].add(str(flow_id))
+                if self._read_from_cache():
+                    observed = self._cache_flow_coverage(start, stop)
+                else:
+                    tables = self.query_api.query(org=self.org, query=flux)
+                    observed = {qid: set() for qid in QIDS}
+                    for table in tables or []:
+                        for record in table.records:
+                            try:
+                                qid = int(record.values.get('queue_id', -1))
+                            except (TypeError, ValueError):
+                                continue
+                            flow_id = record.values.get('flow_id')
+                            if qid in observed and flow_id is not None:
+                                observed[qid].add(str(flow_id))
                 query_error = None
             except Exception as exc:
                 query_error = str(exc)
@@ -1278,7 +1944,8 @@ class QoSRoutingEnv:
                     f"unexpected={unexpected}"
                 )
         if query_error:
-            errors.append(f"InfluxDB coverage query failed: {query_error}")
+            source = "local cache" if self._read_from_cache() else "InfluxDB"
+            errors.append(f"{source} coverage query failed: {query_error}")
 
         report = {
             'verified': not errors,
@@ -1304,6 +1971,21 @@ class QoSRoutingEnv:
             stop: Query window stop time (ISO format)
             step: Global step number for logging (captured at call time)
         """
+        if self._read_from_cache():
+            try:
+                return self._cache_queue_metrics(start, stop)
+            except Exception as e:
+                log.warning(f"[Query S{step}] local telemetry cache queue_metrics failed: {e}")
+                if not self._allow_influx_fallback():
+                    return {
+                        'metrics': {qid: {'lat_p95': None, 'drop_p95': None, 'util_p95': None} for qid in QIDS},
+                        'metrics_received': {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS},
+                        'counts': {qid: {'lat': 0, 'drop': 0, 'util': 0} for qid in QIDS},
+                        'window': None,
+                        'recovered_via_retry': set(),
+                    }
+                log.warning(f"[Query S{step}] falling back to InfluxDB for queue metrics")
+
         flux = f'''
         base = from(bucket:"{self.bucket}")
             |> range(start:{start}, stop:{stop})
@@ -1467,20 +2149,34 @@ class QoSRoutingEnv:
 
             t0 = time.time()
             try:
-                tables = self.query_api.query(org=self.org, query=flux)
-                elapsed_ms = (time.time() - t0) * 1000
+                if self._read_from_cache():
+                    cache_values = self._cache_metric_query(
+                        start,
+                        current_stop,
+                        list(remaining_queues),
+                        measurement,
+                        metric_name,
+                    )
+                    elapsed_ms = (time.time() - t0) * 1000
+                    for qid, value in cache_values.items():
+                        if qid in remaining_queues:
+                            result[qid] = float(value)
+                            remaining_queues.discard(qid)
+                else:
+                    tables = self.query_api.query(org=self.org, query=flux)
+                    elapsed_ms = (time.time() - t0) * 1000
 
-                if tables:
-                    for table in tables:
-                        for record in table.records:
-                            try:
-                                qid = int(record.values.get('queue_id', -1))
-                                value = record.get_value()
-                                if qid in remaining_queues and value is not None:
-                                    result[qid] = float(value)
-                                    remaining_queues.discard(qid)
-                            except (ValueError, TypeError):
-                                continue
+                    if tables:
+                        for table in tables:
+                            for record in table.records:
+                                try:
+                                    qid = int(record.values.get('queue_id', -1))
+                                    value = record.get_value()
+                                    if qid in remaining_queues and value is not None:
+                                        result[qid] = float(value)
+                                        remaining_queues.discard(qid)
+                                except (ValueError, TypeError):
+                                    continue
 
                 window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
                 if not remaining_queues:
@@ -1499,8 +2195,41 @@ class QoSRoutingEnv:
 
             except Exception as e:
                 elapsed_ms = (time.time() - t0) * 1000
-                log.warning(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} FAILED "
-                           f"({elapsed_ms:.0f}ms): {e}")
+                if self._read_from_cache() and self._allow_influx_fallback():
+                    log.warning(f"[Query S{step}] {metric_name} local cache retry failed "
+                                f"({elapsed_ms:.0f}ms), trying InfluxDB: {e}")
+                    try:
+                        if self.query_api is None:
+                            raise RuntimeError("InfluxDB client is unavailable")
+                        tables = self.query_api.query(org=self.org, query=flux)
+                        elapsed_ms = (time.time() - t0) * 1000
+                        if tables:
+                            for table in tables:
+                                for record in table.records:
+                                    try:
+                                        qid = int(record.values.get('queue_id', -1))
+                                        value = record.get_value()
+                                        if qid in remaining_queues and value is not None:
+                                            result[qid] = float(value)
+                                            remaining_queues.discard(qid)
+                                    except (ValueError, TypeError):
+                                        continue
+                    except Exception as influx_exc:
+                        log.warning(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} FAILED "
+                                    f"({elapsed_ms:.0f}ms): {influx_exc}")
+                    else:
+                        window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
+                        if not remaining_queues:
+                            log.info(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} SUCCESS: "
+                                    f"got ALL Q{list(result.keys())} in {elapsed_ms:.0f}ms {window_info}")
+                            return result
+                        if result:
+                            log.info(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} PARTIAL: "
+                                    f"got Q{list(result.keys())}, still missing Q{list(remaining_queues)} "
+                                    f"({elapsed_ms:.0f}ms {window_info})")
+                else:
+                    log.warning(f"[Query S{step}] {metric_name} retry {attempt+1}/{max_retries} FAILED "
+                               f"({elapsed_ms:.0f}ms): {e}")
 
         if result:
             log.warning(f"[Query S{step}] {metric_name} retry exhausted after {max_retries} attempts - "
@@ -1540,6 +2269,7 @@ class QoSRoutingEnv:
             'bottleneck_role': 'other',  # Bottleneck switch role (tor/agg/core/other)
             'path_nodes': [],
             'data_valid': False,  # Track telemetry validity
+            'telemetry_counts': {'lat': 0, 'drop': 0, 'util': 0},
         } for qid in QIDS}
 
         # CPU Optimization: Run two independent queries in parallel using persistent ThreadPoolExecutor
@@ -1551,35 +2281,81 @@ class QoSRoutingEnv:
         # Capture step number NOW before submitting to thread pool
         # This ensures consistent step logging even if retries run after step increments
         step = self.global_step
+        hot_demand_qids = list(self._required_qids_for_current_profile())
 
         # ThreadPoolExecutor health check
         queue_size = self._query_executor._work_queue.qsize()
         if queue_size > 2:
             log.warning(f"[ThreadPool] Work queue backlog: {queue_size} (expected ~0)")
 
-        # Submit queries in parallel using persistent executor (pass step for logging)
-        future_aggregated = self._query_executor.submit(self._query_aggregated_metrics, start, stop, step)
-        future_hottest = self._query_executor.submit(self._get_all_hottest_demands, step)
+        if self._read_from_cache():
+            try:
+                aggregated_result, all_hot_demands = self._cache_queue_summary(
+                    start,
+                    stop,
+                    hot_demand_qids,
+                )
+            except Exception as e:
+                log.warning(f"[Query S{step}] local telemetry cache queue_summary failed: {e}")
+                if self._allow_influx_fallback():
+                    log.warning(f"[Query S{step}] falling back to InfluxDB for queue summary")
+                else:
+                    aggregated_result = {
+                        'metrics': {
+                            qid: {'lat_p95': None, 'drop_p95': None, 'util_p95': None}
+                            for qid in QIDS
+                        },
+                        'metrics_received': {
+                            qid: {'lat': False, 'drop': False, 'util': False}
+                            for qid in QIDS
+                        },
+                        'counts': {
+                            qid: {'lat': 0, 'drop': 0, 'util': 0}
+                            for qid in QIDS
+                        },
+                        'window': None,
+                        'recovered_via_retry': set(),
+                    }
+                    all_hot_demands = {}
 
-        # Collect results as they complete
-        # Timeout covers: initial query (~0.5s) + parallel retries (5s max) + buffer (1.5s) = 7s
-        # This ensures retries complete before moving to next step
-        try:
-            aggregated_result = future_aggregated.result(timeout=7.0)
-        except Exception as e:
-            log.warning(f"[Parallel Query] Aggregated metrics query failed: {e}")
+        if aggregated_result is None:
+            # InfluxDB path: keep the existing retry behavior as the optional
+            # compatibility implementation.
+            future_aggregated = self._query_executor.submit(
+                self._query_aggregated_metrics,
+                start,
+                stop,
+                step,
+            )
+            future_hottest = self._query_executor.submit(
+                self._get_all_hottest_demands,
+                step,
+                hot_demand_qids,
+            )
 
-        # hot_demands has its own retry loop (5s max) + buffer (1s) = 6s
-        try:
-            all_hot_demands = future_hottest.result(timeout=6.0)
-        except Exception as e:
-            log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
+            # Timeout covers: initial query (~0.5s) + parallel retries (5s max)
+            # + buffer (1.5s). This is intentionally only used off the local
+            # cache fast path, where exact-window misses stay invalid.
+            try:
+                aggregated_result = future_aggregated.result(timeout=7.0)
+            except Exception as e:
+                log.warning(f"[Parallel Query] Aggregated metrics query failed: {e}")
+
+            # hot_demands has its own retry loop (5s max) + buffer (1s) = 6s
+            try:
+                all_hot_demands = future_hottest.result(timeout=6.0)
+            except Exception as e:
+                log.warning(f"[Parallel Query] Hottest demands query failed: {e}")
 
         # Process aggregated metrics result
         metrics_received = {qid: {'lat': False, 'drop': False, 'util': False} for qid in QIDS}
+        metrics_counts = {qid: {'lat': 0, 'drop': 0, 'util': 0} for qid in QIDS}
+        metrics_window = None
         recovered_via_retry = set()  # Track queues that were recovered via retry
         if aggregated_result is not None:
             recovered_via_retry = aggregated_result.get('recovered_via_retry', set())
+            metrics_counts = aggregated_result.get('counts', metrics_counts)
+            metrics_window = aggregated_result.get('window')
             for qid in QIDS:
                 metrics = aggregated_result['metrics'].get(qid, {})
                 received = aggregated_result['metrics_received'].get(qid, {})
@@ -1601,62 +2377,150 @@ class QoSRoutingEnv:
             values_sane = self._metric_sane(snapshot[qid]) if metrics_present else False
             snapshot[qid]['data_valid'] = metrics_present and values_sane
             snapshot[qid]['recovered_via_retry'] = qid in recovered_via_retry
+            snapshot[qid]['telemetry_counts'] = metrics_counts.get(
+                qid,
+                {'lat': 0, 'drop': 0, 'util': 0},
+            )
+
+        self._normalize_optional_queue_telemetry(snapshot)
 
         # Log telemetry status for monitoring
         valid_count = sum(1 for qid in QIDS if snapshot[qid]['data_valid'])
-        if valid_count < len(QIDS):
-            missing = [qid for qid in QIDS if not snapshot[qid]['data_valid']]
+        required_qids = set(self._required_qids_for_current_profile())
+        required_valid_count = self._required_valid_count(snapshot)
+        required_invalid = self._required_invalid_queues(snapshot)
+        if required_invalid:
             reasons = []
-            for qid in missing:
+            for qid in required_invalid:
                 if not metrics_received[qid]['lat'] or not metrics_received[qid]['drop'] or not metrics_received[qid]['util']:
                     reasons.append(f"q{qid}:missing_metrics")
                 elif not self._metric_sane(snapshot[qid]):
                     reasons.append(f"q{qid}:insane_values")
-            log.warning(f"[Telemetry] Invalid data for queues {missing} ({', '.join(reasons)}) - only {valid_count}/{len(QIDS)} valid")
+            optional_missing = [
+                qid for qid in QIDS
+                if qid not in required_qids
+                and not metrics_received[qid]['lat']
+            ]
+            optional_note = (
+                f"; optional missing Q{optional_missing}"
+                if optional_missing else ""
+            )
+            log.warning(
+                f"[Telemetry] Invalid required data for queues {required_invalid} "
+                f"({', '.join(reasons)}) - required "
+                f"{required_valid_count}/{len(required_qids)} valid, "
+                f"overall {valid_count}/{len(QIDS)} valid{optional_note}"
+            )
             # Detailed diagnostics for debugging missing metrics
             log.warning(f"[Telemetry Debug] Time window: {start} to {stop}")
             log.warning(f"[Telemetry Debug] Global step: {self.global_step}")
             log.warning(f"[Telemetry Debug] Metrics received: {metrics_received}")
+            log.warning(f"[Telemetry Debug] Metric counts: {metrics_counts}")
+            if metrics_window:
+                log.warning(f"[Telemetry Debug] Cache metric window audit: {metrics_window}")
             log.warning(f"[Telemetry Debug] Hot demands: {all_hot_demands}")
+            freshness = self._cache_freshness(
+                qids=list(required_qids),
+                start=start,
+                stop=stop,
+            )
+            self._last_telemetry_freshness = freshness
+            self._log_freshness_report(
+                freshness,
+                list(required_qids),
+                prefix=f"[Telemetry Freshness S{self.global_step}]",
+                level=logging.WARNING,
+            )
 
         # 2. Get Path and Bottleneck Info (Queue-Specific)
         # Each queue gets its own bottleneck detection and alternative metrics
         # This ensures accurate per-queue congestion identification
         # Note: all_hot_demands already retrieved from parallel query above
-        
-        for qid in QIDS:
-            # Find hottest demand for this queue from batch result
-            hot = all_hot_demands.get(qid)
-            if not hot:
-                # No cache fallback - retry logic already exhausted in _get_all_hottest_demands
-                log.info(f"[Snapshot] Queue {qid}: No hot demand found after retries, skipping bottleneck detection")
-                continue
 
-            src_ip, dst_ip = hot
+        cache_path_context = {}
+        cache_path_metrics = {}
+        if self._read_from_cache():
+            sw_ids_by_qid = {}
+            for qid in QIDS:
+                hot = all_hot_demands.get(qid)
+                if not hot:
+                    continue
+                src_ip, dst_ip = hot
+                path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
+                if not path:
+                    continue
+                sw_names = [n for n in path if n in self.controller.switch_name_to_id]
+                sw_ids = [int(self.controller.switch_name_to_id[n]) for n in sw_names]
+                if not sw_ids:
+                    continue
+                cache_path_context[qid] = {
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'path': list(path),
+                    'sw_ids': sw_ids,
+                }
+                sw_ids_by_qid[qid] = sw_ids
+
+            if sw_ids_by_qid:
+                try:
+                    cache_path_metrics = self._cache_switch_metrics_multi(
+                        start,
+                        stop,
+                        sw_ids_by_qid,
+                    )
+                except Exception as e:
+                    log.warning(f"[Query S{step}] local telemetry cache switch_metrics_multi failed: {e}")
+                    cache_path_metrics = {}
+
+        for qid in QIDS:
+            cached_path = cache_path_context.get(qid)
+            if cached_path is not None:
+                src_ip = cached_path['src_ip']
+                dst_ip = cached_path['dst_ip']
+                path = cached_path['path']
+                sw_ids = cached_path['sw_ids']
+            else:
+                # Find hottest demand for this queue from batch result
+                hot = all_hot_demands.get(qid)
+                if not hot:
+                    if qid not in required_qids:
+                        continue
+                    # No cache fallback - retry logic already exhausted in _get_all_hottest_demands
+                    log.info(f"[Snapshot] Queue {qid}: No hot demand found after retries, skipping bottleneck detection")
+                    continue
+
+                src_ip, dst_ip = hot
+                # Get current path for THIS queue (uses queue-specific paths after reroutes)
+                path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
+                if not path:
+                    log.info(f"[Snapshot] Queue {qid}: No path found for ({src_ip}, {dst_ip})")
+                    continue
+
+                # --- Step A: Path Metrics (Queue-Specific) ---
+                # Query metrics filtered by this queue_id for accurate bottleneck detection
+                # Filter to switches only (exclude hosts) - check against known switch names
+                sw_names = [n for n in path if n in self.controller.switch_name_to_id]
+                sw_ids = [self.controller.switch_name_to_id[n] for n in sw_names]
+                sw_ids = [int(s) for s in sw_ids]
+
             log.debug(f"[Snapshot] Queue {qid}: hot_demand=({src_ip}, {dst_ip})")
             snapshot[qid]['hot_src_ip'] = src_ip
             snapshot[qid]['hot_dst_ip'] = dst_ip
-            
-            # Get current path for THIS queue (uses queue-specific paths after reroutes)
-            path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
-            if not path:
-                log.info(f"[Snapshot] Queue {qid}: No path found for ({src_ip}, {dst_ip})")
-                continue
-            
             snapshot[qid]['path_nodes'] = list(path)
-            
-            # --- Step A: Path Metrics (Queue-Specific) ---
-            # Query metrics filtered by this queue_id for accurate bottleneck detection
-            # Filter to switches only (exclude hosts) - check against known switch names
-            sw_names = [n for n in path if n in self.controller.switch_name_to_id]
-            sw_ids = [self.controller.switch_name_to_id[n] for n in sw_names]
-            sw_ids = [int(s) for s in sw_ids]
             
             if not sw_ids:
                 continue
                 
             # Query path switches with queue_id filter for accurate per-queue bottleneck
-            path_metrics = self._query_switch_metrics_for_queue(sw_ids, qid)
+            if qid in cache_path_metrics:
+                path_metrics = cache_path_metrics.get(qid, {})
+            else:
+                path_metrics = self._query_switch_metrics_for_queue(
+                    sw_ids,
+                    qid,
+                    start,
+                    stop,
+                )
             
             # Identify Bottleneck (SKIP edge switches - they have no alternatives)
             best_sid, best_score = None, -1.0
@@ -1700,7 +2564,12 @@ class QoSRoutingEnv:
 
                 # Query alternative metrics for THIS queue specifically
                 if alt_sids:
-                    alt_metrics = self._query_switch_metrics_for_queue(alt_sids, qid)
+                    alt_metrics = self._query_switch_metrics_for_queue(
+                        alt_sids,
+                        qid,
+                        start,
+                        stop,
+                    )
 
                     # Use cached bottleneck score for relative comparison (CPU optimization)
                     bn_score = best_score
@@ -1747,7 +2616,13 @@ class QoSRoutingEnv:
 
         return snapshot
 
-    def _query_switch_metrics_for_queue(self, sw_ids: List[int], qid: int) -> Dict[int, Dict]:
+    def _query_switch_metrics_for_queue(
+        self,
+        sw_ids: List[int],
+        qid: int,
+        start: Optional[str] = None,
+        stop: Optional[str] = None,
+    ) -> Dict[int, Dict]:
         """
         Query drop, latency, and utilization for a list of switch IDs,
         filtered by a specific queue_id for accurate per-queue metrics.
@@ -1763,7 +2638,17 @@ class QoSRoutingEnv:
             return {}
             
         sid_filter = " or ".join([f'r.switch_id == "{sid}"' for sid in sw_ids])
-        start, stop = self._time_window()
+        if start is None or stop is None:
+            start, stop = self._time_window()
+
+        if self._read_from_cache():
+            try:
+                return self._cache_switch_metrics_for_queue(start, stop, sw_ids, qid)
+            except Exception as e:
+                log.warning(f"Local telemetry cache switch_metrics failed for Q{qid}: {e}")
+                if not self._allow_influx_fallback():
+                    return {}
+                log.warning(f"Falling back to InfluxDB switch metrics for Q{qid}")
         
         # Query metrics WITH queue_id filter for queue-specific accuracy
         flux = f'''
@@ -1794,7 +2679,11 @@ class QoSRoutingEnv:
 
         return results
 
-    def _get_all_hottest_demands(self, step: int) -> Dict[int, Tuple[str, str]]:
+    def _get_all_hottest_demands(
+        self,
+        step: int,
+        target_qids: Optional[List[int]] = None,
+    ) -> Dict[int, Tuple[str, str]]:
         """Get the demand with highest latency for ALL queues in one query.
 
         Uses retry logic similar to flow_latency recovery:
@@ -1807,10 +2696,14 @@ class QoSRoutingEnv:
         """
         start, stop = self._time_window()
 
+        requested_qids = [int(qid) for qid in (target_qids or QIDS)]
         results = {}
-        remaining_queues = set(QIDS)
+        remaining_queues = set(requested_qids)
         max_retries = 5
         retry_delay = 1.0
+        queue_filter = " or ".join(
+            [f'r.queue_id == "{qid}"' for qid in requested_qids]
+        )
 
         for attempt in range(max_retries):
             if attempt > 0:
@@ -1828,7 +2721,7 @@ class QoSRoutingEnv:
             from(bucket:"{self.bucket}")
                 |> range(start:{start}, stop:{current_stop})
                 |> filter(fn: (r) => r._measurement == "flow_latency")
-                |> filter(fn: (r) => r.queue_id == "0" or r.queue_id == "1" or r.queue_id == "7")
+                |> filter(fn: (r) => {queue_filter})
                 |> toFloat()
                 |> group(columns:["queue_id", "src_ip", "dst_ip"])
                 |> mean(column:"_value")
@@ -1839,21 +2732,33 @@ class QoSRoutingEnv:
 
             t0 = time.time()
             try:
-                tables = self.query_api.query(org=self.org, query=flux)
-                elapsed_ms = (time.time() - t0) * 1000
+                if self._read_from_cache():
+                    cache_results = self._cache_hot_demands(
+                        start,
+                        current_stop,
+                        list(remaining_queues),
+                    )
+                    elapsed_ms = (time.time() - t0) * 1000
+                    for qid, demand in cache_results.items():
+                        if qid in remaining_queues:
+                            results[qid] = demand
+                            remaining_queues.discard(qid)
+                else:
+                    tables = self.query_api.query(org=self.org, query=flux)
+                    elapsed_ms = (time.time() - t0) * 1000
 
-                if tables:
-                    for table in tables:
-                        for record in table.records:
-                            try:
-                                qid = int(record.values.get('queue_id', -1))
-                                src = record.values.get('src_ip')
-                                dst = record.values.get('dst_ip')
-                                if qid in remaining_queues and src and dst:
-                                    results[qid] = (str(src), str(dst))
-                                    remaining_queues.discard(qid)
-                            except (ValueError, TypeError):
-                                continue
+                    if tables:
+                        for table in tables:
+                            for record in table.records:
+                                try:
+                                    qid = int(record.values.get('queue_id', -1))
+                                    src = record.values.get('src_ip')
+                                    dst = record.values.get('dst_ip')
+                                    if qid in remaining_queues and src and dst:
+                                        results[qid] = (str(src), str(dst))
+                                        remaining_queues.discard(qid)
+                                except (ValueError, TypeError):
+                                    continue
 
                 window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
                 if not remaining_queues:
@@ -1873,7 +2778,42 @@ class QoSRoutingEnv:
 
             except Exception as e:
                 elapsed_ms = (time.time() - t0) * 1000
-                if attempt > 0:
+                if self._read_from_cache() and self._allow_influx_fallback():
+                    log.warning(f"[Query S{step}] hot_demands local cache failed "
+                                f"({elapsed_ms:.0f}ms), trying InfluxDB: {e}")
+                    try:
+                        if self.query_api is None:
+                            raise RuntimeError("InfluxDB client is unavailable")
+                        tables = self.query_api.query(org=self.org, query=flux)
+                        elapsed_ms = (time.time() - t0) * 1000
+                        if tables:
+                            for table in tables:
+                                for record in table.records:
+                                    try:
+                                        qid = int(record.values.get('queue_id', -1))
+                                        src = record.values.get('src_ip')
+                                        dst = record.values.get('dst_ip')
+                                        if qid in remaining_queues and src and dst:
+                                            results[qid] = (str(src), str(dst))
+                                            remaining_queues.discard(qid)
+                                    except (ValueError, TypeError):
+                                        continue
+                    except Exception as influx_exc:
+                        if attempt > 0:
+                            log.warning(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} FAILED "
+                                       f"({elapsed_ms:.0f}ms): {influx_exc}")
+                    else:
+                        window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
+                        if not remaining_queues:
+                            if attempt > 0:
+                                log.info(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} SUCCESS: "
+                                        f"got ALL Q{list(results.keys())} in {elapsed_ms:.0f}ms {window_info}")
+                            return results
+                        if results and attempt > 0:
+                            log.info(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} PARTIAL: "
+                                    f"got Q{list(results.keys())}, still missing Q{list(remaining_queues)} "
+                                    f"({elapsed_ms:.0f}ms {window_info})")
+                elif attempt > 0:
                     log.warning(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} FAILED "
                                f"({elapsed_ms:.0f}ms): {e}")
 
@@ -2106,6 +3046,7 @@ class QoSRoutingEnv:
         any_valid_for_multi = False
         
         if not in_cooldown:
+            actionable_qids = set(self._required_qids_for_current_profile())
             for action, mapping in self.ACTION_MAP.items():
                 if mapping is None:  # Skip no-op
                     continue
@@ -2113,6 +3054,8 @@ class QoSRoutingEnv:
                     continue
                     
                 qid, alt_idx = mapping
+                if qid not in actionable_qids:
+                    continue
                 
                 # Check if this queue has enough alternatives
                 q = snapshot[qid]
@@ -2125,7 +3068,7 @@ class QoSRoutingEnv:
             # Multi-action is valid ONLY if 2+ queues are VIOLATING SLA *and* have alternatives
             # This ensures multi-action is reserved for situations where multiple queues need help
             violating_with_alts = 0
-            for qid in QIDS:
+            for qid in actionable_qids:
                 q = snapshot[qid]
                 # Check soft margin violation (consistent with step logic)
                 if self._is_sla_violated(qid, snapshot) and q.get('bottleneck_sid') is not None and len(q.get('alternatives', [])) > 0:
@@ -2152,9 +3095,16 @@ class QoSRoutingEnv:
             (reward, info_dict)
         """
         raw_reward = 0.0
-        info = {'sla_met': [], 'sla_violated': [], 'per_queue': {}}
+        reward_qids = list(self._required_qids_for_current_profile())
+        info = {
+            'sla_met': [],
+            'sla_violated': [],
+            'per_queue': {},
+            'reward_qids': reward_qids,
+            'sla_total': len(reward_qids),
+        }
         
-        for qid in QIDS:
+        for qid in reward_qids:
             q = snapshot[qid]
             sla = SLA_THRESHOLDS[qid]
             lat = q['lat_p95']
@@ -2200,6 +3150,9 @@ class QoSRoutingEnv:
                 'component': component,
                 'drop_penalty': drop_penalty
             }
+
+        if reward_qids:
+            raw_reward *= len(QIDS) / len(reward_qids)
         
         # Stability: Symmetric soft clipping with tanh
         # Maps to [-2.5, +2.5] range - symmetric to reduce bias
@@ -2217,8 +3170,11 @@ class QoSRoutingEnv:
             (success, description, reroute_count) - count of queues rerouted
         """
         rerouted = []
+        actionable_qids = set(self._required_qids_for_current_profile())
         
         for qid in QIDS:
+            if qid not in actionable_qids:
+                continue
             q = snapshot[qid]
             
             # Only reroute if SLA is violated
@@ -2248,10 +3204,32 @@ class QoSRoutingEnv:
                 self.controller.record_queue_change(qid, self.global_step)
                 log.info(f"[MULTI] Rerouted qid={qid} to {alt_name} [bn={bottleneck_sid}]")
         
+        self._last_rerouted_qids = list(rerouted)
         if rerouted:
             return True, f"multi:{len(rerouted)}", len(rerouted)
         else:
             return False, None, 0
+
+    def _rollback_failed_reroute(self, qid: int, reason: str) -> bool:
+        """Rollback the most recent queue-specific route change after a blackhole check."""
+        try:
+            reverted = self.controller.revert_last_change_for_qid(int(qid))
+        except Exception as exc:
+            log.warning(
+                f"[Rollback] Failed to revert Q{qid} after {reason}: {exc}"
+            )
+            return False
+
+        if reverted:
+            log.warning(
+                f"[Rollback] Reverted last Q{qid} route change after {reason}"
+            )
+            return True
+
+        log.warning(
+            f"[Rollback] No pending Q{qid} route change to revert after {reason}"
+        )
+        return False
 
     def _verify_queue_traffic_flowing(self, qid: int, window_seconds: float = 1.5) -> bool:
         """
@@ -2269,6 +3247,14 @@ class QoSRoutingEnv:
             start_dt = stop_dt - timedelta(seconds=window_seconds)
             start = start_dt.isoformat() + 'Z'
             stop = stop_dt.isoformat() + 'Z'
+
+            if self._read_from_cache():
+                try:
+                    return self._cache_traffic_count(qid, start, stop) > 0
+                except Exception as e:
+                    log.debug(f"[Verify] Local telemetry cache traffic check for Q{qid} failed: {e}")
+                    if not self._allow_influx_fallback():
+                        return True
 
             # Simple count query for the specific queue
             flux = f'''
@@ -2293,6 +3279,34 @@ class QoSRoutingEnv:
             log.debug(f"[Verify] Traffic check for Q{qid} failed: {e}")
             return True  # Assume OK on error to avoid false alarms
 
+    def _verify_rerouted_traffic_flowing(
+        self,
+        qids: List[int],
+        window_seconds: float = 1.5,
+    ) -> Dict[int, bool]:
+        """Batch post-reroute flow checks when using the local cache."""
+        qids = [int(qid) for qid in qids]
+        if not qids:
+            return {}
+
+        if self._read_from_cache():
+            try:
+                stop_dt = datetime.utcnow()
+                start_dt = stop_dt - timedelta(seconds=window_seconds)
+                start = start_dt.isoformat() + 'Z'
+                stop = stop_dt.isoformat() + 'Z'
+                counts = self._cache_traffic_counts(qids, start, stop)
+                return {qid: counts.get(qid, 0) > 0 for qid in qids}
+            except Exception as e:
+                log.debug(f"[Verify] Local telemetry cache batched traffic check failed: {e}")
+                if not self._allow_influx_fallback():
+                    return {qid: True for qid in qids}
+
+        return {
+            qid: self._verify_queue_traffic_flowing(qid, window_seconds)
+            for qid in qids
+        }
+
     def _apply_action(self, action: int, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str], Optional[int]]:
         """
         Apply routing action based on explicit alternative selection.
@@ -2301,6 +3315,7 @@ class QoSRoutingEnv:
             (success, alt_name, alt_idx) - alt_name for logging, alt_idx for InfluxDB
             For multi-action: alt_name is 'multi:N', alt_idx is count of rerouted queues
         """
+        self._last_rerouted_qids = []
         if action == 0:
             return False, None, None  # No-op
         
@@ -2315,6 +3330,12 @@ class QoSRoutingEnv:
         
         # Single queue action
         qid, alt_idx = mapping
+        if qid not in set(self._required_qids_for_current_profile()):
+            log.debug(
+                f"Action {action} targets Q{qid}, which is optional for "
+                f"profile {self.current_traffic_profile}"
+            )
+            return False, None, None
         q = snapshot[qid]
         src_ip = q.get('hot_src_ip')
         dst_ip = q.get('hot_dst_ip')
@@ -2343,6 +3364,7 @@ class QoSRoutingEnv:
             # Track usage and history
             self.controller.track_usage(alt_name)
             self.controller.record_queue_change(qid, self.global_step)
+            self._last_rerouted_qids = [qid]
         else:
             log.warning(f"[ACTION {action}] Reroute failed: {msg}")
         
@@ -2388,22 +3410,35 @@ class QoSRoutingEnv:
         # Post-reroute traffic verification: check if traffic is still flowing
         # This detects cases where a reroute broke packet forwarding
         if action_applied and action != 0:
-            # Get the queue ID that was rerouted
+            failed_reroute_qids = []
             mapping = self.ACTION_MAP.get(action)
-            if mapping and mapping != 'multi':
-                rerouted_qid = mapping[0]
-                if not self._verify_queue_traffic_flowing(rerouted_qid):
-                    log.warning(f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
-                               f"No traffic data for Q{rerouted_qid} after reroute to {alt_name}")
-                    # Log additional context for debugging
-                    log.warning(f"[Step {self.episode_step}] Reroute details: action={action}, "
-                               f"qid={rerouted_qid}, alt={alt_name}, bn={current_snapshot[rerouted_qid].get('bottleneck_sid')}")
-            elif mapping == 'multi':
-                # For multi-queue action, check all queues
-                for qid in QIDS:
-                    if not self._verify_queue_traffic_flowing(qid):
-                        log.warning(f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
-                                   f"No traffic data for Q{qid} after multi-queue reroute")
+            reroute_flowing = self._verify_rerouted_traffic_flowing(
+                list(getattr(self, "_last_rerouted_qids", []))
+            )
+            for rerouted_qid in getattr(self, "_last_rerouted_qids", []):
+                if reroute_flowing.get(rerouted_qid, True):
+                    continue
+                action_desc = (
+                    "multi-queue reroute"
+                    if mapping == 'multi'
+                    else f"reroute to {alt_name}"
+                )
+                log.warning(f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
+                           f"No traffic data for Q{rerouted_qid} after {action_desc}")
+                log.warning(f"[Step {self.episode_step}] Reroute details: action={action}, "
+                           f"qid={rerouted_qid}, alt={alt_name}, "
+                           f"bn={current_snapshot[rerouted_qid].get('bottleneck_sid')}")
+                self._rollback_failed_reroute(
+                    rerouted_qid,
+                    f"post-reroute traffic verification failure at step {self.episode_step}",
+                )
+                failed_reroute_qids.append(rerouted_qid)
+            if failed_reroute_qids:
+                action_applied = False
+                log.warning(
+                    f"[Step {self.episode_step}] Marking action {action} invalid "
+                    f"after rollback of Q{failed_reroute_qids}"
+                )
 
         # Check if traffic is stable before collecting metrics
         # During traffic transitions (burst start/end), telemetry is unreliable
@@ -2495,7 +3530,8 @@ class QoSRoutingEnv:
             info['action_cost_applied'] = False
         
         # Check episode termination
-        all_sla_met = len(info['sla_met']) == len(QIDS)
+        sla_total = int(info.get('sla_total', len(QIDS)) or len(QIDS))
+        all_sla_met = len(info['sla_met']) == sla_total
         if all_sla_met:
             self.sla_streak += 1
         else:
@@ -2531,6 +3567,10 @@ class QoSRoutingEnv:
         
         valid_count = sum(1 for qid in QIDS if next_snapshot[qid].get('data_valid', False))
         invalid_qs = [qid for qid in QIDS if not next_snapshot[qid].get('data_valid', False)]
+        required_qids = list(self._required_qids_for_current_profile())
+        required_valid_count = self._required_valid_count(next_snapshot)
+        required_invalid_qs = self._required_invalid_queues(next_snapshot)
+        min_required_valid = self._min_required_valid_count()
         
         # Action context check - for ANY non-zero action (not just applied ones)
         action_context_valid = True
@@ -2543,7 +3583,7 @@ class QoSRoutingEnv:
                     (current_snapshot[qid].get('hot_src_ip') is not None and
                      current_snapshot[qid].get('hot_dst_ip') is not None and
                      current_snapshot[qid].get('bottleneck_sid') is not None)
-                    for qid in QIDS
+                    for qid in required_qids
                     if self._is_sla_violated(qid, current_snapshot)
                 )
                 if not action_context_valid:
@@ -2551,35 +3591,81 @@ class QoSRoutingEnv:
             elif mapping is not None:
                 # Single-queue action: extract targeted queue ID
                 targeted_qid = mapping[0]
-                # Check if the PRE-ACTION snapshot had valid routing context
-                q_pre = current_snapshot[targeted_qid]
-                has_context = (q_pre.get('hot_src_ip') is not None and 
-                               q_pre.get('hot_dst_ip') is not None and 
-                               q_pre.get('bottleneck_sid') is not None)
-                if not has_context:
+                if targeted_qid not in required_qids:
                     action_context_valid = False
-                    log.debug(f"[Step {self.episode_step}] Action {action} targeted queue {targeted_qid} lacked routing context")
+                    log.debug(
+                        f"[Step {self.episode_step}] Action {action} targeted "
+                        f"optional queue {targeted_qid} for profile "
+                        f"{self.current_traffic_profile}"
+                    )
+                else:
+                    # Check if the PRE-ACTION snapshot had valid routing context
+                    q_pre = current_snapshot[targeted_qid]
+                    has_context = (q_pre.get('hot_src_ip') is not None and
+                                   q_pre.get('hot_dst_ip') is not None and
+                                   q_pre.get('bottleneck_sid') is not None)
+                    if not has_context:
+                        action_context_valid = False
+                        log.debug(f"[Step {self.episode_step}] Action {action} targeted queue {targeted_qid} lacked routing context")
         
         # Determine validity based on action type
         # RELAXED: Allow 2/3 valid queues for all actions (not just noop)
         # This reduces excessive data filtering in early training while maintaining quality
         if action == 0:
-            # Noop: at least 2/3 queues valid
-            data_valid = valid_count >= 2
+            # Noop: enough required queues valid for the active profile
+            data_valid = required_valid_count >= min_required_valid
         else:
             # Non-zero action attempted:
             # Relaxed from "all 3 queues" to "at least 2 queues" to reduce sampling bias
             # Still require action context and successful application
-            data_valid = (valid_count >= 2) and action_context_valid and action_applied
+            target_post_valid = True
+            mapping = self.ACTION_MAP.get(action)
+            if isinstance(mapping, tuple):
+                target_post_valid = bool(
+                    next_snapshot[mapping[0]].get('data_valid', False)
+                )
+            elif mapping == 'multi':
+                rerouted_qids = getattr(self, "_last_rerouted_qids", [])
+                target_post_valid = any(
+                    next_snapshot[qid].get('data_valid', False)
+                    for qid in rerouted_qids
+                )
+            data_valid = (
+                required_valid_count >= min_required_valid
+                and target_post_valid
+                and action_context_valid
+                and action_applied
+            )
         
         info['data_valid'] = data_valid
         info['valid_count'] = valid_count
         info['invalid_queues'] = invalid_qs
+        info['required_qids'] = required_qids
+        info['required_valid_count'] = required_valid_count
+        info['required_invalid_queues'] = required_invalid_qs
+        info['telemetry_epoch_id'] = self._telemetry_epoch_id
+        info['episode_start_telemetry_valid'] = self._episode_start_telemetry_valid
+        info['telemetry_liveness_missing'] = (
+            self._freshness_missing_required(
+                self._last_telemetry_freshness,
+                required_qids,
+            )
+            if required_invalid_qs else {}
+        )
         
         if not data_valid:
             reasons = []
-            if valid_count < len(QIDS):
-                reasons.append(f"telemetry incomplete ({valid_count}/3): queues {invalid_qs}")
+            if required_valid_count < min_required_valid:
+                reasons.append(
+                    f"required telemetry incomplete "
+                    f"({required_valid_count}/{len(required_qids)}): "
+                    f"queues {required_invalid_qs}"
+                )
+            elif valid_count < len(QIDS):
+                reasons.append(
+                    f"optional telemetry missing ({valid_count}/3): "
+                    f"queues {invalid_qs}"
+                )
             if action != 0 and not action_context_valid:
                 reasons.append("action lacked routing context")
             if action != 0 and not action_applied:
@@ -2626,6 +3712,8 @@ class QoSRoutingEnv:
             detail = getattr(self, "training_influx_detail", "minimal")
             if detail == "off":
                 return
+            if self.write_api is None:
+                return
 
             p = (
                 Point("rl_training")
@@ -2664,6 +3752,8 @@ class QoSRoutingEnv:
         try:
             if getattr(self, "training_influx_detail", "minimal") == "off":
                 return
+            if self.write_api is None:
+                return
             p = (
                 Point("rl_training")
                 .field("episode", int(episode))
@@ -2701,9 +3791,12 @@ class QoSRoutingEnv:
 
         # Close InfluxDB connections
         try:
-            self.write_api.close()
-            self.client.close()
-            log.info("InfluxDB connections closed")
+            if self.write_api is not None:
+                self.write_api.close()
+            if self.client is not None:
+                self.client.close()
+            if self.client is not None or self.write_api is not None:
+                log.info("InfluxDB connections closed")
         except Exception as e:
             log.warning(f"Error closing InfluxDB: {e}")
 
@@ -2812,9 +3905,12 @@ class TrainingArtifactLogger:
         "eps", "beta", "avg_loss", "last_loss", "q_max", "buffer_size",
         "sla_met_count", "sla_violated_count", "sla_streak",
         "all_sla_met", "pressure", "data_valid", "valid_count",
-        "invalid_queues", "action_applied", "action_cost",
-        "action_cost_applied", "targeted_qid", "alt_used", "alt_idx",
-        "multi_reroute_count", "terminated", "truncated",
+        "invalid_queues", "required_qids", "required_valid_count",
+        "required_invalid_queues", "telemetry_epoch_id",
+        "episode_start_telemetry_valid", "telemetry_liveness_missing",
+        "recovery_break", "action_applied",
+        "action_cost", "action_cost_applied", "targeted_qid", "alt_used",
+        "alt_idx", "multi_reroute_count", "terminated", "truncated",
     ] + [
         field
         for qid in QIDS
@@ -2823,6 +3919,9 @@ class TrainingArtifactLogger:
             f"q{qid}_util_pct", f"q{qid}_sla_ratio",
             f"q{qid}_reward_component", f"q{qid}_drop_penalty",
             f"q{qid}_data_valid", f"q{qid}_recovered_via_retry",
+            f"q{qid}_telemetry_count_lat",
+            f"q{qid}_telemetry_count_drop",
+            f"q{qid}_telemetry_count_util",
             f"q{qid}_hot_src_ip", f"q{qid}_hot_dst_ip",
             f"q{qid}_bottleneck_sid", f"q{qid}_bottleneck_score",
             f"q{qid}_bottleneck_drop", f"q{qid}_bottleneck_lat",
@@ -2863,6 +3962,7 @@ class TrainingArtifactLogger:
         )
         self.run_dir = base_dir / run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        normalize_artifact_permissions(self.run_dir, dir_mode=0o775)
         self.flush_every = max(
             1, int(getattr(args, "training_log_flush_every", 25) or 25)
         )
@@ -2878,24 +3978,28 @@ class TrainingArtifactLogger:
         self.closed = False
 
         self._step_file = self.step_path.open("w", newline="", buffering=1024 * 1024)
+        normalize_artifact_permissions(self.step_path, file_mode=0o664)
         self._step_writer = csv.DictWriter(
             self._step_file, fieldnames=self.STEP_FIELDS
         )
         self._step_writer.writeheader()
 
         self._episode_file = self.episode_path.open("w", newline="", buffering=256 * 1024)
+        normalize_artifact_permissions(self.episode_path, file_mode=0o664)
         self._episode_writer = csv.DictWriter(
             self._episode_file, fieldnames=self.EPISODE_FIELDS
         )
         self._episode_writer.writeheader()
 
         self._checkpoint_file = self.checkpoint_path.open("w", newline="", buffering=64 * 1024)
+        normalize_artifact_permissions(self.checkpoint_path, file_mode=0o664)
         self._checkpoint_writer = csv.DictWriter(
             self._checkpoint_file, fieldnames=self.CHECKPOINT_FIELDS
         )
         self._checkpoint_writer.writeheader()
 
         self._snapshot_file = self.snapshot_path.open("w", buffering=1024 * 1024)
+        normalize_artifact_permissions(self.snapshot_path, file_mode=0o664)
 
         self.metadata: Dict[str, Any] = {
             "schema_version": 1,
@@ -2985,12 +4089,15 @@ class TrainingArtifactLogger:
             "checkpoints": self.checkpoints,
         }
         self._write_json(self.metadata_path, self.metadata)
-        (self.run_dir / "command.txt").write_text(self.metadata["command"] + "\n")
+        command_path = self.run_dir / "command.txt"
+        command_path.write_text(self.metadata["command"] + "\n")
+        normalize_artifact_permissions(command_path, file_mode=0o664)
         log.info(f"Training artifacts will be written to {self.run_dir}")
 
     @staticmethod
     def _write_json(path: Path, payload: Dict[str, Any]) -> None:
         path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True))
+        normalize_artifact_permissions(path, file_mode=0o664)
 
     def _flush_if_needed(self, *, force: bool = False) -> None:
         if not force and self._rows_since_flush < self.flush_every:
@@ -3013,7 +4120,9 @@ class TrainingArtifactLogger:
                 key: q.get(key)
                 for key in (
                     "lat_p95", "drop_p95", "util_p95", "data_valid",
-                    "recovered_via_retry", "hot_src_ip", "hot_dst_ip",
+                    "profile_required", "telemetry_optional",
+                    "recovered_via_retry", "telemetry_counts",
+                    "hot_src_ip", "hot_dst_ip",
                     "path_nodes", "bottleneck_sid", "bottleneck_score",
                     "bottleneck_drop", "bottleneck_lat", "bottleneck_util",
                     "bottleneck_role", "alternatives", "alt_exists",
@@ -3090,6 +4199,16 @@ class TrainingArtifactLogger:
             "data_valid": info.get("data_valid"),
             "valid_count": info.get("valid_count"),
             "invalid_queues": json.dumps(_json_safe(info.get("invalid_queues", []))),
+            "required_qids": json.dumps(_json_safe(info.get("required_qids", []))),
+            "required_valid_count": info.get("required_valid_count", ""),
+            "required_invalid_queues": json.dumps(_json_safe(info.get("required_invalid_queues", []))),
+            "telemetry_epoch_id": info.get("telemetry_epoch_id", getattr(env, "_telemetry_epoch_id", "")),
+            "episode_start_telemetry_valid": info.get(
+                "episode_start_telemetry_valid",
+                getattr(env, "_episode_start_telemetry_valid", ""),
+            ),
+            "telemetry_liveness_missing": json.dumps(_json_safe(info.get("telemetry_liveness_missing", {}))),
+            "recovery_break": info.get("recovery_break", False),
             "action_applied": info.get("action_applied"),
             "action_cost": info.get("action_cost"),
             "action_cost_applied": info.get("action_cost_applied"),
@@ -3112,6 +4231,9 @@ class TrainingArtifactLogger:
                 f"q{qid}_drop_penalty": pq.get("drop_penalty"),
                 f"q{qid}_data_valid": q.get("data_valid"),
                 f"q{qid}_recovered_via_retry": q.get("recovered_via_retry"),
+                f"q{qid}_telemetry_count_lat": (q.get("telemetry_counts") or {}).get("lat", 0),
+                f"q{qid}_telemetry_count_drop": (q.get("telemetry_counts") or {}).get("drop", 0),
+                f"q{qid}_telemetry_count_util": (q.get("telemetry_counts") or {}).get("util", 0),
                 f"q{qid}_hot_src_ip": q.get("hot_src_ip"),
                 f"q{qid}_hot_dst_ip": q.get("hot_dst_ip"),
                 f"q{qid}_bottleneck_sid": q.get("bottleneck_sid"),
@@ -3149,6 +4271,8 @@ class TrainingArtifactLogger:
                 "pressure": info.get("pressure"),
                 "sla_met": info.get("sla_met", []),
                 "sla_violated": info.get("sla_violated", []),
+                "reward_qids": info.get("reward_qids", []),
+                "sla_total": info.get("sla_total"),
                 "per_queue": info.get("per_queue", {}),
             },
             "agent": {
@@ -3163,6 +4287,16 @@ class TrainingArtifactLogger:
             "data_valid": info.get("data_valid"),
             "valid_count": info.get("valid_count"),
             "invalid_queues": info.get("invalid_queues", []),
+            "required_qids": info.get("required_qids", []),
+            "required_valid_count": info.get("required_valid_count"),
+            "required_invalid_queues": info.get("required_invalid_queues", []),
+            "telemetry_epoch_id": info.get("telemetry_epoch_id", getattr(env, "_telemetry_epoch_id", None)),
+            "episode_start_telemetry_valid": info.get(
+                "episode_start_telemetry_valid",
+                getattr(env, "_episode_start_telemetry_valid", None),
+            ),
+            "telemetry_liveness_missing": info.get("telemetry_liveness_missing", {}),
+            "recovery_break": info.get("recovery_break", False),
             "pre_action_snapshot": self._snapshot_summary(
                 info.get("pre_action_snapshot")
             ),
@@ -3389,8 +4523,15 @@ def train(args):
         rules_dir=rules_dir,
         config_path=args.config,
         traffic_seed=args.seed,
+        telemetry_backend=args.telemetry_backend,
+        telemetry_cache_socket=args.telemetry_cache_socket,
+        telemetry_cache_timeout=args.telemetry_cache_timeout,
     )
     env.training_influx_detail = args.training_influx_detail
+    env.telemetry_liveness_enabled = not args.disable_telemetry_liveness_gate
+    env.telemetry_liveness_retries = args.telemetry_liveness_retries
+    env.telemetry_liveness_interval_seconds = args.telemetry_liveness_interval
+    env.telemetry_liveness_restarts = args.telemetry_liveness_restarts
     agent = DQNAgent(
         STATE_DIM, ACTION_DIM, device,
         lr=lr,
@@ -3502,6 +4643,7 @@ def train(args):
     episode = 0
     best_avg_reward = -float('inf')
     episode_rewards = deque(maxlen=100)  # Track episode rewards for rolling average (bounded)
+    force_recovery_reset_next = False
     
     # Checkpoints
     os.makedirs(args.save_dir, exist_ok=True)
@@ -3530,6 +4672,11 @@ def train(args):
                 )
                 reset_prob = max(0.0, min(1.0, reset_prob))
                 do_reset = random.random() < reset_prob
+
+            if force_recovery_reset_next:
+                do_reset = True
+                reset_prob = 1.0
+                force_recovery_reset_next = False
             
             cooldown = (
                 args.baseline_cooldown_seconds
@@ -3541,6 +4688,7 @@ def train(args):
             episode_start_step = total_steps
             episode_valid_learning_steps = 0
             episode_invalid_steps = 0
+            episode_invalid_streak = 0
             done = False
             
             reset_type = "BASELINE" if do_reset else "WARM"
@@ -3574,9 +4722,30 @@ def train(args):
                     )
                     agent.update_epsilon()
                     episode_valid_learning_steps += 1
+                    episode_invalid_streak = 0
                 else:
                     episode_invalid_steps += 1
+                    episode_invalid_streak += 1
                     log.debug(f"[Step {total_steps}] Skipping experience storage - invalid telemetry")
+
+                if (
+                    episode_invalid_streak >= args.invalid_recovery_streak
+                    and args.invalid_recovery_streak > 0
+                ):
+                    log.warning(
+                        f"[Recovery] Ending episode {episode} after "
+                        f"{episode_invalid_streak} consecutive invalid "
+                        "transitions; next episode will force baseline reset "
+                        "and wait for fresh required telemetry"
+                    )
+                    log.warning(
+                        "[Recovery] Telemetry missing at break: "
+                        f"{info.get('telemetry_liveness_missing', {})}"
+                    )
+                    info['recovery_break'] = True
+                    info['truncated'] = True
+                    done = True
+                    force_recovery_reset_next = True
                 
                 # Always try to train from existing valid experiences in the buffer
                 loss = agent.train_step()
@@ -3596,7 +4765,8 @@ def train(args):
                         f"eps={stats['eps']:.3f} "
                         f"buffer={stats['buffer_size']:5d} "
                         f"loss={loss_str:>8} "
-                        f"sla={len(info['sla_met'])}/3 "
+                        f"sla={len(info['sla_met'])}/"
+                        f"{info.get('sla_total', 3)} "
                         f"streak={info['sla_streak']}"
                     )
                 
@@ -3788,7 +4958,14 @@ def evaluate(args):
         rules_dir=rules_dir,
         config_path=args.config,
         traffic_seed=args.seed,
+        telemetry_backend=args.telemetry_backend,
+        telemetry_cache_socket=args.telemetry_cache_socket,
+        telemetry_cache_timeout=args.telemetry_cache_timeout,
     )
+    env.telemetry_liveness_enabled = not args.disable_telemetry_liveness_gate
+    env.telemetry_liveness_retries = args.telemetry_liveness_retries
+    env.telemetry_liveness_interval_seconds = args.telemetry_liveness_interval
+    env.telemetry_liveness_restarts = args.telemetry_liveness_restarts
     agent = DQNAgent(STATE_DIM, ACTION_DIM, device)
 
     # Load weights - find latest checkpoint with datetime prefix or fallback to legacy
@@ -3883,12 +5060,35 @@ def main():
     parser.add_argument('--training-log-flush-every', type=int, default=25,
                         help='Flush durable local training logs every N steps '
                              '(default: 25; checkpoints/episodes always flush)')
+    parser.add_argument('--invalid-recovery-streak', type=int,
+                        default=INVALID_RECOVERY_STREAK,
+                        help='End the current episode and force a baseline '
+                             'reset after N consecutive invalid transitions '
+                             '(default: 8; set 0 to disable)')
+    parser.add_argument('--telemetry-liveness-retries', type=int,
+                        default=TELEMETRY_LIVENESS_RETRIES,
+                        help='Fresh local-cache telemetry checks before an '
+                             'episode is allowed to start learning '
+                             f'(default: {TELEMETRY_LIVENESS_RETRIES})')
+    parser.add_argument('--telemetry-liveness-interval', type=float,
+                        default=TELEMETRY_LIVENESS_INTERVAL_SECONDS,
+                        help='Seconds between episode-start telemetry '
+                             'liveness checks '
+                             f'(default: {TELEMETRY_LIVENESS_INTERVAL_SECONDS})')
+    parser.add_argument('--telemetry-liveness-restarts', type=int,
+                        default=TELEMETRY_LIVENESS_RESTARTS,
+                        help='Profile restarts to try when telemetry liveness '
+                             'fails before falling back to baseline reset '
+                             f'(default: {TELEMETRY_LIVENESS_RESTARTS})')
+    parser.add_argument('--disable-telemetry-liveness-gate',
+                        action='store_true',
+                        help='Disable the local-cache telemetry liveness gate')
     parser.add_argument('--training-influx-detail',
                         choices=['minimal', 'off'],
-                        default='minimal',
+                        default='off',
                         help='Influx training logging detail: minimal writes only '
                              'progress-monitoring fields, off disables training '
-                             'Influx writes (default: minimal)')
+                             'Influx writes (default: off)')
     parser.add_argument('--weights-tag', default='final',
                         help='Weight file tag for evaluation (e.g., final, best, 50pct)')
     parser.add_argument('--resume', type=str, default=None,
@@ -3938,6 +5138,18 @@ def main():
     parser.add_argument('--influx-bucket', default='INT')
     parser.add_argument('--influx-token', default=os.environ.get('INFLUX_TOKEN'),
                         help='InfluxDB token (or set INFLUX_TOKEN env var)')
+    parser.add_argument('--telemetry-backend',
+                        choices=['cache', 'influx', 'cache-fallback-influx'],
+                        default='cache',
+                        help='Telemetry source for RL observations '
+                             '(cache uses the local collector socket; influx preserves legacy queries)')
+    parser.add_argument('--telemetry-cache-socket',
+                        default=DEFAULT_SOCKET_PATH,
+                        help='Unix socket path for local telemetry cache')
+    parser.add_argument('--telemetry-cache-timeout',
+                        type=float,
+                        default=1.0,
+                        help='Local telemetry cache request timeout in seconds')
     
     # Logging
     parser.add_argument('--log-level', type=str, default='info',
@@ -3951,7 +5163,11 @@ def main():
     # Setup logging based on log level
     setup_logging(log_level=args.log_level)
 
-    if not args.influx_token:
+    needs_influx = (
+        args.telemetry_backend in ('influx', 'cache-fallback-influx')
+        or (args.mode == 'train' and args.training_influx_detail != 'off')
+    )
+    if needs_influx and not args.influx_token:
         log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
         sys.exit(1)
 

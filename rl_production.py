@@ -39,10 +39,18 @@ import torch
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+from logging_config import normalize_artifact_permissions
+
 # Import from the main RL agent module
 from rl_agent_4 import (
     DuelingDQN, QoSRoutingEnv, setup_logging,
-    STATE_DIM, ACTION_DIM, HIDDEN_DIM, QIDS, SLA_THRESHOLDS
+    STATE_DIM, ACTION_DIM, HIDDEN_DIM, QIDS, SLA_THRESHOLDS,
+    DEFAULT_SOCKET_PATH,
+)
+from ecmp_baseline import (
+    _decorate_top_egresses,
+    collect_local_egress_observations,
+    log_top_bottleneck_egresses,
 )
 from traffic_generator import TrafficManager
 from config.schema import MAX_SWITCHES
@@ -191,9 +199,12 @@ class ProductionMetricsWriter:
     def __init__(self, bucket: str, org: str, url: str, token: str):
         self.bucket = bucket
         self.org = org
-        # PHASE 2.4: Reduced timeout from 5000ms to 2000ms for faster failure detection
-        self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
-        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        self.client = None
+        self.write_api = None
+        if token:
+            # PHASE 2.4: Reduced timeout from 5000ms to 2000ms for faster failure detection
+            self.client = InfluxDBClient(url=url, token=token, org=org, timeout=2000)
+            self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
 
         # Rolling statistics (for get_summary)
         self.rewards = deque(maxlen=100)
@@ -272,6 +283,9 @@ class ProductionMetricsWriter:
                     p = p.field(f"queue_{qid}_drops", float(per_queue[qid].get('drop', 0)))
                     p = p.field(f"queue_{qid}_utilization", float(per_queue[qid].get('util', 0)))
             
+            if self.write_api is None:
+                return
+
             # PHASE 2.2: Circuit breaker pattern for write failures
             if self.circuit_open:
                 log.warning("Circuit breaker OPEN - skipping metric write")
@@ -333,8 +347,10 @@ class ProductionMetricsWriter:
     def close(self):
         """Clean up resources."""
         try:
-            self.write_api.close()
-            self.client.close()
+            if self.write_api is not None:
+                self.write_api.close()
+            if self.client is not None:
+                self.client.close()
         except Exception:
             pass
 
@@ -394,19 +410,34 @@ class ProductionRunner:
             log.info(f"  Rules dir: {rules_dir}")
 
         # Initialize components
+        env_token = (
+            args.influx_token
+            if args.telemetry_backend in ("influx", "cache-fallback-influx")
+            else None
+        )
         env = QoSRoutingEnv(
-            args.influx_bucket, args.influx_token,
+            args.influx_bucket, env_token,
             args.influx_org, args.influx_url,
             verbose=False,  # Controller verbosity disabled (logs go to file)
             reset_network=True,  # Reset network at start for clean baseline
             production_mode=True,  # Production: continuous operation
             topology_builder=topology_builder,
-            rules_dir=rules_dir
+            rules_dir=rules_dir,
+            config_path=args.config,
+            telemetry_backend=args.telemetry_backend,
+            telemetry_cache_socket=args.telemetry_cache_socket,
+            telemetry_cache_timeout=args.telemetry_cache_timeout,
         )
+        env.training_influx_detail = "off"
         agent = ProductionAgent(STATE_DIM, ACTION_DIM, device)
+        metrics_token = (
+            args.influx_token
+            if args.production_influx_write == "on"
+            else None
+        )
         metrics = ProductionMetricsWriter(
             args.influx_bucket, args.influx_org,
-            args.influx_url, args.influx_token
+            args.influx_url, metrics_token
         )
         
         # Load weights - find latest checkpoint with datetime prefix
@@ -453,7 +484,9 @@ class ProductionRunner:
         # CSV logging
         csv_path = args.output or f"data/production_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
+        normalize_artifact_permissions(os.path.dirname(csv_path) or '.', dir_mode=0o775)
         csv_file = open(csv_path, 'w', newline='')
+        normalize_artifact_permissions(csv_path, file_mode=0o664)
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             'step', 'action', 'action_name', 'reward', 'raw_reward',
@@ -469,6 +502,7 @@ class ProductionRunner:
             'timestamp'
         ])
         log.info(f"Production log: {csv_path}")
+        top_bottlenecks = []
         
         # Initialize environment
         state = env.reset(
@@ -644,6 +678,19 @@ class ProductionRunner:
                         "telemetry validity are enforced: "
                         + "; ".join(final_telemetry_state['errors'])
                     )
+
+                if topology_builder is not None:
+                    egress_observations = collect_local_egress_observations(
+                        env,
+                        window_seconds=telemetry_window_seconds,
+                        top_n=10,
+                    )
+                    top_bottlenecks = _decorate_top_egresses(
+                        egress_observations,
+                        topology_builder,
+                        limit=10,
+                    )
+                    log_top_bottleneck_egresses(top_bottlenecks)
             
             # Print summary
             summary = metrics.get_summary()
@@ -693,11 +740,13 @@ class ProductionRunner:
                     'routing_state_verified': routing_state['verified'],
                     'traffic_state_verified': traffic_state['verified'],
                     'telemetry_state_verified': telemetry_state['verified'],
+                    'top_bottleneck_egresses': top_bottlenecks,
                     'routing_state': {
                         'verified': routing_state['verified'],
                         'initial_tables': routing_state,
                         'traffic_processes': traffic_state,
                         'telemetry_flow_coverage': telemetry_state,
+                        'top_bottleneck_egresses': top_bottlenecks,
                         'note': (
                             'Initial clean baseline verified before RL actions; '
                             'per-action success is recorded separately.'
@@ -705,8 +754,10 @@ class ProductionRunner:
                     },
                 }
                 os.makedirs(os.path.dirname(args.summary_json) or '.', exist_ok=True)
+                normalize_artifact_permissions(os.path.dirname(args.summary_json) or '.', dir_mode=0o775)
                 with open(args.summary_json, 'w') as summary_file:
                     json.dump(summary_payload, summary_file, indent=2, sort_keys=True)
+                normalize_artifact_permissions(args.summary_json, file_mode=0o664)
             
             # Clean up
             csv_file.close()
@@ -750,6 +801,21 @@ def main():
     parser.add_argument('--influx-bucket', default='INT')
     parser.add_argument('--influx-token', default=os.environ.get('INFLUX_TOKEN'),
                         help='InfluxDB token (or set INFLUX_TOKEN env var)')
+    parser.add_argument('--telemetry-backend',
+                        choices=['cache', 'influx', 'cache-fallback-influx'],
+                        default='cache',
+                        help='Telemetry source for RL observations')
+    parser.add_argument('--telemetry-cache-socket',
+                        default=DEFAULT_SOCKET_PATH,
+                        help='Unix socket path for local telemetry cache')
+    parser.add_argument('--telemetry-cache-timeout',
+                        type=float,
+                        default=1.0,
+                        help='Local telemetry cache request timeout in seconds')
+    parser.add_argument('--production-influx-write',
+                        choices=['on', 'off'],
+                        default='off',
+                        help='Write production metrics to InfluxDB when on')
     
     # Logging
     parser.add_argument('--log-level', type=str, default='info',
@@ -777,7 +843,11 @@ def main():
     # Setup logging (matches training: INFO console, DEBUG file with 50MB rotation)
     setup_logging(log_level=args.log_level)
 
-    if not args.influx_token:
+    needs_influx = (
+        args.telemetry_backend in ('influx', 'cache-fallback-influx')
+        or args.production_influx_write == 'on'
+    )
+    if needs_influx and not args.influx_token:
         log.error("InfluxDB token not configured. Set INFLUX_TOKEN environment variable or use --influx-token argument.")
         sys.exit(1)
 

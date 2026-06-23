@@ -37,12 +37,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
 
-from logging_config import setup_unified_logging
+from logging_config import normalize_artifact_permissions, setup_unified_logging
 from topology.factory import create_topology
 
 
@@ -230,6 +230,7 @@ class ECMPPlanner:
         groups_by_key: Dict[Tuple[str, str], ECMPGroup],
         src_host: str,
         dst_host: str,
+        host_ips: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Trace the concrete path selected by the installed BMv2 ECMP hash."""
         if src_host not in self.builder.hosts:
@@ -237,8 +238,9 @@ class ECMPPlanner:
         if dst_host not in self.builder.hosts:
             raise KeyError(f"Unknown destination host {dst_host}")
 
-        src_ip = self.builder.hosts[src_host].ip
-        dst_ip = self.builder.hosts[dst_host].ip
+        host_ips = host_ips or {}
+        src_ip = host_ips.get(src_host, self.builder.hosts[src_host].ip)
+        dst_ip = host_ips.get(dst_host, self.builder.hosts[dst_host].ip)
         current = src_host
         path = [current]
 
@@ -278,6 +280,7 @@ class ECMPPlanner:
         self,
         groups: Sequence[ECMPGroup],
         traffic_pairs: Sequence[Tuple[str, str, int]],
+        host_ips: Optional[Dict[str, str]] = None,
     ) -> Dict[int, List[Dict]]:
         """Build the legacy visualizer schema using concrete ECMP paths.
 
@@ -295,6 +298,7 @@ class ECMPPlanner:
                 groups_by_key,
                 src_host,
                 dst_host,
+                host_ips=host_ips,
             )
             for qid in QIDS:
                 export_data[qid].append(
@@ -355,6 +359,343 @@ class VisualizationPathFile:
                 self.path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _switch_id_maps(topology_builder) -> Tuple[Dict[int, str], Dict[str, int]]:
+    id_to_name = {
+        int(switch.switch_id): name
+        for name, switch in topology_builder.switches.items()
+    }
+    name_to_id = {name: switch_id for switch_id, name in id_to_name.items()}
+    return id_to_name, name_to_id
+
+
+def _runtime_port_neighbor_map(path: str = "/tmp/topology.json") -> Dict[Tuple[str, str], str]:
+    port_neighbor: Dict[Tuple[str, str], str] = {}
+    try:
+        data = json.loads(Path(path).read_text())
+    except Exception:
+        return port_neighbor
+
+    for link in data.get("links", []):
+        node1 = link.get("node1") or link.get("source")
+        node2 = link.get("node2") or link.get("target")
+        port1 = link.get("port1")
+        port2 = link.get("port2")
+        if node1 is not None and node2 is not None and port1 is not None:
+            port_neighbor[(str(node1), str(port1))] = str(node2)
+        if node1 is not None and node2 is not None and port2 is not None:
+            port_neighbor[(str(node2), str(port2))] = str(node1)
+    return port_neighbor
+
+
+def _runtime_host_ips(controller, hosts: Sequence[str]) -> Dict[str, str]:
+    host_ips: Dict[str, str] = {}
+    for host in hosts:
+        try:
+            host_ips[host] = controller.topo.get_host_ip(host).split("/")[0]
+        except Exception:
+            continue
+    return host_ips
+
+
+def _groups_with_runtime_ips(
+    groups: Sequence[ECMPGroup],
+    host_ips: Dict[str, str],
+) -> List[ECMPGroup]:
+    updated = []
+    for group in groups:
+        updated.append(
+            ECMPGroup(
+                switch=group.switch,
+                destination=group.destination,
+                destination_ip=host_ips.get(
+                    group.destination,
+                    group.destination_ip,
+                ),
+                group_id=group.group_id,
+                next_hops=group.next_hops,
+            )
+        )
+    return updated
+
+
+def _decorate_top_egresses(
+    observations: Optional[Dict[str, Any]],
+    topology_builder,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    if not observations or not observations.get("ok", False):
+        return []
+    id_to_name, _ = _switch_id_maps(topology_builder)
+    port_neighbor = _runtime_port_neighbor_map()
+    decorated = []
+    for item in observations.get("top_egresses", [])[:limit]:
+        try:
+            switch_id = int(item.get("switch_id"))
+        except (TypeError, ValueError):
+            switch_id = -1
+        switch_name = id_to_name.get(switch_id, f"s{item.get('switch_id')}")
+        egress_port = str(item.get("egress_port"))
+        neighbor = port_neighbor.get((switch_name, egress_port), "?")
+        decorated.append(
+            {
+                **item,
+                "switch": switch_name,
+                "neighbor": neighbor,
+                "label": (
+                    f"{switch_name}:port{egress_port}->{neighbor} "
+                    f"Q{item.get('queue_id')}"
+                ),
+            }
+        )
+    return decorated
+
+
+def log_top_bottleneck_egresses(
+    top_egresses: Sequence[Dict[str, Any]],
+    logger: logging.Logger = log,
+    prefix: str = "Top INT bottleneck egresses",
+) -> None:
+    if not top_egresses:
+        logger.info("%s: unavailable", prefix)
+        return
+    logger.info("%s:", prefix)
+    for item in top_egresses:
+        logger.info(
+            "  %s mean=%.2f%% p95=%.2f%% max=%.2f%% samples=%s flows=%s",
+            item.get("label", "?"),
+            float(item.get("mean_util", 0.0)),
+            float(item.get("p95_util", 0.0)),
+            float(item.get("max_util", 0.0)),
+            item.get("count", 0),
+            item.get("flow_count", 0),
+        )
+
+
+def collect_local_egress_observations(
+    env,
+    window_seconds: float,
+    top_n: int = 10,
+) -> Dict[str, Any]:
+    """Best-effort local-cache INT egress evidence for benchmark summaries."""
+    try:
+        observations = env.get_local_egress_observations(
+            window_seconds=window_seconds,
+            top_n=top_n,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "flows": {},
+            "top_egresses": [],
+        }
+    if not observations:
+        return {
+            "ok": False,
+            "error": "local egress observations unavailable",
+            "flows": {},
+            "top_egresses": [],
+        }
+    return observations
+
+
+def _expected_edge_signature(
+    path: Sequence[str],
+    controller,
+    name_to_id: Dict[str, int],
+) -> List[str]:
+    edges = []
+    for node, next_hop in zip(path, path[1:]):
+        switch_id = name_to_id.get(node)
+        if switch_id is None:
+            continue
+        port = controller.topo.node_to_node_port_num(node, next_hop)
+        edges.append(f"{switch_id}:{port}")
+    return sorted(edges)
+
+
+def _observed_path_from_edges(
+    edges: Sequence[str],
+    src_host: str,
+    dst_host: str,
+    topology_builder,
+    id_to_name: Dict[int, str],
+    port_neighbor: Dict[Tuple[str, str], str],
+) -> Dict[str, Any]:
+    by_switch: Dict[str, List[Tuple[str, str, str]]] = {}
+    edge_details = []
+    for edge in edges:
+        try:
+            switch_id_text, port = edge.split(":", 1)
+            switch_name = id_to_name.get(int(switch_id_text), f"s{switch_id_text}")
+        except (ValueError, TypeError):
+            switch_name = "?"
+            port = "?"
+        neighbor = port_neighbor.get((switch_name, str(port)), "?")
+        by_switch.setdefault(switch_name, []).append((str(port), neighbor, edge))
+        edge_details.append(
+            {
+                "edge": edge,
+                "switch": switch_name,
+                "egress_port": str(port),
+                "neighbor": neighbor,
+            }
+        )
+
+    path = [src_host]
+    current = topology_builder.hosts[src_host].connected_switch
+    path.append(current)
+    used_edges = set()
+    ambiguous = False
+    for _ in range(len(edges) + 3):
+        if current == dst_host:
+            break
+        options = sorted(by_switch.get(current, []))
+        options = [option for option in options if option[2] not in used_edges]
+        if not options:
+            break
+        if len(options) > 1:
+            ambiguous = True
+        _port, neighbor, edge = options[0]
+        used_edges.add(edge)
+        path.append(neighbor)
+        current = neighbor
+        if current == dst_host:
+            break
+        if current not in topology_builder.switches:
+            break
+
+    return {
+        "path": path,
+        "complete": bool(path and path[-1] == dst_host),
+        "ambiguous": ambiguous,
+        "edge_details": edge_details,
+        "unused_edges": sorted(set(edges) - used_edges),
+    }
+
+
+def audit_ecmp_observed_paths(
+    observations: Optional[Dict[str, Any]],
+    topology_builder,
+    controller,
+    planner: ECMPPlanner,
+    groups_by_key: Dict[Tuple[str, str], ECMPGroup],
+    traffic_pairs: Sequence[Tuple[str, str, int]],
+    host_ips: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    if not observations or not observations.get("ok", False):
+        return {
+            "verified": False,
+            "errors": ["local egress observations unavailable"],
+            "mismatch_count": 0,
+            "queue_independence_violations": 0,
+            "per_flow": {},
+        }
+
+    id_to_name, name_to_id = _switch_id_maps(topology_builder)
+    port_neighbor = _runtime_port_neighbor_map()
+    observed_flows = observations.get("flows", {})
+    errors = []
+    per_flow: Dict[str, Any] = {}
+    mismatch_count = 0
+    queue_independence_violations = 0
+    expected_egress_counts: Dict[str, int] = {}
+    observed_egress_counts: Dict[str, int] = {}
+
+    for src_host, dst_host, flow_id in traffic_pairs:
+        flow_key = str(flow_id)
+        expected_path = planner.trace_selected_path(
+            groups_by_key,
+            src_host,
+            dst_host,
+            host_ips=host_ips,
+        )
+        expected_edges = _expected_edge_signature(
+            expected_path,
+            controller,
+            name_to_id,
+        )
+        for edge in expected_edges:
+            expected_egress_counts[edge] = expected_egress_counts.get(edge, 0) + 1
+
+        q_reports = {}
+        dominant_signatures = set()
+        for qid in QIDS:
+            qid_key = str(qid)
+            flow_payload = observed_flows.get(flow_key, {}).get(qid_key)
+            if not flow_payload or not flow_payload.get("signatures"):
+                mismatch_count += 1
+                q_reports[qid_key] = {
+                    "match": False,
+                    "error": "no observed INT egress signature",
+                    "expected_edges": expected_edges,
+                }
+                errors.append(f"flow {flow_id} Q{qid}: no observed INT egress signature")
+                continue
+
+            dominant = flow_payload["signatures"][0]
+            observed_edges = sorted(dominant.get("edges", []))
+            dominant_signatures.add("|".join(observed_edges))
+            for edge in observed_edges:
+                observed_egress_counts[edge] = observed_egress_counts.get(edge, 0) + 1
+            missing = sorted(set(expected_edges) - set(observed_edges))
+            unexpected = sorted(set(observed_edges) - set(expected_edges))
+            match = not missing and not unexpected
+            if not match:
+                mismatch_count += 1
+                errors.append(
+                    f"flow {flow_id} Q{qid}: missing={missing} unexpected={unexpected}"
+                )
+            observed_path = _observed_path_from_edges(
+                observed_edges,
+                src_host,
+                dst_host,
+                topology_builder,
+                id_to_name,
+                port_neighbor,
+            )
+            q_reports[qid_key] = {
+                "match": match,
+                "report_count": flow_payload.get("report_count", 0),
+                "unique_signatures": flow_payload.get("unique_signatures", 0),
+                "dominant_fraction": dominant.get("fraction", 0.0),
+                "expected_edges": expected_edges,
+                "observed_edges": observed_edges,
+                "missing_edges": missing,
+                "unexpected_edges": unexpected,
+                "observed_path": observed_path,
+            }
+
+        queue_independent = len(dominant_signatures) <= 1
+        if not queue_independent:
+            queue_independence_violations += 1
+            errors.append(f"flow {flow_id}: Q0/Q1/Q7 observed different ECMP signatures")
+        per_flow[flow_key] = {
+            "src": src_host,
+            "dst": dst_host,
+            "expected_path": expected_path,
+            "expected_edges": expected_edges,
+            "queue_independent": queue_independent,
+            "queues": q_reports,
+        }
+
+    return {
+        "verified": not errors,
+        "errors": errors,
+        "mismatch_count": mismatch_count,
+        "queue_independence_violations": queue_independence_violations,
+        "flow_count": len(traffic_pairs),
+        "per_flow": per_flow,
+        "expected_egress_counts": expected_egress_counts,
+        "observed_egress_counts": observed_egress_counts,
+        "top_bottleneck_egresses": _decorate_top_egresses(
+            observations,
+            topology_builder,
+            limit=10,
+        ),
+    }
 
 
 class ECMPProgrammer:
@@ -676,7 +1017,9 @@ class ECMPBenchmark:
 
         self.env = QoSRoutingEnv(
             self.args.influx_bucket,
-            self.args.influx_token,
+            self.args.influx_token
+            if self.args.telemetry_backend in ("influx", "cache-fallback-influx")
+            else None,
             self.args.influx_org,
             self.args.influx_url,
             verbose=False,
@@ -685,7 +1028,24 @@ class ECMPBenchmark:
             topology_builder=builder,
             rules_dir=rules_dir,
             config_path=self.args.config,
+            telemetry_backend=self.args.telemetry_backend,
+            telemetry_cache_socket=self.args.telemetry_cache_socket,
+            telemetry_cache_timeout=self.args.telemetry_cache_timeout,
         )
+        self.env.training_influx_detail = "off"
+        runtime_host_ips = _runtime_host_ips(self.env.controller, planner.hosts)
+        if runtime_host_ips:
+            changed_ips = sum(
+                1
+                for group in groups
+                if runtime_host_ips.get(group.destination) != group.destination_ip
+            )
+            groups = _groups_with_runtime_ips(groups, runtime_host_ips)
+            if changed_ips:
+                log.info(
+                    "Using runtime host IPs from topology.json for ECMP "
+                    f"programming ({changed_ips} destination entries updated)"
+                )
 
         # ECMP must not inherit any forwarding state from the preceding
         # benchmark method. Install and verify a clean deterministic fallback
@@ -709,6 +1069,7 @@ class ECMPBenchmark:
             "plan_sha256": plan_digest,
             "baseline_tables": baseline_verification,
             "ecmp_tables": installed["verification"],
+            "runtime_host_ips": runtime_host_ips,
         }
         log.info(
             f"Verified {installed['groups']} ECMP groups and "
@@ -721,9 +1082,13 @@ class ECMPBenchmark:
             seed=self.args.traffic_seed,
         )
         self.visualization_file = VisualizationPathFile(self.args.paths_file)
+        groups_by_key = {
+            (group.switch, group.destination): group for group in groups
+        }
         visualization_data = planner.build_visualization_data(
             groups,
             self.traffic_manager.traffic_pairs,
+            host_ips=runtime_host_ips,
         )
         self.visualization_file.publish(visualization_data)
         log.info(
@@ -785,10 +1150,12 @@ class ECMPBenchmark:
             "data"
         ) / f"ecmp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        normalize_artifact_permissions(output_path.parent, dir_mode=0o775)
         stats = BenchmarkStats()
         completed_steps = 0
 
         with output_path.open("w", newline="") as csv_file:
+            normalize_artifact_permissions(output_path, file_mode=0o664)
             writer = csv.writer(csv_file)
             writer.writerow(
                 [
@@ -900,6 +1267,61 @@ class ECMPBenchmark:
                 + "; ".join(final_telemetry_state["errors"])
             )
 
+        egress_observations = collect_local_egress_observations(
+            self.env,
+            window_seconds=telemetry_window_seconds,
+            top_n=10,
+        )
+        top_bottlenecks = _decorate_top_egresses(
+            egress_observations,
+            builder,
+            limit=10,
+        )
+        self.routing_state["top_bottleneck_egresses"] = top_bottlenecks
+        log_top_bottleneck_egresses(top_bottlenecks)
+        ecmp_path_audit_required = self.args.telemetry_backend in (
+            "cache",
+            "cache-fallback-influx",
+        )
+        if egress_observations.get("ok", False):
+            ecmp_path_audit = audit_ecmp_observed_paths(
+                egress_observations,
+                builder,
+                self.env.controller,
+                planner,
+                groups_by_key,
+                self.traffic_manager.traffic_pairs,
+                host_ips=runtime_host_ips,
+            )
+            ecmp_path_audit["required"] = ecmp_path_audit_required
+        else:
+            ecmp_path_audit = {
+                "verified": None,
+                "required": ecmp_path_audit_required,
+                "errors": [egress_observations.get("error", "unavailable")],
+                "mismatch_count": None,
+                "queue_independence_violations": None,
+                "flow_count": len(self.traffic_manager.traffic_pairs),
+                "per_flow": {},
+                "top_bottleneck_egresses": top_bottlenecks,
+            }
+        self.routing_state["ecmp_observed_path_audit"] = ecmp_path_audit
+        if ecmp_path_audit["verified"] is True:
+            log.info(
+                "Verified INT-observed ECMP paths against planner "
+                f"for {ecmp_path_audit['flow_count']} flows and all queues"
+            )
+        elif ecmp_path_audit["verified"] is None:
+            log.info(
+                "INT-observed ECMP path audit unavailable: "
+                + "; ".join(ecmp_path_audit["errors"][:5])
+            )
+        else:
+            log.warning(
+                "INT-observed ECMP path audit failed: "
+                + "; ".join(ecmp_path_audit["errors"][:5])
+            )
+
         final_baseline_verification = (
             self.env.controller.verify_forwarding_tables(raise_on_error=True)
         )
@@ -933,13 +1355,22 @@ class ECMPBenchmark:
                 "routing_state_verified": self.routing_state["verified"],
                 "traffic_state_verified": traffic_state["verified"],
                 "telemetry_state_verified": telemetry_state["verified"],
+                "ecmp_path_audit_verified": ecmp_path_audit["verified"],
+                "ecmp_path_audit_required": ecmp_path_audit_required,
+                "ecmp_path_mismatch_count": ecmp_path_audit["mismatch_count"],
+                "ecmp_queue_independence_violations": (
+                    ecmp_path_audit["queue_independence_violations"]
+                ),
+                "top_bottleneck_egresses": top_bottlenecks,
                 "routing_state": self.routing_state,
             }
             summary_path = Path(self.args.summary_json)
             summary_path.parent.mkdir(parents=True, exist_ok=True)
+            normalize_artifact_permissions(summary_path.parent, dir_mode=0o775)
             summary_path.write_text(
                 json.dumps(summary_payload, indent=2, sort_keys=True)
             )
+            normalize_artifact_permissions(summary_path, file_mode=0o664)
         return 0
 
     def close(self) -> None:
@@ -1029,6 +1460,23 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("INFLUX_TOKEN"),
         help="InfluxDB token or INFLUX_TOKEN environment variable",
     )
+    parser.add_argument(
+        "--telemetry-backend",
+        choices=["cache", "influx", "cache-fallback-influx"],
+        default="cache",
+        help="Telemetry source for benchmark observations",
+    )
+    parser.add_argument(
+        "--telemetry-cache-socket",
+        default="/tmp/p4_qos_int_telemetry.sock",
+        help="Unix socket path for local telemetry cache",
+    )
+    parser.add_argument(
+        "--telemetry-cache-timeout",
+        type=float,
+        default=1.0,
+        help="Local telemetry cache request timeout in seconds",
+    )
     return parser.parse_args()
 
 
@@ -1051,7 +1499,7 @@ def main() -> int:
         )
         return 0
 
-    if not args.influx_token:
+    if args.telemetry_backend in ("influx", "cache-fallback-influx") and not args.influx_token:
         log.error("Set INFLUX_TOKEN or pass --influx-token")
         return 2
 

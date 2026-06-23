@@ -200,8 +200,14 @@ class Collector:
                  aggregate_window_ms=500,       # aggregation window in ms
                  # Optional metrics (disabled for CPU efficiency, enable when needed)
                  enable_link_latency=False,     # inter-switch link latency
-                 enable_queue_occupancy=False): # queue depth metrics
+                 enable_queue_occupancy=False,  # queue depth metrics
+                 telemetry_cache=None,
+                 telemetry_spool=None,
+                 influx_enabled=True):
         self.influx_client = influx_client
+        self.telemetry_cache = telemetry_cache
+        self.telemetry_spool = telemetry_spool
+        self.influx_enabled = bool(influx_enabled and influx_client is not None)
         self.counter = 0            # packets parsed
         self.records_exported = 0   # points written to Influx (total)
         self.records_per_queue = {0: 0, 1: 0, 7: 0}  # per-queue counts
@@ -221,7 +227,9 @@ class Collector:
         self.enable_link_latency = bool(enable_link_latency)
         self.enable_queue_occupancy = bool(enable_queue_occupancy)
 
-        if write_async:
+        if not self.influx_enabled:
+            self.write_api = None
+        elif write_async:
             self.write_api = influx_client.write_api(write_options=WriteOptions(
                 batch_size=batch_size,
                 flush_interval=flush_interval_ms,
@@ -243,6 +251,14 @@ class Collector:
         self._max_drop_entries = 10000  # Limit drop data entries to prevent memory growth
 
     def flush_buffer(self):
+        if self.telemetry_spool is not None:
+            try:
+                self.telemetry_spool.flush()
+            except Exception:
+                log.warning("Local telemetry spool flush failed", exc_info=True)
+
+        if self.write_api is None:
+            return
         try:
             self.write_api.flush()
         except Exception:
@@ -274,7 +290,27 @@ class Collector:
             skip_per_q = getattr(self, '_lat_skip_per_queue', {0: 0, 1: 0, 7: 0})
             skip_q0, skip_q1, skip_q7 = skip_per_q.get(0, 0), skip_per_q.get(1, 0), skip_per_q.get(7, 0)
             skip_str = f" (Q0:{skip_q0} Q1:{skip_q1} Q7:{skip_q7})" if lat_skip > 0 else ""
-            log.info(f"[Collector] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7}) | caches: drop={drop_cache} agg={agg_cache} | {lat_str} skip:{lat_skip}{skip_str}")
+
+            sink_parts = [
+                f"influx={'on' if self.write_api is not None else 'off'}",
+                f"cache={'on' if self.telemetry_cache is not None else 'off'}",
+                f"spool={'on' if self.telemetry_spool is not None else 'off'}",
+            ]
+            if self.telemetry_cache is not None:
+                cache_stats = self.telemetry_cache.stats()
+                sink_parts.append(f"cache_cached={cache_stats.get('records_cached', 0)}")
+            if self.telemetry_spool is not None:
+                spool_stats = self.telemetry_spool.stats()
+                sink_parts.append(f"spool_written={spool_stats.get('records_written', 0)}")
+                queued = spool_stats.get("queued_batches", 0)
+                if queued:
+                    sink_parts.append(f"spool_queue={queued}")
+                if spool_stats.get("error"):
+                    sink_parts.append("spool_error=1")
+
+            log.info(f"[Collector] Exported {total} records (Q0:{q0} Q1:{q1} Q7:{q7}) "
+                     f"| sinks: {' '.join(sink_parts)} "
+                     f"| caches: drop={drop_cache} agg={agg_cache} | {lat_str} skip:{lat_skip}{skip_str}")
             self.records_exported = 0
             self.records_per_queue = {0: 0, 1: 0, 7: 0}
             self._lat_count = 0
@@ -702,14 +738,20 @@ class Collector:
 
             # Write batch
             if points:
+                if self.telemetry_cache is not None:
+                    self.telemetry_cache.add_line_points(points)
+                if self.telemetry_spool is not None:
+                    self.telemetry_spool.write_lines(points)
+
                 # Use low-level write call if possible to avoid Point object validation overhead?
                 # The generic client.write_api.write() handles strings well.
-                self.write_api.write(
-                    bucket=self.bucket,
-                    org=self.org,
-                    record=points,
-                    write_precision=WritePrecision.NS,
-                )
+                if self.write_api is not None:
+                    self.write_api.write(
+                        bucket=self.bucket,
+                        org=self.org,
+                        record=points,
+                        write_precision=WritePrecision.NS,
+                    )
                 self.records_exported += len(points)
                 if expected_queue_id in self.records_per_queue:
                     self.records_per_queue[expected_queue_id] += len(points)

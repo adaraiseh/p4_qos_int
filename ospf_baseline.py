@@ -22,8 +22,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from ecmp_baseline import BenchmarkStats, VisualizationPathFile
-from logging_config import setup_unified_logging
+from ecmp_baseline import (
+    BenchmarkStats,
+    VisualizationPathFile,
+    _decorate_top_egresses,
+    collect_local_egress_observations,
+    log_top_bottleneck_egresses,
+)
+from logging_config import normalize_artifact_permissions, setup_unified_logging
 from topology.factory import create_topology
 
 
@@ -92,7 +98,9 @@ class OSPFBenchmark:
 
         self.env = QoSRoutingEnv(
             self.args.influx_bucket,
-            self.args.influx_token,
+            self.args.influx_token
+            if self.args.telemetry_backend in ("influx", "cache-fallback-influx")
+            else None,
             self.args.influx_org,
             self.args.influx_url,
             verbose=False,
@@ -101,7 +109,11 @@ class OSPFBenchmark:
             topology_builder=builder,
             rules_dir=rules_dir,
             config_path=self.args.config,
+            telemetry_backend=self.args.telemetry_backend,
+            telemetry_cache_socket=self.args.telemetry_cache_socket,
+            telemetry_cache_timeout=self.args.telemetry_cache_timeout,
         )
+        self.env.training_influx_detail = "off"
         self.traffic_manager = TrafficManager(
             config_path=self.args.config,
             seed=self.args.traffic_seed,
@@ -178,10 +190,12 @@ class OSPFBenchmark:
             "data"
         ) / f"ospf_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        normalize_artifact_permissions(output_path.parent, dir_mode=0o775)
         stats = BenchmarkStats()
         completed_steps = 0
 
         with output_path.open("w", newline="") as csv_file:
+            normalize_artifact_permissions(output_path, file_mode=0o664)
             writer = csv.writer(csv_file)
             writer.writerow(
                 [
@@ -296,6 +310,19 @@ class OSPFBenchmark:
                 + "; ".join(final_telemetry_state["errors"])
             )
 
+        egress_observations = collect_local_egress_observations(
+            self.env,
+            window_seconds=telemetry_window_seconds,
+            top_n=10,
+        )
+        top_bottlenecks = _decorate_top_egresses(
+            egress_observations,
+            builder,
+            limit=10,
+        )
+        self.routing_state["top_bottleneck_egresses"] = top_bottlenecks
+        log_top_bottleneck_egresses(top_bottlenecks)
+
         final_verification = self.env.controller.verify_forwarding_tables(
             raise_on_error=True
         )
@@ -343,6 +370,7 @@ class OSPFBenchmark:
                 "routing_state_verified": self.routing_state["verified"],
                 "traffic_state_verified": traffic_state["verified"],
                 "telemetry_state_verified": telemetry_state["verified"],
+                "top_bottleneck_egresses": top_bottlenecks,
                 "routing_state": self.routing_state,
                 "implementation_note": (
                     "Centralized deterministic single shortest-path SPF; "
@@ -351,7 +379,9 @@ class OSPFBenchmark:
             }
             summary_path = Path(self.args.summary_json)
             summary_path.parent.mkdir(parents=True, exist_ok=True)
+            normalize_artifact_permissions(summary_path.parent, dir_mode=0o775)
             summary_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            normalize_artifact_permissions(summary_path, file_mode=0o664)
 
         return 0
 
@@ -405,6 +435,23 @@ def parse_args() -> argparse.Namespace:
         "--influx-token",
         default=os.environ.get("INFLUX_TOKEN"),
     )
+    parser.add_argument(
+        "--telemetry-backend",
+        choices=["cache", "influx", "cache-fallback-influx"],
+        default="cache",
+        help="Telemetry source for benchmark observations",
+    )
+    parser.add_argument(
+        "--telemetry-cache-socket",
+        default="/tmp/p4_qos_int_telemetry.sock",
+        help="Unix socket path for local telemetry cache",
+    )
+    parser.add_argument(
+        "--telemetry-cache-timeout",
+        type=float,
+        default=1.0,
+        help="Local telemetry cache request timeout in seconds",
+    )
     return parser.parse_args()
 
 
@@ -412,7 +459,7 @@ def main() -> int:
     args = parse_args()
     setup_unified_logging(module_name="ospf_baseline", log_level=args.log_level)
 
-    if not args.influx_token:
+    if args.telemetry_backend in ("influx", "cache-fallback-influx") and not args.influx_token:
         log.error("Set INFLUX_TOKEN or pass --influx-token")
         return 2
 

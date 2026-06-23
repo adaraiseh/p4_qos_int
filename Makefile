@@ -36,15 +36,26 @@ TRAIN_POLISH_RESET_PROB_END ?= 0.10
 TRAIN_BASELINE_COOLDOWN ?= 5
 TRAIN_WARM_COOLDOWN ?= 3
 TRAIN_LOG_FLUSH_EVERY ?= 25
-TRAIN_INFLUX_DETAIL ?= minimal
+TRAIN_INFLUX_DETAIL ?= off
 TRAIN_TEST_INFLUX_DETAIL ?= off
 TRAFFIC_TEST_INFLUX_DETAIL ?= off
+TELEMETRY_BACKEND ?= cache
+TELEMETRY_CACHE_SOCKET ?= /tmp/p4_qos_int_telemetry.sock
+TELEMETRY_CACHE_TIMEOUT ?= 1.0
+COLLECTOR_INFLUX_WRITE ?= off
+COLLECTOR_LOCAL_SPOOL ?= on
+COLLECTOR_LOCAL_SPOOL_DIR ?= training_files/collector_spool
+PRODUCTION_INFLUX_WRITE ?= off
 TRAIN_LOG_DIR ?=
-TRAIN_PROFILE_WEIGHTS ?= light_1:2,light_2:2,medium_1:3,medium_2:3,high_1:4,high_2:4,bursty_vo_1:4,bursty_vo_2:4,bursty_vi_1:4,bursty_vi_2:4,bursty_be_1:4,bursty_be_2:4
-TRAIN_FOUNDATION_PROFILE_WEIGHTS ?= light_1:6,light_2:6,medium_1:6,medium_2:6,high_1:6,high_2:6,bursty_vo_1:2,bursty_vo_2:2,bursty_vi_1:2,bursty_vi_2:2,bursty_be_1:2,bursty_be_2:2
-TRAIN_BURST_PROFILE_WEIGHTS ?= light_1:1,light_2:1,medium_1:2,medium_2:2,high_1:3,high_2:3,bursty_vo_1:5,bursty_vo_2:5,bursty_vi_1:5,bursty_vi_2:5,bursty_be_1:5,bursty_be_2:5
+ALL_TRAFFIC_PROFILES ?= light_1 light_2 medium_1 medium_2 high_1 high_2 bursty_vo_1 bursty_vo_2 bursty_vo_3 bursty_vi_1 bursty_vi_2 bursty_vi_3 bursty_be_1 bursty_be_2 bursty_be_3
+ALL_TRAFFIC_PROFILES_CSV ?= light_1,light_2,medium_1,medium_2,high_1,high_2,bursty_vo_1,bursty_vo_2,bursty_vo_3,bursty_vi_1,bursty_vi_2,bursty_vi_3,bursty_be_1,bursty_be_2,bursty_be_3
+TRAIN_TEST_PROFILES ?= $(ALL_TRAFFIC_PROFILES)
+PRODUCTION_PROFILES ?= $(ALL_TRAFFIC_PROFILES)
+TRAIN_PROFILE_WEIGHTS ?= light_1:2,light_2:2,medium_1:3,medium_2:3,high_1:4,high_2:4,bursty_vo_1:4,bursty_vo_2:4,bursty_vo_3:4,bursty_vi_1:4,bursty_vi_2:4,bursty_vi_3:4,bursty_be_1:4,bursty_be_2:4,bursty_be_3:4
+TRAIN_FOUNDATION_PROFILE_WEIGHTS ?= light_1:6,light_2:6,medium_1:6,medium_2:6,high_1:6,high_2:6,bursty_vo_1:2,bursty_vo_2:2,bursty_vo_3:2,bursty_vi_1:2,bursty_vi_2:2,bursty_vi_3:2,bursty_be_1:2,bursty_be_2:2,bursty_be_3:2
+TRAIN_BURST_PROFILE_WEIGHTS ?= light_1:1,light_2:1,medium_1:2,medium_2:2,high_1:3,high_2:3,bursty_vo_1:5,bursty_vo_2:5,bursty_vo_3:5,bursty_vi_1:5,bursty_vi_2:5,bursty_vi_3:5,bursty_be_1:5,bursty_be_2:5,bursty_be_3:5
 TRAIN_POLISH_PROFILE_WEIGHTS ?= $(TRAIN_PROFILE_WEIGHTS)
-BENCH_PROFILES ?= light_2,medium_2,high_1
+BENCH_PROFILES ?= $(ALL_TRAFFIC_PROFILES_CSV)
 BENCH_REPETITIONS ?= 6
 BENCH_BASE_SEED ?= 42
 BENCH_WARMUP ?= 5
@@ -74,13 +85,15 @@ TRAIN_LOG_DIR_FLAG = $(if $(TRAIN_LOG_DIR),--training-log-dir $(TRAIN_LOG_DIR),)
 TRAIN_LOGGING_FLAGS = --training-log-flush-every $(TRAIN_LOG_FLUSH_EVERY) $(TRAIN_LOG_DIR_FLAG)
 TRAIN_RESET_FLAGS = --reset-prob-start $(TRAIN_RESET_PROB_START) --reset-prob-end $(TRAIN_RESET_PROB_END) --baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) --warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN)
 TRAIN_COMMON_FLAGS = $(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_RESET_FLAGS) --training-influx-detail $(TRAIN_INFLUX_DETAIL)
+TELEMETRY_FLAGS = --telemetry-backend $(TELEMETRY_BACKEND) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --telemetry-cache-timeout $(TELEMETRY_CACHE_TIMEOUT)
+COLLECTOR_TELEMETRY_FLAGS = --influx-write $(COLLECTOR_INFLUX_WRITE) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --local-spool $(COLLECTOR_LOCAL_SPOOL) --local-spool-dir $(COLLECTOR_LOCAL_SPOOL_DIR)
 
 # =============================================
 # Common Command Variables
 # =============================================
 PYTHON      := python3
 SUDO_PYTHON := sudo -E PYTHONUNBUFFERED=1 python3 -u
-RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(LOG_LEVEL_FLAG)
+RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(LOG_LEVEL_FLAG) $(TELEMETRY_FLAGS)
 
 # Default target
 all: train
@@ -148,7 +161,9 @@ endif
 
 collect:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY) $(LOG_LEVEL_FLAG)
+	@echo "Telemetry cache socket: $(TELEMETRY_CACHE_SOCKET), Influx writes: $(COLLECTOR_INFLUX_WRITE)"
+	@echo "Local telemetry spool: $(COLLECTOR_LOCAL_SPOOL) ($(COLLECTOR_LOCAL_SPOOL_DIR))"
+	sudo -E $(PYTHON) report_collector/influxdb_export.py --config $(DETECT_TOPOLOGY) $(LOG_LEVEL_FLAG) $(COLLECTOR_TELEMETRY_FLAGS)
 
 monitor:
 	$(PYTHON) monitor_iperf_s.py --dir /tmp --window 60 --refresh 1
@@ -165,6 +180,7 @@ train:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
 	@echo "Training steps: $(TRAIN_STEPS), Influx training detail: $(TRAIN_INFLUX_DETAIL)"
+	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
 	@echo "Reset schedule: $(TRAIN_RESET_PROB_START) -> $(TRAIN_RESET_PROB_END); cooldowns baseline=$(TRAIN_BASELINE_COOLDOWN)s warm=$(TRAIN_WARM_COOLDOWN)s"
 	@echo "Profile weights: $(TRAIN_PROFILE_WEIGHTS)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_STEPS) \
@@ -209,7 +225,7 @@ train_test:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "=== Testing all training profiles ($(TRAIN_TEST_STEPS) steps each) ==="
 	@echo "Influx training detail: $(TRAIN_TEST_INFLUX_DETAIL)"
-	@for p in bursty_vo_2 bursty_vi_2 bursty_be_2 bursty_vo_1 bursty_vi_1 bursty_be_1 high_2 high_1 medium_2 medium_1 light_2 light_1; do \
+	@for p in $(TRAIN_TEST_PROFILES); do \
 		echo ""; \
 		echo "=== Testing profile: $$p ==="; \
 		if ! $(SUDO_PYTHON) rl_agent_4.py --mode train $(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
@@ -292,7 +308,8 @@ traffic_stress_test_custom:
 
 PROD_COMMON = $(SUDO_PYTHON) rl_production.py $(RL_COMMON) \
 	--generate-traffic --traffic-profile $(profile) \
-	--traffic-seed $(TRAFFIC_SEED)
+	--traffic-seed $(TRAFFIC_SEED) \
+	--production-influx-write $(PRODUCTION_INFLUX_WRITE)
 
 # Run production with specific traffic profile
 production:
@@ -308,6 +325,22 @@ production_final:
 production_75pct:
 	$(PROD_COMMON) --weights-tag 75pct
 
+production_all:
+	@echo "Using topology config: $(DETECT_TOPOLOGY)"
+	@echo "=== Running finite production smoke for all profiles ($(STEPS) steps each) ==="
+	@for p in $(PRODUCTION_PROFILES); do \
+		echo ""; \
+		echo "=== Production profile: $$p ==="; \
+		if ! $(SUDO_PYTHON) rl_production.py $(RL_COMMON) \
+			--generate-traffic --traffic-profile $$p \
+			--traffic-seed $(TRAFFIC_SEED) \
+			--production-influx-write $(PRODUCTION_INFLUX_WRITE) \
+			--weights-tag best --steps $(STEPS); then \
+			echo "Production smoke failed for $$p"; \
+			exit 1; \
+		fi; \
+	done
+
 # Finite RL run with the same step count/traffic seed used by ECMP
 rl_compare:
 	$(PROD_COMMON) --weights-tag best --steps $(STEPS)
@@ -318,7 +351,7 @@ ecmp:
 	@echo "Traffic profile: $(profile), seed: $(TRAFFIC_SEED)"
 	$(SUDO_PYTHON) ecmp_baseline.py --config $(DETECT_TOPOLOGY) \
 		--traffic-profile $(profile) --traffic-seed $(TRAFFIC_SEED) \
-		--steps $(STEPS) $(LOG_LEVEL_FLAG)
+		--steps $(STEPS) $(LOG_LEVEL_FLAG) $(TELEMETRY_FLAGS)
 
 ecmp_plan:
 	$(PYTHON) ecmp_baseline.py --config $(TOPOLOGY_CONFIG) --plan-only
@@ -329,7 +362,7 @@ ospf:
 	@echo "Traffic profile: $(profile), seed: $(TRAFFIC_SEED)"
 	$(SUDO_PYTHON) ospf_baseline.py --config $(DETECT_TOPOLOGY) \
 		--traffic-profile $(profile) --traffic-seed $(TRAFFIC_SEED) \
-		--steps $(STEPS) $(LOG_LEVEL_FLAG)
+		--steps $(STEPS) $(LOG_LEVEL_FLAG) $(TELEMETRY_FLAGS)
 
 # Paper-oriented paired benchmark: RL vs ECMP and RL vs OSPF
 benchmark:
@@ -344,7 +377,9 @@ benchmark:
 		--cooldown-seconds $(BENCH_COOLDOWN) \
 		--min-valid-fraction $(BENCH_MIN_VALID) \
 		--max-retries $(BENCH_RETRIES) \
-		--weights-tag $(BENCH_WEIGHTS_TAG) $(BENCH_OUTPUT_FLAG) $(LOG_LEVEL_FLAG)
+		--weights-tag $(BENCH_WEIGHTS_TAG) \
+		--production-influx-write $(PRODUCTION_INFLUX_WRITE) \
+		$(BENCH_OUTPUT_FLAG) $(LOG_LEVEL_FLAG) $(TELEMETRY_FLAGS)
 
 # =============================================
 # Help
@@ -382,7 +417,7 @@ help:
 	@echo "Traffic Testing:"
 	@echo "  make test_traffic profile=<name>   Run specific profile indefinitely"
 	@echo "  Profiles: light_{1,2}, medium_{1,2}, high_{1,2},"
-	@echo "            bursty_{vo,vi,be}_{1,2}"
+	@echo "            bursty_{vo,vi,be}_{1,2,3}"
 	@echo ""
 	@echo "Traffic Stress Testing:"
 	@echo "  make traffic_stress_test_quick     Quick test (100 cycles, ~10 min)"
@@ -392,12 +427,13 @@ help:
 	@echo "Production Mode:"
 	@echo "  make production profile=<name>     Run with best model"
 	@echo "  make production_final profile=<name>"
+	@echo "  make production_all STEPS=30       Finite smoke over all profiles"
 	@echo "  make rl_compare profile=<name> STEPS=300 TRAFFIC_SEED=42"
 	@echo "  make ecmp profile=<name> STEPS=300 TRAFFIC_SEED=42"
 	@echo "  make ospf profile=<name> STEPS=300 TRAFFIC_SEED=42"
 	@echo "  make ecmp_plan topo=<name>  Validate ECMP groups offline"
 	@echo "  make benchmark             Paired RL/ECMP/OSPF paper benchmark"
-	@echo "    BENCH_PROFILES=light_2,medium_2,high_1"
+	@echo "    BENCH_PROFILES=$(ALL_TRAFFIC_PROFILES_CSV)"
 	@echo "    BENCH_REPETITIONS=6 STEPS=300 BENCH_COOLDOWN=30"
 	@echo "  make clean_bench           Remove benchmark_results/ and run logs"
 	@echo "  make clean_training_logs   Remove training_files/training_logs contents"
@@ -421,6 +457,6 @@ help:
 .PHONY: all validate rules run stop clean collect monitor visualize \
         train train_paper train_profile train_test resume test test_best test_traffic \
         traffic_stress_test traffic_stress_test_quick traffic_stress_test_custom \
-        production production_best production_final production_75pct \
+        production production_best production_final production_75pct production_all \
         rl_compare ecmp ecmp_plan ospf benchmark clean_bench clean-benchmark \
         clean_training_logs clean-training-logs bench help

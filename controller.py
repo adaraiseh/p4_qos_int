@@ -663,10 +663,8 @@ class Controller:
         """
         Return all valid alternative switches for the worst node in the path.
 
-        Generic Logic:
-        Finds any switch (other than 'edge' or 'bottleneck') that allows a valid path
-        from source to destination in a graph view EXCLUDING the bottleneck.
-        This supports both local stitching (c1 -> c2) and global rerouting (c1 -> a2 -> c3 -> a4).
+        An alternative is valid only if the controller can produce a safe
+        simple path through that switch while avoiding the bottleneck.
         """
         with self._lock:
             # Use cached version with hashable arguments (CPU optimization)
@@ -697,30 +695,8 @@ class Controller:
         if not path or worst_name not in path or len(path) < 2:
             return []
 
-        src_node = path[0]
-        dst_node = path[-1]
-
-        # Create a read-only graph view WITHOUT the bottleneck to verify independent reachability
-        # Using restricted_view() is O(1) vs O(V+E) for copy() - much faster for large topologies
-        if worst_name not in self.net_graph:
-            # If bottleneck not in graph, something is wrong, but proceed safely
-            return []
-        G_view = nx.restricted_view(self.net_graph, nodes=[worst_name], edges=[])
-
-        # Optimization: Pre-check connectivity from src/dst in the restricted graph
-        if not (G_view.has_node(src_node) and G_view.has_node(dst_node)):
-            return []
-
-        # CPU Optimization: Use connected components for batch reachability check
-        # Instead of calling has_path() for each candidate, compute component membership once
-        try:
-            # Get the connected component containing src_node
-            src_component = nx.node_connected_component(G_view, src_node)
-        except nx.NetworkXError:
-            return []
-
-        # If dst is not in same component as src, no valid path exists at all
-        if dst_node not in src_component:
+        has_loop, _ = self._detect_routing_loop(path)
+        if has_loop:
             return []
 
         worst_role = self._normalize_role(self._role_of_sid(worst_switch_id))
@@ -744,12 +720,11 @@ class Controller:
                 continue
 
             cand_name = self.switch_id_to_name.get(sid)
-            if not cand_name or cand_name not in G_view:
+            if not cand_name or cand_name not in self.net_graph:
                 continue
 
-            # CPU Optimization: Check component membership instead of has_path()
-            # If candidate is in same component as src (and dst), it's reachable both ways
-            if cand_name in src_component:
+            planned, _ = self._plan_safe_reroute_path(path, worst_name, cand_name)
+            if planned is not None:
                 candidates.append(cand_name)
 
         return sorted(candidates)
@@ -1029,21 +1004,13 @@ class Controller:
 
     def _detect_routing_loop(self, path: list[str]) -> tuple[bool, str]:
         """
-        Detect if a path contains a routing loop (directed cycle).
+        Detect if a path is unsafe for destination-only LPM forwarding.
 
-        A routing loop exists if the directed edge sequence contains a cycle,
-        meaning packets could circulate indefinitely. Node revisits are OK
-        if edges differ (e.g., a1→c1 then a3→c1 - same node, different ingress).
-
-        The key insight: A routing loop exists if and only if the same directed
-        edge appears twice in the path. A path like [c1, a3, c1] is NOT a loop
-        because the edges are c1→a3 and a3→c1 (different). But [a1, c1, a1]
-        contains edges a1→c1 and c1→a1, which together form a cycle.
-
-        However, we need to distinguish between:
-        - [a1, c1, a1]: edges (a1,c1) and (c1,a1) - this IS a loop (2-cycle)
-        - [c1, a3, c1, a7]: edges (c1,a3), (a3,c1), (c1,a7) - NOT a loop
-          (just passing through c1 twice)
+        The installed overlay is keyed by destination prefix and DSCP only; it
+        does not include ingress port or path position. Therefore any repeated
+        switch in a computed path is unsafe even when the directed edges differ:
+        the second visit would overwrite the next hop needed by the first
+        visit and can blackhole or loop the queue.
 
         Args:
             path: List of node names forming the path
@@ -1054,20 +1021,20 @@ class Controller:
         if not path or len(path) < 2:
             return False, ""
 
-        # Fast path: If no node appears twice, impossible to have a cycle
-        if len(path) == len(set(path)):
-            return False, ""
+        first_seen = {}
+        for idx, node in enumerate(path):
+            if node in first_seen:
+                segment = path[first_seen[node]:idx + 1]
+                return (
+                    True,
+                    "LPM-unsafe repeated node "
+                    f"{node}: {' -> '.join(segment)}",
+                )
+            first_seen[node] = idx
 
-        # Check for two types of loops:
-        # 1. Self-loops: node connects to itself
-        # 2. Duplicate edges: same directed edge appears twice
         edges_seen = {}  # edge -> first occurrence position
         for i in range(len(path) - 1):
             u, v = path[i], path[i+1]
-
-            # Check for self-loop
-            if u == v:
-                return True, f"Loop detected: {u} -> {u} (self-loop)"
 
             # Check for duplicate edge
             edge = (u, v)
@@ -1080,6 +1047,122 @@ class Controller:
 
         return False, ""
 
+    def _erase_repeated_nodes(self, path: list[str]) -> list[str]:
+        """
+        Remove looped path segments while preserving traversal order.
+
+        Example:
+            h1 -> t1 -> a1 -> c1 -> a1 -> t2 -> h4
+        becomes:
+            h1 -> t1 -> a1 -> t2 -> h4
+        """
+        stack = []
+        positions = {}
+        for node in path:
+            if node in positions:
+                keep_len = positions[node] + 1
+                for removed in stack[keep_len:]:
+                    positions.pop(removed, None)
+                stack = stack[:keep_len]
+                continue
+            positions[node] = len(stack)
+            stack.append(node)
+        return stack
+
+    def _plan_safe_reroute_path(
+        self,
+        original_path: list[str],
+        worst_name: str,
+        alt_switch_name: str,
+    ) -> tuple[Optional[list[str]], str]:
+        """
+        Plan a safe reroute for a queue path.
+
+        The P4 overlay only stores one next hop per (dst_prefix, dscp), so the
+        installed path must be simple. The planner first tries a local
+        replacement with loop erasure. If that is physically impossible, it
+        computes a detour through the selected alternative with the bottleneck
+        removed, and accepts it only if the final path is simple and every
+        adjacent link physically exists.
+        """
+        def _validate_simple_path(candidate_path: list[str], label: str):
+            if not candidate_path or len(candidate_path) < 3:
+                return None, f"{label} path too short"
+
+            p4_switches = self.topo.get_p4switches().keys()
+            for node in candidate_path[1:-1]:
+                if node not in p4_switches:
+                    return None, f"{label} uses non-switch transit node {node}"
+
+            for i in range(len(candidate_path) - 1):
+                if not self.net_graph.has_edge(candidate_path[i], candidate_path[i + 1]):
+                    return (
+                        None,
+                        f"{label} lacks link "
+                        f"{candidate_path[i]} -> {candidate_path[i + 1]}",
+                    )
+
+            has_loop, loop_msg = self._detect_routing_loop(candidate_path)
+            if has_loop:
+                return None, f"{label} is unsafe: {loop_msg}"
+
+            return candidate_path, "ok"
+
+        if not original_path or len(original_path) < 3:
+            return None, "path too short for local replacement"
+
+        has_loop, loop_msg = self._detect_routing_loop(original_path)
+        if has_loop:
+            return None, f"current path is unsafe: {loop_msg}"
+
+        try:
+            idx = original_path.index(worst_name)
+        except ValueError:
+            return None, f"bottleneck {worst_name} not in path"
+
+        if idx == 0 or idx == len(original_path) - 1:
+            return None, "cannot replace path endpoint"
+
+        new_path = list(original_path)
+        new_path[idx] = alt_switch_name
+        new_path = self._erase_repeated_nodes(new_path)
+
+        planned, msg = _validate_simple_path(new_path, "local replacement")
+        if planned is not None:
+            return planned, msg
+
+        # If a local replacement is physically impossible, allow a controlled
+        # multi-hop detour through the chosen alternative. The bottleneck is
+        # removed from the graph, and the candidate is accepted only when the
+        # final installed path is still a simple physical path.
+        src_node = original_path[0]
+        dst_node = original_path[-1]
+        if worst_name not in self.net_graph:
+            return None, f"{msg}; bottleneck node not in graph"
+        if alt_switch_name not in self.net_graph:
+            return None, f"{msg}; alternative node not in graph"
+
+        G_view = nx.restricted_view(self.net_graph, nodes=[worst_name], edges=[])
+        if not (
+            G_view.has_node(src_node)
+            and G_view.has_node(dst_node)
+            and G_view.has_node(alt_switch_name)
+        ):
+            return None, f"{msg}; reroute endpoint missing after bottleneck removal"
+
+        try:
+            p1 = nx.shortest_path(G_view, src_node, alt_switch_name, weight='weight')
+            p2 = nx.shortest_path(G_view, alt_switch_name, dst_node, weight='weight')
+        except nx.NetworkXNoPath:
+            return None, f"{msg}; no safe detour via {alt_switch_name}"
+
+        detour_path = p1 + p2[1:]
+        planned, detour_msg = _validate_simple_path(detour_path, "multi-hop detour")
+        if planned is None:
+            return None, f"{msg}; {detour_msg}"
+
+        return planned, "ok"
+
     def reroute_one_demand_symmetric(self, src_ip: str, dst_ip: str, qid: int,
                                  worst_switch_id: int, alt_switch_name: str):
         """
@@ -1088,11 +1171,12 @@ class Controller:
 
         Thread-safe wrapper that acquires lock before calling internal implementation.
 
-        Strategy: A Hybrid Rerouting Approach
-        1. Try simple local swap (stitching) first to preserve max path structure.
-        2. If invalid, fall back to "Sticky Routing": shortest path calculation
-           on a graph where original path edges are hyper-preferred (weight=0.01).
-        3. Enforce strict symmetry for the return path.
+        Strategy:
+        1. Perform a local replacement.
+        2. Erase repeated-node segments into a simple path when possible.
+        3. Allow multi-hop detours through the selected alternative only when
+           the final path is simple and the bottleneck is avoided.
+        4. Enforce strict symmetry for the return path.
         """
         with self._lock:
             return self._reroute_one_demand_symmetric_unlocked(src_ip, dst_ip, qid, worst_switch_id, alt_switch_name)
@@ -1122,71 +1206,27 @@ class Controller:
         if not path_fwd_orig or worst_name not in path_fwd_orig:
             return False, "no stored forward path or worst not in path"
             
-        # --- PATH CALCULATION STRATEGY ---
-        
-        # 1. Try Local Swap (Stitching)
-        def _try_local_swap(original_path, w_name, a_name):
-            try:
-                newp = list(original_path)
-                idx = newp.index(w_name)
-                newp[idx] = a_name
-                # Validate edges
-                for i in range(len(newp) - 1):
-                    if not self.net_graph.has_edge(newp[i], newp[i+1]):
-                        return None
-                return newp
-            except ValueError:
-                return None
-                
-        fwd_new_path = _try_local_swap(path_fwd_orig, worst_name, alt_switch_name)
-        
-        # 2. Fallback to Sticky Routing (if swap failed)
+        fwd_new_path, plan_msg = self._plan_safe_reroute_path(
+            path_fwd_orig,
+            worst_name,
+            alt_switch_name,
+        )
         if not fwd_new_path:
-            # Create restricted graph (no bottleneck)
-            G_temp = self.net_graph.copy()
-            if worst_name in G_temp:
-                G_temp.remove_node(worst_name)
-            else:
-                return False, "bottleneck node not in graph"
-                
-            # Bias towards existing path edges (Sticky Routing)
-            # NetworkX shortest_path with weight='weight' defaults missing attributes to 1.0
-            # We set original path edges to 0.01 to strongly prefer reusing them
-            # This minimizes path changes while still allowing new routes when necessary
-            for i in range(len(path_fwd_orig) - 1):
-                u, v = path_fwd_orig[i], path_fwd_orig[i+1]
-                if G_temp.has_edge(u, v):
-                    G_temp[u][v]['weight'] = 0.01
-            
-            try:
-                # Compute path passing through alt
-                # src -> ... -> alt
-                p1 = nx.shortest_path(G_temp, src_host, alt_switch_name, weight='weight')
-                # alt -> ... -> dst
-                p2 = nx.shortest_path(G_temp, alt_switch_name, dst_host, weight='weight')
-                
-                # Merge (slice p2 to avoid duplicating alt node)
-                fwd_new_path = p1 + p2[1:]
+            return False, f"unsafe reroute rejected: {plan_msg}"
 
-                # Validate no routing loops in merged path
-                has_loop, loop_msg = self._detect_routing_loop(fwd_new_path)
-                if has_loop:
-                    self.loop_detection_events += 1
-                    log.warning("=" * 60)
-                    log.warning("ROUTING LOOP DETECTED")
-                    log.warning("=" * 60)
-                    log.warning(f"Source: {src_host}, Destination: {dst_host}")
-                    log.warning(f"Bottleneck: {worst_name}, Alternative: {alt_switch_name}")
-                    log.warning(f"P1 (src -> alt): {' -> '.join(p1)}")
-                    log.warning(f"P2 (alt -> dst): {' -> '.join(p2)}")
-                    log.warning(f"Merged path:    {' -> '.join(fwd_new_path)}")
-                    log.warning(f"{loop_msg}")
-                    log.warning("=" * 60)
-                    return False, f"merged path contains routing loop: {loop_msg}"
-
-                log.debug(f"Sticky fallback path found: {' -> '.join(fwd_new_path)}")
-            except nx.NetworkXNoPath:
-                return False, f"no physical path found via {alt_switch_name} (sticky fallback failed)"
+        # Validate the final simple path before installing overlays.
+        has_loop, loop_msg = self._detect_routing_loop(fwd_new_path)
+        if has_loop:
+            self.loop_detection_events += 1
+            log.warning("=" * 60)
+            log.warning("UNSAFE REROUTE PATH REJECTED")
+            log.warning("=" * 60)
+            log.warning(f"Source: {src_host}, Destination: {dst_host}")
+            log.warning(f"Bottleneck: {worst_name}, Alternative: {alt_switch_name}")
+            log.warning(f"Candidate path: {' -> '.join(fwd_new_path)}")
+            log.warning(f"{loop_msg}")
+            log.warning("=" * 60)
+            return False, f"candidate path is unsafe for LPM overlay: {loop_msg}"
 
         # 3. Enforce Symmetry for Reverse Path
         # The return path should be the exact reverse of the new forward path

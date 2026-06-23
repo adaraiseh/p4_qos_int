@@ -1,7 +1,9 @@
 import csv
 import json
 import random
+import re
 import signal
+import sys
 import tempfile
 import threading
 import time
@@ -12,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from benchmark import (
     BenchmarkOrchestrator,
+    parse_args,
     summarize_run_csv,
     validate_runner_summary,
 )
@@ -317,6 +320,86 @@ class BenchmarkInterruptTests(unittest.TestCase):
 
 
 class TrafficIntegrityTests(unittest.TestCase):
+    @staticmethod
+    def _make_variables():
+        variables = {}
+        for line in Path("Makefile").read_text().splitlines():
+            match = re.match(r"^([A-Z0-9_]+)\s*\?=\s*(.*)$", line)
+            if match:
+                variables[match.group(1)] = match.group(2).strip()
+        return variables
+
+    @staticmethod
+    def _expand_make_value(value, variables):
+        previous = None
+        while value != previous:
+            previous = value
+            for name in re.findall(r"\$\(([A-Z0-9_]+)\)", value):
+                value = value.replace(f"$({name})", variables.get(name, ""))
+        return value
+
+    def test_makefile_profile_lists_cover_runtime_registry(self):
+        variables = self._make_variables()
+        expected = list(TrafficManager.TRAFFIC_PROFILES)
+
+        all_profiles = self._expand_make_value(
+            variables["ALL_TRAFFIC_PROFILES"],
+            variables,
+        ).split()
+        all_profiles_csv = [
+            item
+            for item in self._expand_make_value(
+                variables["ALL_TRAFFIC_PROFILES_CSV"],
+                variables,
+            ).split(",")
+            if item
+        ]
+        bench_profiles = [
+            item
+            for item in self._expand_make_value(
+                variables["BENCH_PROFILES"],
+                variables,
+            ).split(",")
+            if item
+        ]
+
+        self.assertEqual(all_profiles, expected)
+        self.assertEqual(all_profiles_csv, expected)
+        self.assertEqual(bench_profiles, expected)
+        self.assertEqual(
+            self._expand_make_value(
+                variables["TRAIN_TEST_PROFILES"],
+                variables,
+            ).split(),
+            expected,
+        )
+        self.assertEqual(
+            self._expand_make_value(
+                variables["PRODUCTION_PROFILES"],
+                variables,
+            ).split(),
+            expected,
+        )
+
+        for name in (
+            "TRAIN_PROFILE_WEIGHTS",
+            "TRAIN_FOUNDATION_PROFILE_WEIGHTS",
+            "TRAIN_BURST_PROFILE_WEIGHTS",
+            "TRAIN_POLISH_PROFILE_WEIGHTS",
+        ):
+            value = self._expand_make_value(variables[name], variables)
+            weighted_profiles = [
+                item.split(":", 1)[0]
+                for item in value.split(",")
+                if item
+            ]
+            self.assertEqual(weighted_profiles, expected)
+
+    def test_benchmark_default_profiles_cover_runtime_registry(self):
+        with patch.object(sys, "argv", ["benchmark.py"]):
+            args = parse_args()
+        self.assertEqual(args.profiles, list(TrafficManager.TRAFFIC_PROFILES))
+
     def test_tc_root_class_and_rate_parser(self):
         parsed = TrafficManager._parse_root_htb_class(
             "class htb 5:1 root prio 0 rate 4740Kbit "
@@ -339,12 +422,12 @@ class TrafficIntegrityTests(unittest.TestCase):
         }
         average_totals = []
         expected_ranges = {
-            "light_1": (1.50, 1.50),
-            "light_2": (1.62, 1.62),
-            "medium_1": (1.50, 1.80),
-            "medium_2": (1.50, 1.92),
-            "high_1": (1.50, 1.85),
-            "high_2": (1.85, 1.85),
+            "light_1": (2.75, 2.75),
+            "light_2": (2.78, 2.78),
+            "medium_1": (2.65, 3.15),
+            "medium_2": (2.45, 3.20),
+            "high_1": (2.55, 3.25),
+            "high_2": (3.25, 3.25),
         }
 
         for profile in (
@@ -432,8 +515,13 @@ class TrafficIntegrityTests(unittest.TestCase):
             manager._choose_profile_name(None, {"light": 0.0})
 
     def test_bursty_profiles_have_queue_biased_bursts(self):
+        expected_high_totals = {
+            "vo": {1: 3.20, 2: 3.55, 3: 3.75},
+            "vi": {1: 3.20, 2: 3.30, 3: 4.00},
+            "be": {1: 3.20, 2: 3.80, 3: 3.50},
+        }
         for queue_name, qid in (("vo", 0), ("vi", 1), ("be", 7)):
-            for suffix, high_steps in ((1, 3), (2, 6)):
+            for suffix, high_steps in ((1, 3), (2, 6), (3, 8)):
                 profile = f"bursty_{queue_name}_{suffix}"
                 stages = TrafficManager.PROFILE_STAGE_LOADS[profile]
                 self.assertIn(profile, TrafficManager.TRAFFIC_PROFILES)
@@ -446,7 +534,10 @@ class TrafficIntegrityTests(unittest.TestCase):
                     qid,
                 )
                 self.assertAlmostEqual(sum(stages["low"].values()), 0.5)
-                self.assertAlmostEqual(sum(stages["high"].values()), 3.2)
+                self.assertAlmostEqual(
+                    sum(stages["high"].values()),
+                    expected_high_totals[queue_name][suffix],
+                )
 
     def test_bursty_cycles_are_seeded_random_with_fixed_high_step_count(self):
         first = object.__new__(TrafficManager)

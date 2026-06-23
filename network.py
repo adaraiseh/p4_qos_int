@@ -10,7 +10,7 @@ from p4utils.mininetlib.network_API import NetworkAPI
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from logging_config import setup_unified_logging
+from logging_config import normalize_artifact_tree, setup_unified_logging
 from topology.factory import create_topology
 from topology.base import TopologyBuilder
 from config.validator import validate_config
@@ -414,6 +414,7 @@ def main():
 
     # Set up unified logging
     setup_unified_logging(module_name="network", log_level=args.log_level)
+    normalize_artifact_tree("log")
 
     # Build network from configuration
     net, builder = config_network(args.config, args.rules)
@@ -424,6 +425,7 @@ def main():
 
     # Start network
     net.startNetwork()
+    normalize_artifact_tree("log")
 
     # Determine rules directory
     if args.rules:
