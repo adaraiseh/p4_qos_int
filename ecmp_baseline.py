@@ -918,12 +918,12 @@ class BenchmarkStats:
         return float(np.percentile(values, 95)) if values else 0.0
 
     def to_summary(self, steps: int) -> Dict:
+        sla_pct = 100.0 * self.sla_met / max(1, self.sla_checks)
         return {
             "total_steps": steps,
             "mean_reward": self._mean(self.rewards),
-            "overall_sla_compliance": (
-                100.0 * self.sla_met / max(1, self.sla_checks)
-            ),
+            "overall_sla_compliance": sla_pct,
+            "sla_met_pct": sla_pct,
             "valid_steps": self.valid_steps,
             "queue_metrics": {
                 qid: {
@@ -945,6 +945,7 @@ class BenchmarkStats:
             f"  SLA compliance: "
             f"{summary['overall_sla_compliance']:.2f}%"
         )
+        log.info(f"  SLA met percentage: {summary['sla_met_pct']:.2f}%")
         log.info(
             f"  Valid telemetry steps: "
             f"{summary['valid_steps']}/{summary['total_steps']}"

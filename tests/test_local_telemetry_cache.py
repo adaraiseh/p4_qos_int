@@ -249,11 +249,12 @@ class LocalTelemetryCacheTests(unittest.TestCase):
         self.assertEqual(wide_response["switch_metrics"]["0"]["23"], {"drop": 0.0, "lat": 0.0, "util": 0.0})
         self.assertEqual(wide_response["switch_metrics"]["1"]["24"], {"drop": 0.0, "lat": 0.0, "util": 0.0})
 
-    def test_traffic_count_counts_flow_latency_by_queue(self):
+    def test_traffic_count_counts_int_liveness_by_queue(self):
         self.cache.add_line_points([
-            self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 1),
-            self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
-            self._line("flow_latency", {"queue_id": "1", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
+            self._line("flow_telemetry_seen", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 1),
+            self._line("flow_telemetry_seen", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
+            self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 40000.0, 2),
+            self._line("flow_telemetry_seen", {"queue_id": "1", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
         ])
 
         response = self.cache.handle_request({
@@ -268,11 +269,12 @@ class LocalTelemetryCacheTests(unittest.TestCase):
 
     def test_traffic_count_multi_counts_queues_in_one_exact_window(self):
         self.cache.add_line_points([
-            self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, -5),
-            self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 1),
-            self._line("flow_latency", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
-            self._line("flow_latency", {"queue_id": "1", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
-            self._line("flow_latency", {"queue_id": "7", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 20),
+            self._line("flow_telemetry_seen", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, -5),
+            self._line("flow_telemetry_seen", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 1),
+            self._line("flow_telemetry_seen", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
+            self._line("flow_telemetry_seen", {"queue_id": "1", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 2),
+            self._line("flow_latency", {"queue_id": "1", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 40000.0, 2),
+            self._line("flow_telemetry_seen", {"queue_id": "7", "src_ip": "a", "dst_ip": "b", "flow_id": "1"}, 1.0, 20),
         ])
 
         response = self.cache.handle_request({
@@ -288,6 +290,26 @@ class LocalTelemetryCacheTests(unittest.TestCase):
         self.assertEqual(response["window"]["min_ns"], self.base_ns + 1_000_000)
         self.assertEqual(response["window"]["max_ns"], self.base_ns + 2_000_000)
         self.assertTrue(response["window"]["within_window"])
+
+    def test_flow_coverage_uses_int_liveness_not_latency(self):
+        self.cache.add_line_points([
+            self._line("flow_telemetry_seen", {"queue_id": "0", "src_ip": "a", "dst_ip": "b", "flow_id": "10"}, 1.0, 1),
+            self._line("flow_telemetry_seen", {"queue_id": "7", "src_ip": "a", "dst_ip": "b", "flow_id": "10"}, 1.0, 2),
+            self._line("flow_latency", {"queue_id": "1", "src_ip": "a", "dst_ip": "b", "flow_id": "99"}, 5.0, 2),
+            self._line("flow_latency", {"queue_id": "7", "src_ip": "a", "dst_ip": "b", "flow_id": "11"}, 40000.0, 2),
+        ])
+
+        response = self.cache.handle_request({
+            "kind": "flow_coverage",
+            "start_ns": self.base_ns,
+            "stop_ns": self.base_ns + 10_000_000,
+            "qids": [0, 1, 7],
+        })
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["coverage_measurement"], "flow_telemetry_seen")
+        self.assertEqual(response["observed"], {"0": ["10"], "1": [], "7": ["10"]})
+        self.assertEqual(response["window"]["by_measurement"]["flow_telemetry_seen"]["count"], 2)
 
     def test_egress_observations_reconstruct_path_and_bottleneck(self):
         common = {

@@ -190,6 +190,7 @@ SLA_THRESHOLDS = {
     7: 200.0,   # Best-effort - most lenient
 }
 QIDS = (0, 1, 7)
+FLOW_TELEMETRY_MEASUREMENT = "flow_telemetry_seen"
 
 
 def _flux_queue_filter(qids) -> str:
@@ -1943,14 +1944,12 @@ class QoSRoutingEnv:
         retry_delay: float = 1.0,
         raise_on_error: bool = True,
     ) -> Dict:
-        """Verify that every configured demand reports latency in every queue.
+        """Verify that every configured demand reports INT telemetry in every queue.
 
-        Metric presence alone is insufficient for benchmark validity: a
-        partially blackholed ECMP condition can look excellent when percentiles
-        contain only surviving flows. This check requires exact flow-ID
-        coverage for every RL queue over a multi-second window. Retries allow the
-        INT collector and InfluxDB writer to catch up after a clean traffic
-        start without weakening the exact all-flow requirement.
+        Performance metrics are intentionally separate from liveness: a severely
+        delayed flow can have awful latency and still prove that INT telemetry is
+        alive. This check uses the collector's per-report liveness measurement so
+        benchmark validity does not depend on latency sanity thresholds.
         """
         expected = {str(int(flow_id)) for flow_id in expected_flow_ids}
         observed = {qid: set() for qid in QIDS}
@@ -1964,7 +1963,7 @@ class QoSRoutingEnv:
             flux = f'''
             from(bucket:"{self.bucket}")
                 |> range(start:{start}, stop:{stop})
-                |> filter(fn: (r) => r._measurement == "flow_latency")
+                |> filter(fn: (r) => r._measurement == "{FLOW_TELEMETRY_MEASUREMENT}")
                 |> filter(fn: (r) => {_flux_queue_filter(QIDS)})
                 |> group(columns:["queue_id", "flow_id"])
                 |> first()
@@ -2018,6 +2017,7 @@ class QoSRoutingEnv:
 
         report = {
             'verified': not errors,
+            'coverage_measurement': FLOW_TELEMETRY_MEASUREMENT,
             'window_seconds': float(window_seconds),
             'expected_flow_ids': sorted(expected, key=int),
             'per_queue': per_queue,
@@ -3377,7 +3377,7 @@ class QoSRoutingEnv:
             flux = f'''
             from(bucket:"{self.bucket}")
                 |> range(start:{start}, stop:{stop})
-                |> filter(fn: (r) => r._measurement == "flow_latency")
+                |> filter(fn: (r) => r._measurement == "{FLOW_TELEMETRY_MEASUREMENT}")
                 |> filter(fn: (r) => r.queue_id == "{qid}")
                 |> count()
             '''

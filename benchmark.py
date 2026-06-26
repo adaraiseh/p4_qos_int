@@ -235,6 +235,11 @@ def summarize_run_csv(path: Path) -> Dict:
             if valid_rows
             else math.nan
         ),
+        "sla_met_pct": (
+            100.0 * sum(values("sla_met_count")) / (sla_denominator * len(valid_rows))
+            if valid_rows
+            else math.nan
+        ),
         "offered_load_mean_mbps": mean(
             [
                 clean_float(row.get("load_q0_mbps"))
@@ -1212,7 +1217,7 @@ class BenchmarkOrchestrator:
             lines.append("  Aggregate across independent runs:")
             confidence_label = f"{self.args.confidence * 100:.1f}% CI"
             lines.append(
-                f"  Method  n    SLA valid % [{confidence_label}]       "
+                f"  Method  n    SLA met % [{confidence_label}]          "
                 f"Macro latency ms [{confidence_label}]    "
                 f"Mean drops/100ms [{confidence_label}] "
                 f"Mean reward [{confidence_label}]"
@@ -1280,7 +1285,7 @@ class BenchmarkOrchestrator:
                     f"routing_verified={verified:<3} "
                     f"traffic_verified={traffic_verified:<3} "
                     f"telemetry_verified={telemetry_verified:<3} "
-                    f"SLA={float(row.get('sla_compliance_valid_pct', math.nan)):>7.2f}% "
+                    f"SLA met={float(row.get('sla_compliance_valid_pct', math.nan)):>7.2f}% "
                     f"reward={float(row.get('reward_mean_valid', math.nan)):>8.4f} "
                     f"ecmp_path={ecmp_path_audit:<3} "
                     f"mismatches={_count_text(row.get('ecmp_path_mismatch_count'))} "

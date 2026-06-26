@@ -41,6 +41,16 @@ PROFILE_CYCLE_STEPS = 10
 PROFILE_VERIFY_INTERVAL_STEPS = 20
 MEASUREMENT_SETTLE_SECONDS = 0.0
 COMMON_QUEUE_WEIGHTS = {0: 0.22327, 1: 0.34591, 7: 0.43082}
+DEFAULT_BOTTLENECK_LINK_MBPS = 10.0
+MAX_FLOW_BOTTLENECK_FRACTION = 0.50
+FLOW_LOAD_WEIGHT_TEMPLATE = (
+    1.42, 0.74, 1.16,
+    0.66, 1.34, 0.92,
+    1.08, 1.48, 0.70,
+    0.86, 1.26, 0.60,
+    1.18, 0.82, 1.38,
+    0.76, 1.02, 1.30,
+)
 
 
 def _weighted_load(total_mbps: float, weights: Dict[int, float]) -> Dict[int, float]:
@@ -90,38 +100,38 @@ def _steady_stages(
 
 
 STEADY_PROFILE_SPECS = {
-    # Near-knee stress points are intentionally close because fat_tree_k4 has
-    # a sharp ECMP congestion transition. Light profiles are steady. Medium
-    # and high profiles use deterministic high/low cycles around the knee so
-    # they exercise partial SLA behavior without unbounded queue buildup.
+    # Calibrated for the single-path OSPF baseline on fat_tree_k4. The
+    # configured 18-demand workload can concentrate 10 demands on one 10 Mbps
+    # spine/core edge, so per-demand totals are kept below the old ECMP-tuned
+    # values but stepped up enough that each level is visibly distinct.
     "light_1": {
-        "low": 2.75,
-        "high": 2.75,
+        "low": 0.60,
+        "high": 0.60,
         "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     },
     "light_2": {
-        "low": 2.78,
-        "high": 2.78,
+        "low": 0.75,
+        "high": 0.75,
         "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     },
     "medium_1": {
-        "low": 2.65,
-        "high": 3.15,
+        "low": 1.563,
+        "high": 1.803,
         "pattern": (0, 1, 0, 0, 1, 0, 0, 1, 0, 0),
     },
     "medium_2": {
-        "low": 2.45,
-        "high": 3.20,
+        "low": 1.50,
+        "high": 1.81,
         "pattern": (0, 1, 0, 1, 0, 0, 1, 0, 1, 0),
     },
     "high_1": {
-        "low": 2.55,
-        "high": 3.25,
+        "low": 2.70,
+        "high": 3.15,
         "pattern": (0, 1, 1, 0, 1, 1, 0, 1, 1, 0),
     },
     "high_2": {
-        "low": 3.25,
-        "high": 3.25,
+        "low": 2.98,
+        "high": 2.98,
         "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     },
 }
@@ -134,16 +144,16 @@ BURST_QUEUE_WEIGHTS = {
 BURST_TIER_SPECS = {
     # Suffixes mirror the steady profile difficulty bands:
     # _1 light, _2 medium, _3 high.
-    1: {"low": 0.5, "high_steps": 3},
-    2: {"low": 0.5, "high_steps": 6},
-    3: {"low": 0.5, "high_steps": 8},
+    1: {"low": 0.70, "high_steps": 3},
+    2: {"low": 0.70, "high_steps": 6},
+    3: {"low": 0.70, "high_steps": 8},
 }
 BURST_HIGH_TOTALS = {
-    # Class-specific burst totals calibrated against the focused queue SLA:
-    # voice=Q0, video=Q1, best-effort=Q7.
-    "vo": {1: 3.20, 2: 3.55, 3: 3.75},
-    "vi": {1: 3.20, 2: 3.30, 3: 4.00},
-    "be": {1: 3.20, 2: 3.80, 3: 3.50},
+    # Class-specific burst totals calibrated against the focused queue under
+    # single-path OSPF concentration: voice=Q0, video=Q1, best-effort=Q7.
+    "vo": {1: 3.40, 2: 3.155, 3: 3.04},
+    "vi": {1: 3.25, 2: 3.20, 3: 3.03},
+    "be": {1: 3.35, 2: 3.13, 3: 3.148},
 }
 BURSTY_PROFILE_SPECS = {
     f"bursty_{traffic_class}_{tier}": {
@@ -361,6 +371,8 @@ class TrafficManager:
 
         # Build sender/receiver pairs from config or fallback to default logic
         self.traffic_pairs = self._build_traffic_pairs_from_config()
+        self._max_flow_total_mbps = self._max_single_flow_mbps()
+        self._flow_load_weights = self._build_flow_load_weights()
 
         # Extract unique senders and receivers from pairs
         self.senders = list(set(p[0] for p in self.traffic_pairs))
@@ -381,6 +393,8 @@ class TrafficManager:
         # Current profile state
         self.current_load: Dict[int, float] = {}
         self._source_load: Dict[int, float] = {}
+        self._current_flow_loads: Dict[int, Dict[int, float]] = {}
+        self._source_flow_loads: Dict[int, Dict[int, float]] = {}
         self.current_profile_name: str = ""
         self.current_profile_category: str = ""
         self._tc_original_classes: Dict[str, Dict[str, str]] = {}
@@ -1320,6 +1334,182 @@ class TrafficManager:
         stage = "high" if stage_high else "low"
         return cls.PROFILE_STAGE_LOADS[profile_name][stage].copy()
 
+    def _topology_bottleneck_mbps(self) -> float:
+        """Return the smallest configured data-link bandwidth in Mbps."""
+        config = getattr(self, "_topology_config", None)
+        if config is None:
+            return DEFAULT_BOTTLENECK_LINK_MBPS
+
+        bandwidths = getattr(config, "link_bandwidths", None)
+        if bandwidths is None:
+            return DEFAULT_BOTTLENECK_LINK_MBPS
+
+        raw_topology_type = getattr(getattr(config, "topology", None), "type", "")
+        topology_type = str(getattr(raw_topology_type, "value", raw_topology_type))
+        if "fat-tree" in topology_type:
+            field_names = ("host_leaf", "leaf_spine", "spine_core")
+        elif "leaf-spine" in topology_type:
+            field_names = ("host_leaf", "leaf_spine")
+        elif "three-tier" in topology_type:
+            field_names = ("host_access", "access_distribution", "distribution_core")
+        else:
+            field_names = ()
+
+        values = [
+            float(getattr(bandwidths, field_name))
+            for field_name in field_names
+            if hasattr(bandwidths, field_name)
+            for value in (getattr(bandwidths, field_name),)
+            if isinstance(value, (int, float)) and float(value) > 0.0
+        ]
+        if not values:
+            if hasattr(bandwidths, "model_dump"):
+                raw_values = bandwidths.model_dump().values()
+            else:
+                raw_values = vars(bandwidths).values()
+            values = [
+                float(value)
+                for value in raw_values
+                if isinstance(value, (int, float)) and float(value) > 0.0
+            ]
+        return min(values) if values else DEFAULT_BOTTLENECK_LINK_MBPS
+
+    def _max_single_flow_mbps(self) -> float:
+        return self._topology_bottleneck_mbps() * MAX_FLOW_BOTTLENECK_FRACTION
+
+    def _build_flow_load_weights(self) -> Dict[int, float]:
+        """Assign deterministic heterogeneous weights to configured demands."""
+        pairs = list(getattr(self, "traffic_pairs", []))
+        if not pairs:
+            return {}
+
+        raw_weights = [
+            FLOW_LOAD_WEIGHT_TEMPLATE[index % len(FLOW_LOAD_WEIGHT_TEMPLATE)]
+            for index, _pair in enumerate(pairs)
+        ]
+        mean_weight = sum(raw_weights) / len(raw_weights)
+        if mean_weight <= 0.0:
+            raise ValueError("Flow load weights must have a positive mean")
+        return {
+            flow_id: raw_weights[index] / mean_weight
+            for index, (_sender, _receiver, flow_id) in enumerate(pairs)
+        }
+
+    @staticmethod
+    def _bounded_weighted_totals(
+        average_total_mbps: float,
+        weights: Dict[int, float],
+        max_total_mbps: float,
+    ) -> Dict[int, float]:
+        """Distribute an average demand load while capping each demand."""
+        if not weights:
+            return {}
+        if average_total_mbps < 0.0:
+            raise ValueError("Average flow load cannot be negative")
+        if max_total_mbps <= 0.0:
+            raise ValueError("Maximum flow load must be positive")
+
+        flow_ids = list(weights)
+        target_total = average_total_mbps * len(flow_ids)
+        capacity = max_total_mbps * len(flow_ids)
+        if target_total > capacity + 1e-9:
+            raise ValueError(
+                f"Average flow load {average_total_mbps:.3f} Mbps cannot be "
+                f"met while capping every demand at {max_total_mbps:.3f} Mbps"
+            )
+
+        totals = {flow_id: 0.0 for flow_id in flow_ids}
+        remaining = set(flow_ids)
+        remaining_total = target_total
+        while remaining:
+            weight_sum = sum(weights[flow_id] for flow_id in remaining)
+            if weight_sum <= 0.0:
+                raise ValueError("Flow load weights must be positive")
+
+            capped = []
+            for flow_id in remaining:
+                candidate = remaining_total * weights[flow_id] / weight_sum
+                if candidate > max_total_mbps:
+                    capped.append(flow_id)
+
+            if not capped:
+                for flow_id in remaining:
+                    totals[flow_id] = (
+                        remaining_total * weights[flow_id] / weight_sum
+                    )
+                break
+
+            for flow_id in capped:
+                totals[flow_id] = max_total_mbps
+                remaining_total -= max_total_mbps
+                remaining.remove(flow_id)
+
+        return totals
+
+    def _flow_load_plan(
+        self,
+        average_queue_loads: Dict[int, float],
+    ) -> Dict[int, Dict[int, float]]:
+        """Expand profile-average queue loads into per-demand queue loads."""
+        pairs = list(getattr(self, "traffic_pairs", []))
+        if not pairs:
+            return {}
+
+        total_average = sum(average_queue_loads.values())
+        if total_average <= 0.0:
+            return {
+                flow_id: {qid: 0.0 for qid in ALL_QUEUES}
+                for _sender, _receiver, flow_id in pairs
+            }
+
+        weights = getattr(self, "_flow_load_weights", None)
+        if not weights:
+            self._flow_load_weights = self._build_flow_load_weights()
+            weights = self._flow_load_weights
+        max_flow_total = getattr(
+            self,
+            "_max_flow_total_mbps",
+            DEFAULT_BOTTLENECK_LINK_MBPS * MAX_FLOW_BOTTLENECK_FRACTION,
+        )
+        flow_totals = self._bounded_weighted_totals(
+            total_average,
+            weights,
+            max_flow_total,
+        )
+        queue_shares = {
+            qid: average_queue_loads.get(qid, 0.0) / total_average
+            for qid in ALL_QUEUES
+        }
+        return {
+            flow_id: {
+                qid: flow_totals[flow_id] * queue_shares[qid]
+                for qid in ALL_QUEUES
+            }
+            for _sender, _receiver, flow_id in pairs
+        }
+
+    def _set_current_stage_loads(
+        self,
+        profile_name: str,
+        stage_high: bool,
+    ) -> None:
+        self.current_load = self._stage_loads(profile_name, stage_high)
+        self._current_flow_loads = self._flow_load_plan(self.current_load)
+
+    def _set_source_loads(self, stages: Dict[str, Dict[int, float]]) -> None:
+        self._source_load = stages["source"].copy()
+        self._source_flow_loads = self._flow_load_plan(self._source_load)
+
+    def _flow_queue_load(
+        self,
+        flow_id: int,
+        qid: int,
+        source: bool = False,
+    ) -> float:
+        plan = self._source_flow_loads if source else self._current_flow_loads
+        fallback = self._source_load if source else self.current_load
+        return plan.get(flow_id, {}).get(qid, fallback.get(qid, 0.0))
+
     def _bursty_pattern_for_cycle(self, cycle_index: int) -> Tuple[int, ...]:
         """Return the seeded random burst pattern for a zero-based cycle."""
         if cycle_index < 0:
@@ -1514,16 +1704,26 @@ class TrafficManager:
         verify: bool = True,
         verify_reason: str = "startup",
     ) -> Dict:
-        """Shape each sender to the profile's exact aggregate offered load."""
-        pair_counts = Counter(sender for sender, _, _ in self.traffic_pairs)
-        per_pair_total = sum(self.current_load.values())
+        """Shape each sender to the sum of its active per-demand targets."""
+        sender_totals = Counter()
+        flow_totals = {}
+        for sender, _receiver, flow_id in self.traffic_pairs:
+            flow_loads = self._current_flow_loads.get(flow_id)
+            if flow_loads is None:
+                flow_loads = self.current_load
+            flow_total = sum(flow_loads.values())
+            flow_totals[flow_id] = flow_total
+            sender_totals[sender] += flow_total
+
+        average_per_demand_total = sum(self.current_load.values())
+        max_demand_total = max(flow_totals.values(), default=0.0)
         reports = []
         try:
-            for sender in sorted(pair_counts):
+            for sender in sorted(sender_totals):
                 reports.append(
                     self._set_sender_rate_cap(
                         sender,
-                        per_pair_total * pair_counts[sender],
+                        sender_totals[sender],
                         verify=verify,
                     )
                 )
@@ -1546,13 +1746,23 @@ class TrafficManager:
                     else "startup"
                 )
             ),
-            "per_pair_total_mbps": per_pair_total,
+            "per_pair_total_mbps": average_per_demand_total,
+            "average_per_demand_total_mbps": average_per_demand_total,
+            "max_demand_total_mbps": max_demand_total,
+            "max_flow_total_mbps": getattr(
+                self,
+                "_max_flow_total_mbps",
+                DEFAULT_BOTTLENECK_LINK_MBPS * MAX_FLOW_BOTTLENECK_FRACTION,
+            ),
+            "flow_totals_mbps": flow_totals,
+            "sender_totals_mbps": dict(sender_totals),
             "senders": reports,
         }
         verification_note = "verified" if verify else "verification skipped"
         log.info(
             f"[Traffic] Applied sender HTB caps for {profile_name}: "
-            f"{per_pair_total:.4f} Mbps per demand ({verification_note})"
+            f"{average_per_demand_total:.4f} Mbps average per demand, "
+            f"{max_demand_total:.4f} Mbps max demand ({verification_note})"
         )
         return self._tc_shape_report
 
@@ -1602,7 +1812,7 @@ class TrafficManager:
             return None
 
         self._shaped_stage_high = stage_high
-        self.current_load = self._stage_loads(
+        self._set_current_stage_loads(
             self.current_profile_name,
             stage_high,
         )
@@ -1740,6 +1950,7 @@ class TrafficManager:
 
         self._shaped_stage_high = stage_high
         self.current_load = target_load
+        self._current_flow_loads = self._flow_load_plan(self.current_load)
         report = self._apply_sender_caps(self.current_profile_name)
         report["phase"] = "measurement_start"
         report["already_active"] = False
@@ -1828,16 +2039,26 @@ class TrafficManager:
         # the measured episode instead of starting every profile at a benign
         # low-rate validation load.
         stages = self.PROFILE_STAGE_LOADS[self.current_profile_name]
-        self._source_load = stages["source"].copy()
+        self._set_source_loads(stages)
         self._profile_step_offset = 0
         self._shaped_stage_high = self._scheduled_stage_high(1)
-        self.current_load = self._stage_loads(
+        self._set_current_stage_loads(
             self.current_profile_name,
             self._shaped_stage_high,
         )
         
         log.info(f"Starting profile '{self.current_profile_name}' ({self.current_profile_category})")
         log.info(f"  Loads: Q0={self.current_load[0]:.2f}, Q1={self.current_load[1]:.2f}, Q7={self.current_load[7]:.2f} Mbps")
+        flow_totals = [
+            sum(loads.values())
+            for loads in self._current_flow_loads.values()
+        ]
+        if flow_totals:
+            log.info(
+                f"  Per-flow totals: min={min(flow_totals):.2f}, "
+                f"max={max(flow_totals):.2f}, "
+                f"cap={self._max_flow_total_mbps:.2f} Mbps"
+            )
         if is_bursty:
             initial_pattern = "".join(
                 str(bit) for bit in self._bursty_pattern_for_cycle(0)
@@ -1895,6 +2116,15 @@ class TrafficManager:
             'profile_category': self.current_profile_category,
             'loads': self.current_load.copy(),
             'measurement_loads': self.current_load.copy(),
+            'measurement_flow_loads': {
+                flow_id: loads.copy()
+                for flow_id, loads in self._current_flow_loads.items()
+            },
+            'source_flow_loads': {
+                flow_id: loads.copy()
+                for flow_id, loads in self._source_flow_loads.items()
+            },
+            'max_flow_total_mbps': self._max_flow_total_mbps,
             'is_bursty': is_bursty,
             'traffic_verified': True,
             'start_verification': start_report,
@@ -1982,10 +2212,7 @@ class TrafficManager:
             for idx, qid in enumerate(ALL_QUEUES):
                 port = _traffic_dst_port(flow_id, qid)
                 tos = QID_TOS.get(qid, 0)
-                bw = self._source_load.get(
-                    qid,
-                    self.current_load.get(qid, 0.2),
-                )
+                bw = self._flow_queue_load(flow_id, qid, source=True)
                 cmd = (
                     f"bash -lc '{self.TRAFFIC_TAG}=1; "
                     f"while true; do iperf3 -c {dst_ip} -p {port} -u "

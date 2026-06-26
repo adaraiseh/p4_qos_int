@@ -475,6 +475,7 @@ class Collector:
             dst_port = flow_info.dst_port
             flow_id = (dst_port // 10) % 100
             expected_queue_id = dst_port % 10
+            q_ids = flow_info.queue_ids
 
             # ---- Robust guard for partial/empty hop metadata ----
             # Only check lengths of arrays we actually iterate over or index into
@@ -530,7 +531,6 @@ class Collector:
 
                 # Cache local vars for loop speed
                 sw_ids = flow_info.switch_ids
-                q_ids = flow_info.queue_ids
                 eg_ports = flow_info.l1_egress_ports
                 hop_lats = flow_info.hop_latencies
                 tx_utils = flow_info.egress_tx_utils
@@ -680,6 +680,26 @@ class Collector:
                             dr["measurement"], dr_tags, float(dr["value"]), dr["ts_ns"], points
                         )
 
+            # --- INT liveness (once per packet) ---
+            # This is independent of flow_latency sanity. Coverage/liveness gates
+            # should verify that INT reports are arriving, while flow_latency
+            # remains the performance signal, including severe congestion.
+            int_queue_id = q_ids[-1] if len(q_ids) > 0 else expected_queue_id
+            points.append(
+                f"flow_telemetry_seen,dst_ip={dst_ip},flow_id={flow_id},queue_id={int_queue_id},src_ip={src_ip} value=1 {report_time}"
+            )
+            cache_points.append((
+                "flow_telemetry_seen",
+                {
+                    "dst_ip": dst_ip,
+                    "flow_id": flow_id,
+                    "queue_id": int_queue_id,
+                    "src_ip": src_ip,
+                },
+                1.0,
+                report_time,
+            ))
+
             # --- Flow Latency (Only once per packet) ---
             # INT metadata is prepended by each switch, so:
             #   - Index 0 = last hop (most recent metadata)
@@ -696,9 +716,6 @@ class Collector:
                     flow_info.egress_tstamps[0] - flow_info.ingress_tstamps[-1]
                 ) / 1_000_000.0
 
-                # Use queue_id from first hop (index -1, oldest metadata)
-                int_queue_id = q_ids[-1] if len(q_ids) > 0 else expected_queue_id
-
                 # Debug: Log when INT queue_id differs from expected (from dst_port)
                 if int_queue_id != expected_queue_id:
                     log.debug(f"[Latency Queue Mismatch] expected={expected_queue_id} actual={int_queue_id} "
@@ -709,50 +726,61 @@ class Collector:
                     log.debug(f"[Latency] Timestamp array mismatch: egress={egress_ts_len}, ingress={ingress_ts_len}, "
                               f"flow={flow_id}, queue={int_queue_id}")
 
-                # Sanity check: reject negative latency or latency > 10 seconds (10000ms)
-                # This catches timestamp wraparound issues and stale packet data
-                if flow_latency < 0 or flow_latency > 10000:
-                    log.warning(f"[Latency] Rejected insane value: {flow_latency:.2f}ms "
-                                f"(egr[0]={flow_info.egress_tstamps[0]}, "
-                                f"ing[-1]={flow_info.ingress_tstamps[-1]}) "
-                                f"flow={flow_id} queue={int_queue_id}")
-                elif not self.aggregate_enabled:
-                     points.append(
-                        f"flow_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={int_queue_id},src_ip={src_ip} value={float(flow_latency)} {report_time}"
-                     )
-                     cache_points.append((
-                        "flow_latency",
-                        {
-                            "dst_ip": dst_ip,
-                            "flow_id": flow_id,
-                            "queue_id": int_queue_id,
-                            "src_ip": src_ip,
-                        },
-                        float(flow_latency),
-                        report_time,
-                     ))
-                     self._lat_count = getattr(self, '_lat_count', 0) + 1
-                     # Track per-queue flow_latency distribution for diagnostics
-                     if not hasattr(self, '_lat_per_queue'):
-                         self._lat_per_queue = {}
-                     self._lat_per_queue[int_queue_id] = self._lat_per_queue.get(int_queue_id, 0) + 1
-                else:
-                     self._emit_or_aggregate(
-                        "flow_latency",
-                        {
-                            "flow_id": flow_id,
-                            "src_ip": flow_info.src_ip,
-                            "dst_ip": flow_info.dst_ip,
-                            "queue_id": int_queue_id,
-                        },
-                        float(flow_latency),
-                        report_time,
-                        points,
+                # Sanity check: reject negative latency as timestamp corruption.
+                # Large positive latency is valid performance evidence under
+                # severe queue buildup and must remain visible to RL/benchmarks.
+                if flow_latency < 0:
+                    log.warning(
+                        f"[Latency] Rejected negative value: {flow_latency:.2f}ms "
+                        f"(egr[0]={flow_info.egress_tstamps[0]}, "
+                        f"ing[-1]={flow_info.ingress_tstamps[-1]}) "
+                        f"flow={flow_id} queue={int_queue_id}"
                     )
-                     # Track per-queue flow_latency distribution for diagnostics (aggregation path)
-                     if not hasattr(self, '_lat_per_queue'):
-                         self._lat_per_queue = {}
-                     self._lat_per_queue[int_queue_id] = self._lat_per_queue.get(int_queue_id, 0) + 1
+                else:
+                    if flow_latency > 10000:
+                        log.warning(
+                            f"[Latency] Accepted high value: {flow_latency:.2f}ms "
+                            f"(egr[0]={flow_info.egress_tstamps[0]}, "
+                            f"ing[-1]={flow_info.ingress_tstamps[-1]}) "
+                            f"flow={flow_id} queue={int_queue_id}"
+                        )
+                    if not self.aggregate_enabled:
+                        points.append(
+                            f"flow_latency,dst_ip={dst_ip},flow_id={flow_id},queue_id={int_queue_id},src_ip={src_ip} value={float(flow_latency)} {report_time}"
+                        )
+                        cache_points.append((
+                            "flow_latency",
+                            {
+                                "dst_ip": dst_ip,
+                                "flow_id": flow_id,
+                                "queue_id": int_queue_id,
+                                "src_ip": src_ip,
+                            },
+                            float(flow_latency),
+                            report_time,
+                        ))
+                        self._lat_count = getattr(self, '_lat_count', 0) + 1
+                        # Track per-queue flow_latency distribution for diagnostics
+                        if not hasattr(self, '_lat_per_queue'):
+                            self._lat_per_queue = {}
+                        self._lat_per_queue[int_queue_id] = self._lat_per_queue.get(int_queue_id, 0) + 1
+                    else:
+                        self._emit_or_aggregate(
+                            "flow_latency",
+                            {
+                                "flow_id": flow_id,
+                                "src_ip": flow_info.src_ip,
+                                "dst_ip": flow_info.dst_ip,
+                                "queue_id": int_queue_id,
+                            },
+                            float(flow_latency),
+                            report_time,
+                            points,
+                        )
+                        # Track per-queue flow_latency distribution for diagnostics (aggregation path)
+                        if not hasattr(self, '_lat_per_queue'):
+                            self._lat_per_queue = {}
+                        self._lat_per_queue[int_queue_id] = self._lat_per_queue.get(int_queue_id, 0) + 1
             else:
                 # Count skipped latency records
                 self._lat_skip_count = getattr(self, '_lat_skip_count', 0) + 1
@@ -782,7 +810,7 @@ class Collector:
             # Write batch
             if points:
                 if self.telemetry_cache is not None:
-                    if cache_points:
+                    if cache_points and not self.aggregate_enabled:
                         self.telemetry_cache.add_preparsed_points(cache_points)
                     else:
                         self.telemetry_cache.add_line_points(points)

@@ -342,6 +342,7 @@ class OSPFBenchmark:
         log.info(
             f"  SLA compliance: {summary['overall_sla_compliance']:.2f}%"
         )
+        log.info(f"  SLA met percentage: {summary['sla_met_pct']:.2f}%")
         log.info(
             f"  Valid telemetry steps: "
             f"{summary['valid_steps']}/{summary['total_steps']}"

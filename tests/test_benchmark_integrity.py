@@ -192,12 +192,14 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
             return []
 
     class QueryRecord:
-        def __init__(self, qid, value=None, measurement=None, src_ip=None, dst_ip=None):
+        def __init__(self, qid, value=None, measurement=None, src_ip=None, dst_ip=None, flow_id=None):
             self.values = {"queue_id": str(qid)}
             if src_ip is not None:
                 self.values["src_ip"] = src_ip
             if dst_ip is not None:
                 self.values["dst_ip"] = dst_ip
+            if flow_id is not None:
+                self.values["flow_id"] = str(flow_id)
             self._value = value
             self._measurement = measurement
 
@@ -385,6 +387,26 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
         for qid in QIDS:
             self.assertIn(f'r.queue_id == "{qid}"', query_api.queries[0])
 
+    def test_influx_flow_coverage_uses_int_liveness_measurement(self):
+        query_api = self.CapturingQueryApi([
+            self.QueryRecord(qid, flow_id=flow_id)
+            for qid in QIDS
+            for flow_id in (10, 11)
+        ])
+        env = self._influx_env("high_1", query_api)
+
+        report = env.verify_telemetry_flow_coverage(
+            [10, 11],
+            window_seconds=0.1,
+            retries=1,
+            raise_on_error=False,
+        )
+
+        self.assertTrue(report["verified"])
+        self.assertEqual(report["coverage_measurement"], "flow_telemetry_seen")
+        self.assertIn('r._measurement == "flow_telemetry_seen"', query_api.queries[0])
+        self.assertNotIn('r._measurement == "flow_latency"', query_api.queries[0])
+
 
 class BenchmarkReportingIntegrityTests(unittest.TestCase):
     def test_runner_summary_requires_verified_routing_state(self):
@@ -512,6 +534,7 @@ class BenchmarkReportingIntegrityTests(unittest.TestCase):
             summary = summarize_run_csv(path)
 
         self.assertEqual(summary["sla_compliance_valid_pct"], 50.0)
+        self.assertEqual(summary["sla_met_pct"], 50.0)
         self.assertEqual(summary["reward_mean_valid"], 0.0)
 
 
@@ -693,12 +716,12 @@ class TrafficIntegrityTests(unittest.TestCase):
         }
         average_totals = []
         expected_ranges = {
-            "light_1": (2.75, 2.75),
-            "light_2": (2.78, 2.78),
-            "medium_1": (2.65, 3.15),
-            "medium_2": (2.45, 3.20),
-            "high_1": (2.55, 3.25),
-            "high_2": (3.25, 3.25),
+            "light_1": (0.60, 0.60),
+            "light_2": (0.75, 0.75),
+            "medium_1": (1.563, 1.803),
+            "medium_2": (1.50, 1.81),
+            "high_1": (2.70, 3.15),
+            "high_2": (2.98, 2.98),
         }
 
         for profile in (
@@ -787,9 +810,9 @@ class TrafficIntegrityTests(unittest.TestCase):
 
     def test_bursty_profiles_have_queue_biased_bursts(self):
         expected_high_totals = {
-            "vo": {1: 3.20, 2: 3.55, 3: 3.75},
-            "vi": {1: 3.20, 2: 3.30, 3: 4.00},
-            "be": {1: 3.20, 2: 3.80, 3: 3.50},
+            "vo": {1: 3.40, 2: 3.155, 3: 3.04},
+            "vi": {1: 3.25, 2: 3.20, 3: 3.03},
+            "be": {1: 3.35, 2: 3.13, 3: 3.148},
         }
         for queue_name, qid in (("vo", 0), ("vi", 1), ("be", 7)):
             for suffix, high_steps in ((1, 3), (2, 6), (3, 8)):
@@ -804,11 +827,64 @@ class TrafficIntegrityTests(unittest.TestCase):
                     max(stages["high"], key=stages["high"].get),
                     qid,
                 )
-                self.assertAlmostEqual(sum(stages["low"].values()), 0.5)
+                self.assertAlmostEqual(sum(stages["low"].values()), 0.70)
                 self.assertAlmostEqual(
                     sum(stages["high"].values()),
                     expected_high_totals[queue_name][suffix],
                 )
+
+    def test_flow_load_plan_is_heterogeneous_bounded_and_preserves_average(self):
+        manager = object.__new__(TrafficManager)
+        manager.traffic_pairs = [
+            (f"h{index % 6 + 1}", f"h{index % 6 + 7}", 10 + index)
+            for index in range(18)
+        ]
+        manager._max_flow_total_mbps = 5.0
+        manager._flow_load_weights = manager._build_flow_load_weights()
+
+        average_loads = TrafficManager.PROFILE_STAGE_LOADS["high_2"]["high"]
+        plan = manager._flow_load_plan(average_loads)
+        totals = [sum(loads.values()) for loads in plan.values()]
+
+        self.assertEqual(len(plan), 18)
+        self.assertLess(min(totals), max(totals))
+        self.assertLessEqual(max(totals), 5.0)
+        self.assertAlmostEqual(
+            sum(totals) / len(totals),
+            sum(average_loads.values()),
+            places=6,
+        )
+
+    def test_profiles_are_calibrated_for_single_path_ospf_hot_edge(self):
+        link_mbps = 10.0
+        hot_edge_demands = 10.0
+
+        def hot_edge_ratio(profile, stage):
+            total = sum(TrafficManager.PROFILE_STAGE_LOADS[profile][stage].values())
+            return total * hot_edge_demands / link_mbps
+
+        self.assertAlmostEqual(hot_edge_ratio("light_1", "high"), 0.60)
+        self.assertAlmostEqual(hot_edge_ratio("light_2", "high"), 0.75)
+        self.assertAlmostEqual(hot_edge_ratio("medium_1", "high"), 1.803)
+        self.assertAlmostEqual(hot_edge_ratio("medium_2", "high"), 1.81)
+        self.assertAlmostEqual(hot_edge_ratio("high_1", "high"), 3.15)
+        self.assertAlmostEqual(hot_edge_ratio("high_2", "high"), 2.98)
+
+        expected_focused = {
+            "bursty_vo_1": (0, 3.40 * 0.72),
+            "bursty_vo_2": (0, 3.155 * 0.72),
+            "bursty_vo_3": (0, 3.04 * 0.72),
+            "bursty_vi_1": (1, 3.25 * 0.70),
+            "bursty_vi_2": (1, 3.20 * 0.70),
+            "bursty_vi_3": (1, 3.03 * 0.70),
+            "bursty_be_1": (7, 3.35 * 0.75),
+            "bursty_be_2": (7, 3.13 * 0.75),
+            "bursty_be_3": (7, 3.148 * 0.75),
+        }
+        for profile, (qid, expected_total) in expected_focused.items():
+            focused_load = TrafficManager.PROFILE_STAGE_LOADS[profile]["high"][qid]
+            ratio = focused_load * hot_edge_demands / link_mbps
+            self.assertAlmostEqual(ratio, expected_total)
 
     def test_bursty_cycles_are_seeded_random_with_fixed_high_step_count(self):
         first = object.__new__(TrafficManager)

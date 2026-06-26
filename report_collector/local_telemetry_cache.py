@@ -28,6 +28,7 @@ log = logging.getLogger(__name__)
 DEFAULT_SOCKET_PATH = "/tmp/p4_qos_int_telemetry.sock"
 DEFAULT_TRAINING_STATE_PATH = "/tmp/p4_qos_int_training_state.json"
 RELEVANT_MEASUREMENTS = {
+    "flow_telemetry_seen",
     "flow_latency",
     "q_drop_rate_100ms",
     "tx_utilization",
@@ -68,6 +69,8 @@ class LocalTelemetryCache:
             if parsed is None:
                 continue
             measurement, tags, value, ts_ns = parsed
+            if measurement not in RELEVANT_MEASUREMENTS:
+                continue
             points_by_measurement[measurement].append((ts_ns, value, tags, now_ns))
             cached_count += 1
 
@@ -555,13 +558,13 @@ class LocalTelemetryCache:
         window = _new_window_audit(start_ns, stop_ns)
         with self._lock:
             for ts_ns, _value, tags in self._iter_window_locked(
-                "flow_latency",
+                "flow_telemetry_seen",
                 start_ns,
                 stop_ns,
             ):
                 if tags.get("queue_id") == qid:
                     count += 1
-                    _record_window_audit(window, "flow_latency", ts_ns)
+                    _record_window_audit(window, "flow_telemetry_seen", ts_ns)
         return {"ok": True, "count": count, "window": window}
 
     def _traffic_count_multi(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -571,14 +574,14 @@ class LocalTelemetryCache:
         window = _new_window_audit(start_ns, stop_ns)
         with self._lock:
             for ts_ns, _value, tags in self._iter_window_locked(
-                "flow_latency",
+                "flow_telemetry_seen",
                 start_ns,
                 stop_ns,
             ):
                 qid = tags.get("queue_id")
                 if qid in qids:
                     counts[qid] += 1
-                    _record_window_audit(window, "flow_latency", ts_ns)
+                    _record_window_audit(window, "flow_telemetry_seen", ts_ns)
         return {"ok": True, "counts": counts, "window": window}
 
     def _flow_coverage(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -589,7 +592,7 @@ class LocalTelemetryCache:
 
         with self._lock:
             for ts_ns, _value, tags in self._iter_window_locked(
-                "flow_latency",
+                "flow_telemetry_seen",
                 start_ns,
                 stop_ns,
             ):
@@ -597,10 +600,11 @@ class LocalTelemetryCache:
                 flow_id = tags.get("flow_id")
                 if qid in qids and flow_id is not None:
                     observed[qid].add(str(flow_id))
-                    _record_window_audit(window, "flow_latency", ts_ns)
+                    _record_window_audit(window, "flow_telemetry_seen", ts_ns)
 
         return {
             "ok": True,
+            "coverage_measurement": "flow_telemetry_seen",
             "observed": {
                 qid: sorted(flow_ids, key=lambda item: int(item))
                 for qid, flow_ids in observed.items()
