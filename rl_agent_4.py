@@ -134,6 +134,12 @@ ACTION_DIM = 8          # No-op + 6 single (3 queues × 2 alts) + 1 multi
 # Total: 832 + 128 = 960
 STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
 
+# Per-queue raw-state layout. Keep these in sync with _build_raw_state().
+QUEUE_FEATURE_STRIDE = 16
+QUEUE_FEATURE_LAT_RATIO = 0
+QUEUE_FEATURE_DROP_NORM = 1
+QUEUE_FEATURE_UTIL_NORM = 2
+
 # Temporal smoothing
 LAT_EMA_ALPHA = 0.3     # EMA smoothing for latency ratio
 
@@ -218,6 +224,19 @@ REWARD_DROP_PENALTY = 0.8           # Reduced from 1.5 (with sqrt compression)
 #   - If targeting a sick queue → low cost (encouraged to fix)
 REWARD_ACTION_COST_HEALTHY = 0.5   # Cost when targeting a queue with SLA met (reduced from 0.65)
 REWARD_ACTION_COST_SICK = 0.10      # Cost when targeting a queue with SLA violated
+
+# Contextual intervention costs. These shape behavior without changing the
+# action mask or observation dimensions.
+ACTION_COST_CLEAR_VIOLATION = 0.10
+ACTION_COST_SEVERE_MULTI = 0.05
+ACTION_COST_PERSISTENT_BUILDUP = 0.30
+ACTION_COST_RECOVERING = 0.40
+ACTION_COST_SHORT_SPIKE = 0.80
+ACTION_COST_STABLE = 1.00
+ACTION_COST_ALL_SLA_MET_EXTRA = 0.25
+ACTION_COST_SAME_QUEUE_REPEAT_EXTRA = 0.10
+ACTION_COST_EXACT_REPEAT_EXTRA = 0.20
+ACTION_COST_RECOVERING_REPEAT_EXTRA = 0.05
 
 # Soft margin around SLA (reduces reward flip-flopping)
 SLA_SOFT_MARGIN = 0.1  # REDUCED from 0.2 to 0.1 (10%) - tighter margin provides stronger training signal
@@ -637,12 +656,14 @@ class DQNAgent:
     def __init__(self, state_dim: int, action_dim: int, device: torch.device,
                  lr: float = LR, multi_buffer: bool = False,
                  buffer_capacity: int = REPLAY_CAPACITY,
-                 balanced_sampling: bool = False):
+                 balanced_sampling: bool = False,
+                 eps_decay_steps: int = EPS_DECAY_STEPS):
         self.device = device
         self.action_dim = action_dim
         self.lr = lr  # Store for logging
         self.multi_buffer = multi_buffer
         self.balanced_sampling = balanced_sampling
+        self.eps_decay_steps = max(1, int(eps_decay_steps))
 
         # Networks
         self.online_net = DuelingDQN(state_dim, action_dim, HIDDEN_DIM).to(device)
@@ -661,6 +682,7 @@ class DQNAgent:
 
         # Epsilon schedule
         self.eps = EPS_START
+        self.eps_decay_start = EPS_START
         self.step_count = 0      # Global training steps (for PER beta)
         self.eps_step_count = 0  # Steps for epsilon decay (can be reset)
 
@@ -723,12 +745,18 @@ class DQNAgent:
         self.step_count += 1      # Always increments (Global progress)
         self.eps_step_count += 1  # Increments but can be reset
         
-        progress = min(1.0, self.eps_step_count / EPS_DECAY_STEPS)
-        self.eps = EPS_END + (EPS_START - EPS_END) * (1 - progress)
+        progress = min(1.0, self.eps_step_count / self.eps_decay_steps)
+        self.eps = EPS_END + (self.eps_decay_start - EPS_END) * (1 - progress)
         
         # Update PER beta
         beta_progress = min(1.0, self.step_count / PER_BETA_STEPS)
         self.beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * beta_progress
+
+    def set_epsilon_for_decay(self, eps: float) -> None:
+        """Start a fresh stage-local epsilon decay from the provided value."""
+        self.eps = max(EPS_END, min(EPS_START, float(eps)))
+        self.eps_decay_start = self.eps
+        self.eps_step_count = 0
     
     def push_experience(self, state, action, reward, next_state, terminated, next_valid_mask):
         """Add experience to replay buffer."""
@@ -824,6 +852,8 @@ class DQNAgent:
             'optimizer': self.optimizer.state_dict(),
             'step_count': self.step_count,
             'eps_step_count': self.eps_step_count,
+            'eps_decay_steps': self.eps_decay_steps,
+            'eps_decay_start': self.eps_decay_start,
             'eps': self.eps,
             'beta': self.beta,
             'multi_buffer': self.multi_buffer,
@@ -862,6 +892,11 @@ class DQNAgent:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.step_count = checkpoint.get('step_count', 0)
         self.eps_step_count = checkpoint.get('eps_step_count', self.step_count)
+        self.eps_decay_steps = max(
+            1,
+            int(checkpoint.get('eps_decay_steps', self.eps_decay_steps)),
+        )
+        self.eps_decay_start = checkpoint.get('eps_decay_start', EPS_START)
         self.eps = checkpoint.get('eps', EPS_END)
         self.beta = checkpoint.get('beta', PER_BETA_END)
         
@@ -2030,6 +2065,114 @@ class QoSRoutingEnv:
             )
         return report
 
+    def verify_required_telemetry_freshness(
+        self,
+        window_seconds: Optional[float] = None,
+        retries: Optional[int] = None,
+        retry_delay: Optional[float] = None,
+        raise_on_error: bool = True,
+    ) -> Dict[str, Any]:
+        """Verify the same required queue-metric telemetry used by training.
+
+        This is intentionally weaker than all-flow coverage. Training starts an
+        episode only after the required queues have fresh lat/drop/util records,
+        and per-step learning then uses data_valid to decide whether to store a
+        transition.
+        """
+        required_qids = list(self._required_qids_for_current_profile())
+        labels = ["lat", "drop", "util"]
+        seconds = (
+            float(window_seconds)
+            if window_seconds is not None
+            else float(self.telemetry_liveness_window_seconds)
+        )
+        attempts = max(
+            1,
+            int(
+                retries
+                if retries is not None
+                else self.telemetry_liveness_retries
+            ),
+        )
+        delay = max(
+            0.0,
+            float(
+                retry_delay
+                if retry_delay is not None
+                else self.telemetry_liveness_interval_seconds
+            ),
+        )
+
+        if not self.telemetry_liveness_enabled or not self._read_from_cache():
+            return {
+                "verified": True,
+                "telemetry_policy": "training_required_queue_metrics",
+                "required_qids": required_qids,
+                "required_labels": labels,
+                "window_seconds": seconds,
+                "retries": attempts,
+                "per_queue": {},
+                "missing": {},
+                "errors": [],
+                "note": (
+                    "Training-style cache freshness gate bypassed because "
+                    "cache telemetry liveness is disabled or unavailable; "
+                    "per-step data_valid remains enforced."
+                ),
+            }
+
+        report = None
+        missing: Dict[int, List[str]] = {}
+        for attempt in range(1, attempts + 1):
+            report = self._cache_freshness(
+                qids=required_qids,
+                window_seconds=seconds,
+            )
+            self._last_telemetry_freshness = report
+            missing = self._freshness_missing_required(report, required_qids)
+            if not missing:
+                break
+            if attempt < attempts and delay > 0:
+                time.sleep(delay)
+
+        queues = (report or {}).get("queues", {}) if report else {}
+        per_queue = {}
+        for qid in required_qids:
+            by_label = queues.get(str(qid), {}) if queues else {}
+            missing_labels = list(missing.get(qid, []))
+            per_queue[qid] = {
+                "valid": not missing_labels,
+                "missing_labels": missing_labels,
+                "labels": {
+                    label: by_label.get(label, {}) for label in labels
+                },
+            }
+
+        errors = [
+            f"Q{qid} missing {','.join(missing_labels)}"
+            for qid, missing_labels in sorted(missing.items())
+        ]
+        result = {
+            "verified": not errors,
+            "telemetry_policy": "training_required_queue_metrics",
+            "required_qids": required_qids,
+            "required_labels": labels,
+            "window_seconds": seconds,
+            "retries": attempts,
+            "retry_delay_seconds": delay,
+            "epoch_id": (report or {}).get("epoch_id") if report else None,
+            "window": (report or {}).get("window") if report else None,
+            "per_queue": per_queue,
+            "missing": missing,
+            "errors": errors,
+        }
+        if errors and raise_on_error:
+            raise RuntimeError(
+                "Required telemetry freshness verification failed: "
+                + "; ".join(errors)
+            )
+        return result
+
     def _query_aggregated_metrics(self, start: str, stop: str, step: int) -> Dict:
         """
         Query aggregated p95 metrics for all queues.
@@ -3148,6 +3291,495 @@ class QoSRoutingEnv:
         weighted_actions = (self._actions_buffer * DECAY_WEIGHTS[:, np.newaxis]).ravel()
 
         return np.concatenate([weighted_obs, weighted_actions])
+
+    def _queue_feature_index(self, qid: int, feature_idx: int) -> Optional[int]:
+        """Return the raw-state index for a queue-local feature."""
+        try:
+            qpos = tuple(QIDS).index(int(qid))
+        except ValueError:
+            return None
+        return qpos * QUEUE_FEATURE_STRIDE + feature_idx
+
+    def _recent_queue_feature_values(self, qid: int, feature_idx: int) -> List[float]:
+        """Read a queue-local feature from the unweighted frame stack."""
+        idx = self._queue_feature_index(qid, feature_idx)
+        if idx is None:
+            return []
+
+        values: List[float] = []
+        for frame in list(getattr(self, "frame_stack", []) or []):
+            arr = np.asarray(frame)
+            if arr.size <= idx:
+                continue
+            value = float(arr[idx])
+            if np.isfinite(value):
+                values.append(value)
+        return values
+
+    def _snapshot_queue_norms(
+        self,
+        qid: int,
+        snapshot: Optional[Dict[int, Dict]],
+    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Return current ratio/drop/util normalized like the raw state."""
+        if not snapshot or qid not in snapshot:
+            return None, None, None
+        q = snapshot.get(qid) or {}
+
+        ratio = None
+        try:
+            ratio = float(q.get('lat_p95')) / float(SLA_THRESHOLDS[qid])
+            ratio = min(max(ratio, 0.0), LAT_RATIO_CAP)
+        except (TypeError, ValueError, KeyError, ZeroDivisionError):
+            ratio = None
+
+        drop_norm = None
+        try:
+            drop_norm = min(max(float(q.get('drop_p95', 0.0)), 0.0), DROP_CAP) / DROP_CAP
+        except (TypeError, ValueError):
+            drop_norm = None
+
+        util_norm = None
+        try:
+            util_norm = min(max(float(q.get('util_p95', 0.0)), 0.0), UTIL_CAP) / UTIL_CAP
+        except (TypeError, ValueError):
+            util_norm = None
+
+        return ratio, drop_norm, util_norm
+
+    def _queue_feature_series(
+        self,
+        qid: int,
+        feature_idx: int,
+        snapshot_value: Optional[float],
+    ) -> np.ndarray:
+        """Combine recent stack values with the current pre-action snapshot."""
+        values = self._recent_queue_feature_values(qid, feature_idx)
+        if snapshot_value is not None and np.isfinite(snapshot_value):
+            current = float(snapshot_value)
+            if not values or abs(values[-1] - current) > 1e-6:
+                values.append(current)
+        values = values[-STACK_SIZE:]
+        return np.asarray(values, dtype=np.float32)
+
+    @staticmethod
+    def _series_tail(values: np.ndarray, window: int) -> np.ndarray:
+        if values.size == 0:
+            return np.asarray([0.0], dtype=np.float32)
+        return values[-min(window, values.size):]
+
+    @classmethod
+    def _series_mean(cls, values: np.ndarray, window: int) -> float:
+        tail = cls._series_tail(values, window)
+        return float(np.mean(tail))
+
+    @classmethod
+    def _series_max(cls, values: np.ndarray, window: int) -> float:
+        tail = cls._series_tail(values, window)
+        return float(np.max(tail))
+
+    @classmethod
+    def _series_slope(cls, values: np.ndarray, window: int) -> float:
+        tail = cls._series_tail(values, window)
+        if tail.size < 2:
+            return 0.0
+        return float(tail[-1] - tail[0])
+
+    @classmethod
+    def _series_persistence(cls, values: np.ndarray, window: int, threshold: float) -> int:
+        tail = cls._series_tail(values, window)
+        return int(np.sum(tail > threshold))
+
+    def _queue_intervention_context(
+        self,
+        qid: int,
+        snapshot: Optional[Dict[int, Dict]],
+    ) -> Dict[str, Any]:
+        """Classify whether a queue needs intervention using stack history."""
+        ratio_now, drop_now, util_now = self._snapshot_queue_norms(qid, snapshot)
+        ratios = self._queue_feature_series(
+            qid, QUEUE_FEATURE_LAT_RATIO, ratio_now
+        )
+        drops = self._queue_feature_series(
+            qid, QUEUE_FEATURE_DROP_NORM, drop_now
+        )
+        utils = self._queue_feature_series(
+            qid, QUEUE_FEATURE_UTIL_NORM, util_now
+        )
+
+        if ratios.size == 0:
+            ratios = np.asarray([0.0], dtype=np.float32)
+        if drops.size == 0:
+            drops = np.asarray([0.0], dtype=np.float32)
+        if utils.size == 0:
+            utils = np.asarray([0.0], dtype=np.float32)
+
+        current_ratio = float(ratios[-1])
+        current_drop = float(drops[-1])
+        current_util = float(utils[-1])
+
+        slope_3 = self._series_slope(ratios, 3)
+        slope_5 = self._series_slope(ratios, 5)
+        slope_8 = self._series_slope(ratios, 8)
+        drop_trend_3 = self._series_slope(drops, 3)
+        drop_trend_5 = self._series_slope(drops, 5)
+        util_trend_3 = self._series_slope(utils, 3)
+        util_trend_5 = self._series_slope(utils, 5)
+
+        persistence_3_90 = self._series_persistence(ratios, 3, 0.90)
+        persistence_5_90 = self._series_persistence(ratios, 5, 0.90)
+        persistence_8_90 = self._series_persistence(ratios, 8, 0.90)
+        persistence_3_95 = self._series_persistence(ratios, 3, 0.95)
+        persistence_5_95 = self._series_persistence(ratios, 5, 0.95)
+        persistence_8_95 = self._series_persistence(ratios, 8, 0.95)
+        persistence_3_100 = self._series_persistence(ratios, 3, 1.00)
+        persistence_5_100 = self._series_persistence(ratios, 5, 1.00)
+        persistence_8_100 = self._series_persistence(ratios, 8, 1.00)
+
+        clear_violation = current_ratio >= SLA_MARGIN_HIGH
+        recent_clear = self._series_max(ratios, 8) >= SLA_MARGIN_HIGH
+        recovering = (
+            not clear_violation
+            and current_ratio >= 0.95
+            and recent_clear
+            and slope_3 <= -0.03
+        )
+        persistent_buildup = (
+            not clear_violation
+            and not recovering
+            and (
+                persistence_5_95 >= 3
+                or persistence_5_90 >= 4
+                or persistence_8_90 >= 5
+                or persistence_5_100 >= 2
+            )
+            and (
+                slope_5 >= 0.02
+                or slope_8 >= 0.05
+                or self._series_max(ratios, 5) >= 1.0
+                or drop_trend_5 >= 0.05
+                or util_trend_5 >= 0.05
+            )
+        )
+        short_spike = (
+            not clear_violation
+            and not persistent_buildup
+            and not recovering
+            and (
+                current_ratio >= 0.95
+                or self._series_max(ratios, 3) >= 0.95
+                or current_drop >= 0.20
+            )
+            and persistence_5_95 <= 2
+            and persistence_5_100 <= 1
+        )
+
+        if clear_violation:
+            context = "clear_violation"
+        elif recovering:
+            context = "recovering"
+        elif persistent_buildup:
+            context = "persistent_buildup"
+        elif short_spike:
+            context = "short_spike"
+        else:
+            context = "stable"
+
+        steps_since_action = int(
+            max(0, getattr(self, "global_step", 0) - getattr(self, "_last_action_global_step", 0))
+        )
+
+        return {
+            "intervention_context": context,
+            "target_ratio": current_ratio,
+            "target_mean_3": self._series_mean(ratios, 3),
+            "target_mean_5": self._series_mean(ratios, 5),
+            "target_mean_8": self._series_mean(ratios, 8),
+            "target_slope_3": slope_3,
+            "target_slope_5": slope_5,
+            "target_slope_8": slope_8,
+            "target_persistence_3": persistence_3_95,
+            "target_persistence_5": persistence_5_95,
+            "target_persistence_8": persistence_8_95,
+            "target_persistence_3_above_0_90": persistence_3_90,
+            "target_persistence_5_above_0_90": persistence_5_90,
+            "target_persistence_8_above_0_90": persistence_8_90,
+            "target_persistence_3_above_1_00": persistence_3_100,
+            "target_persistence_5_above_1_00": persistence_5_100,
+            "target_persistence_8_above_1_00": persistence_8_100,
+            "target_drop_norm": current_drop,
+            "target_drop_trend": drop_trend_3,
+            "target_drop_trend_3": drop_trend_3,
+            "target_drop_trend_5": drop_trend_5,
+            "target_util_norm": current_util,
+            "target_util_trend": util_trend_3,
+            "target_util_trend_3": util_trend_3,
+            "target_util_trend_5": util_trend_5,
+            "steps_since_last_action": steps_since_action,
+        }
+
+    @staticmethod
+    def _intervention_rank(context: str) -> int:
+        return {
+            "stable": 0,
+            "short_spike": 1,
+            "recovering": 2,
+            "persistent_buildup": 3,
+            "clear_violation": 4,
+        }.get(context, 0)
+
+    def _network_intervention_context(
+        self,
+        snapshot: Optional[Dict[int, Dict]],
+    ) -> Dict[str, Any]:
+        """Classify network-level pressure while preserving broad action masks."""
+        required_qids = list(self._required_qids_for_current_profile())
+        queue_contexts = {
+            qid: self._queue_intervention_context(qid, snapshot)
+            for qid in required_qids
+        }
+
+        clear_count = sum(
+            1 for ctx in queue_contexts.values()
+            if ctx["intervention_context"] == "clear_violation"
+        )
+        elevated_count = sum(
+            1 for ctx in queue_contexts.values()
+            if ctx["intervention_context"] in (
+                "persistent_buildup", "recovering", "clear_violation"
+            )
+        )
+        drop_pressure_count = sum(
+            1 for ctx in queue_contexts.values()
+            if float(ctx.get("target_drop_norm", 0.0)) >= 0.30
+        )
+        severe_multi_queue = (
+            clear_count >= 2
+            or (clear_count >= 1 and (elevated_count >= 2 or drop_pressure_count >= 2))
+        )
+
+        dominant_qid = None
+        dominant_ctx: Dict[str, Any] = {}
+        if queue_contexts:
+            dominant_qid, dominant_ctx = max(
+                queue_contexts.items(),
+                key=lambda item: (
+                    self._intervention_rank(item[1]["intervention_context"]),
+                    float(item[1].get("target_ratio", 0.0)),
+                    float(item[1].get("target_drop_norm", 0.0)),
+                ),
+            )
+
+        return {
+            "network_intervention_context": (
+                "severe_multi_queue" if severe_multi_queue else "normal"
+            ),
+            "severe_multi_queue": severe_multi_queue,
+            "clear_violation_count": clear_count,
+            "elevated_queue_count": elevated_count,
+            "drop_pressure_count": drop_pressure_count,
+            "dominant_qid": dominant_qid,
+            "dominant_context": dominant_ctx.get("intervention_context", "stable"),
+            "dominant_queue_context": dominant_ctx,
+            "queue_contexts": queue_contexts,
+        }
+
+    def _action_id_from_onehot(self, onehot: np.ndarray) -> int:
+        arr = np.asarray(onehot)
+        if arr.size == 0 or float(np.max(arr)) <= 0.0:
+            return 0
+        action = int(np.argmax(arr))
+        if action < 0 or action >= ACTION_DIM:
+            return 0
+        return action
+
+    def _action_repeat_context(self, action: int) -> Dict[str, Any]:
+        """Summarize recent same-queue and exact reroute attempts."""
+        mapping = self.ACTION_MAP.get(action)
+        if not isinstance(mapping, tuple):
+            return {
+                "same_queue_repeat": False,
+                "exact_action_repeat": False,
+                "same_queue_repeat_count_3": 0,
+                "same_queue_repeat_count_5": 0,
+                "exact_action_repeat_count_3": 0,
+                "exact_action_repeat_count_5": 0,
+            }
+
+        target_qid = mapping[0]
+        recent_actions = [
+            self._action_id_from_onehot(onehot)
+            for onehot in list(getattr(self, "action_stack", []) or [])
+        ]
+
+        def same_queue_count(window: int) -> int:
+            count = 0
+            for previous_action in recent_actions[-window:]:
+                previous_mapping = self.ACTION_MAP.get(previous_action)
+                if isinstance(previous_mapping, tuple) and previous_mapping[0] == target_qid:
+                    count += 1
+            return count
+
+        def exact_count(window: int) -> int:
+            return sum(1 for previous_action in recent_actions[-window:] if previous_action == action)
+
+        same_3 = same_queue_count(3)
+        same_5 = same_queue_count(5)
+        exact_3 = exact_count(3)
+        exact_5 = exact_count(5)
+        return {
+            "same_queue_repeat": same_3 > 0,
+            "exact_action_repeat": exact_3 > 0,
+            "same_queue_repeat_count_3": same_3,
+            "same_queue_repeat_count_5": same_5,
+            "exact_action_repeat_count_3": exact_3,
+            "exact_action_repeat_count_5": exact_5,
+        }
+
+    def _all_required_sla_within_margin(
+        self,
+        snapshot: Optional[Dict[int, Dict]],
+    ) -> bool:
+        if not snapshot:
+            return False
+        for qid in self._required_qids_for_current_profile():
+            ratio, _, _ = self._snapshot_queue_norms(qid, snapshot)
+            if ratio is None or ratio > SLA_MARGIN_HIGH:
+                return False
+        return True
+
+    @staticmethod
+    def _queue_context_log_fields(ctx: Dict[str, Any]) -> Dict[str, Any]:
+        fields = {
+            "intervention_context": "stable",
+            "target_ratio": "",
+            "target_mean_3": "",
+            "target_mean_5": "",
+            "target_mean_8": "",
+            "target_slope_3": "",
+            "target_slope_5": "",
+            "target_persistence_3": "",
+            "target_persistence_5": "",
+            "target_persistence_8": "",
+            "target_drop_trend": "",
+            "target_util_trend": "",
+            "steps_since_last_action": "",
+        }
+        for key in fields:
+            if key in ctx:
+                fields[key] = ctx[key]
+        return fields
+
+    def _contextual_action_cost_info(
+        self,
+        action: int,
+        snapshot: Optional[Dict[int, Dict]],
+        reroute_count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Compute soft intervention cost and diagnostics for an action."""
+        network_ctx = self._network_intervention_context(snapshot)
+        dominant_ctx = network_ctx.get("dominant_queue_context", {})
+        info: Dict[str, Any] = {
+            **self._queue_context_log_fields(dominant_ctx),
+            "network_intervention_context": network_ctx["network_intervention_context"],
+            "severe_multi_queue": network_ctx["severe_multi_queue"],
+            "clear_violation_count": network_ctx["clear_violation_count"],
+            "elevated_queue_count": network_ctx["elevated_queue_count"],
+            "same_queue_repeat": False,
+            "exact_action_repeat": False,
+            "same_queue_repeat_count_3": 0,
+            "same_queue_repeat_count_5": 0,
+            "exact_action_repeat_count_3": 0,
+            "exact_action_repeat_count_5": 0,
+            "repeat_penalty": 0.0,
+            "all_sla_penalty": 0.0,
+            "base_action_cost": 0.0,
+            "final_action_cost": 0.0,
+            "outcome_class": "",
+            "outcome_shaping": 0.0,
+        }
+
+        mapping = self.ACTION_MAP.get(action)
+        if action == 0 or mapping is None:
+            return info
+
+        if mapping == 'multi':
+            count = int(reroute_count or network_ctx["clear_violation_count"] or 1)
+            base = (
+                ACTION_COST_SEVERE_MULTI
+                if network_ctx["severe_multi_queue"]
+                else ACTION_COST_CLEAR_VIOLATION
+            )
+            info.update({
+                "intervention_context": (
+                    "severe_multi_queue"
+                    if network_ctx["severe_multi_queue"]
+                    else info.get("intervention_context", "stable")
+                ),
+                "base_action_cost": base,
+                "final_action_cost": base * max(1, count),
+                "targeted_qid": -1,
+                "multi_reroute_count": count,
+            })
+            return info
+
+        targeted_qid, _alt_idx = mapping
+        q_ctx = self._queue_intervention_context(targeted_qid, snapshot)
+        repeat_ctx = self._action_repeat_context(action)
+        context = q_ctx["intervention_context"]
+        target_ratio = float(q_ctx.get("target_ratio", 0.0) or 0.0)
+        severe_target = (
+            network_ctx["severe_multi_queue"]
+            and (
+                context in ("clear_violation", "persistent_buildup", "recovering")
+                or target_ratio > 1.0
+            )
+        )
+
+        if severe_target and context == "clear_violation":
+            base_cost = ACTION_COST_SEVERE_MULTI
+        elif context == "clear_violation":
+            base_cost = ACTION_COST_CLEAR_VIOLATION
+        elif severe_target:
+            base_cost = ACTION_COST_CLEAR_VIOLATION
+        elif context == "persistent_buildup":
+            base_cost = ACTION_COST_PERSISTENT_BUILDUP
+        elif context == "recovering":
+            base_cost = ACTION_COST_RECOVERING
+        elif context == "short_spike":
+            base_cost = ACTION_COST_SHORT_SPIKE
+        else:
+            base_cost = ACTION_COST_STABLE
+
+        all_sla_penalty = 0.0
+        if (
+            self._all_required_sla_within_margin(snapshot)
+            and context not in ("persistent_buildup", "clear_violation", "recovering")
+            and not severe_target
+        ):
+            all_sla_penalty = ACTION_COST_ALL_SLA_MET_EXTRA
+
+        repeat_penalty = 0.0
+        if context in ("stable", "short_spike"):
+            if repeat_ctx["exact_action_repeat"]:
+                repeat_penalty = ACTION_COST_EXACT_REPEAT_EXTRA
+            elif repeat_ctx["same_queue_repeat"]:
+                repeat_penalty = ACTION_COST_SAME_QUEUE_REPEAT_EXTRA
+        elif context == "recovering" and target_ratio > 1.0:
+            if repeat_ctx["same_queue_repeat"] or repeat_ctx["exact_action_repeat"]:
+                repeat_penalty = ACTION_COST_RECOVERING_REPEAT_EXTRA
+
+        final_cost = base_cost + all_sla_penalty + repeat_penalty
+        info.update(self._queue_context_log_fields(q_ctx))
+        info.update(repeat_ctx)
+        info.update({
+            "targeted_qid": targeted_qid,
+            "repeat_penalty": repeat_penalty,
+            "all_sla_penalty": all_sla_penalty,
+            "base_action_cost": base_cost,
+            "final_action_cost": final_cost,
+        })
+        return info
     
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
@@ -3603,62 +4235,29 @@ class QoSRoutingEnv:
         
         info['pressure'] = pressure  # Always available for logging
         
-        # Apply queue-specific action cost ONLY for successful actions
-        # Cost depends on whether the TARGETED queue's SLA is met
+        # Apply context-derived action cost ONLY for successful actions. The
+        # helper uses frame_stack/action_stack history without adding new inputs
+        # to the DQN observation.
+        mapping = self.ACTION_MAP.get(action)
+        cost_info = self._contextual_action_cost_info(
+            action,
+            current_snapshot,
+            reroute_count=(alt_idx if mapping == 'multi' else None),
+        )
+        info.update(cost_info)
         if action != 0 and action_applied:
-            # Get which queue this action targets
-            mapping = self.ACTION_MAP.get(action)
-            
-            if mapping == 'multi':
-                # Multi-action: cost based on number of queues rerouted
-                # alt_idx contains reroute_count for multi-action
-                reroute_count = alt_idx if alt_idx else 0
-                # Use sick cost per rerouted queue (they were all violating)
-                action_cost = reroute_count * REWARD_ACTION_COST_SICK
-                targeted_qid = -1  # Sentinel for multi-action
-                info['multi_reroute_count'] = reroute_count
-            elif mapping is not None:
-                # Single-queue action: extract targeted queue ID
-                targeted_qid = mapping[0]
-                
-                # Check targeted queue's health using TREND-BASED logic
-                # We must look at current_snapshot (pre-action), not info/next_snapshot
-                q_pre = current_snapshot[targeted_qid]
-                sla_pre = SLA_THRESHOLDS[targeted_qid]
+            action_cost = float(cost_info.get('final_action_cost', 0.0) or 0.0)
 
-                # Use latency trend (ema_diff) to determine if intervention is needed
-                # Proactive: low cost if latency trending upward (preventive action encouraged)
-                # Conservative: high cost if latency stable/improving (don't disturb)
-                ratio_pre = q_pre['lat_p95'] / sla_pre
-                lat_ema_diff = q_pre.get('lat_ema_diff', 0.0)  # Normalized latency change
-
-                # Decision logic:
-                # 1. If SLA violated (ratio > margin_high) → low cost (must fix)
-                # 2. If SLA met but trending bad (ema_diff > 0.05) → low cost (preventive)
-                # 3. If SLA met and stable/improving → high cost (don't disturb)
-                if ratio_pre > SLA_MARGIN_HIGH:
-                    # Violated: must fix
-                    action_cost = REWARD_ACTION_COST_SICK
-                elif lat_ema_diff > 0.05:  # Latency increasing > 5% of normalized range
-                    # Trending bad: preventive action encouraged
-                    action_cost = REWARD_ACTION_COST_SICK
-                else:
-                    # Stable or improving: high cost to avoid unnecessary changes
-                    action_cost = REWARD_ACTION_COST_HEALTHY
-            else:
-                action_cost = REWARD_ACTION_COST_HEALTHY  # Fallback
-                targeted_qid = None
-            
-            # Apply cost and re-clip with tanh
             raw_reward_with_cost = info['raw_reward'] - action_cost
             reward = 2.5 * np.tanh(raw_reward_with_cost / 2.5)
-            
+
             info['action_cost'] = action_cost
             info['action_cost_applied'] = True
-            info['targeted_qid'] = targeted_qid
         else:
             info['action_cost'] = 0.0
             info['action_cost_applied'] = False
+            if mapping == 'multi' and not action_applied:
+                info['multi_reroute_count'] = 0
         
         # Check episode termination
         sla_total = int(info.get('sla_total', len(QIDS)) or len(QIDS))
@@ -4150,7 +4749,18 @@ class TrainingArtifactLogger:
         "episode_start_telemetry_valid", "telemetry_liveness_missing",
         "recovery_break", "action_applied",
         "action_cost", "action_cost_applied", "targeted_qid", "alt_used",
-        "alt_idx", "multi_reroute_count", "terminated", "truncated",
+        "alt_idx", "multi_reroute_count", "intervention_context",
+        "network_intervention_context", "severe_multi_queue",
+        "target_ratio", "target_mean_3", "target_mean_5",
+        "target_mean_8", "target_persistence_3",
+        "target_persistence_5", "target_persistence_8",
+        "target_slope_3", "target_slope_5", "target_drop_trend",
+        "target_util_trend", "same_queue_repeat", "exact_action_repeat",
+        "same_queue_repeat_count_3", "same_queue_repeat_count_5",
+        "exact_action_repeat_count_3", "exact_action_repeat_count_5",
+        "repeat_penalty", "all_sla_penalty", "base_action_cost",
+        "final_action_cost", "outcome_class", "outcome_shaping",
+        "terminated", "truncated",
     ] + [
         field
         for qid in QIDS
@@ -4298,7 +4908,7 @@ class TrainingArtifactLogger:
                 "min_replay_size": MIN_REPLAY_SIZE,
                 "epsilon_start": EPS_START,
                 "epsilon_end": EPS_END,
-                "epsilon_decay_steps": EPS_DECAY_STEPS,
+                "epsilon_decay_steps": getattr(args, "eps_decay_steps", EPS_DECAY_STEPS),
                 "per_alpha": PER_ALPHA,
                 "per_beta_start": PER_BETA_START,
                 "per_beta_end": PER_BETA_END,
@@ -4319,6 +4929,18 @@ class TrainingArtifactLogger:
                     "action_cost_sick": REWARD_ACTION_COST_SICK,
                     "sla_margin_low": SLA_MARGIN_LOW,
                     "sla_margin_high": SLA_MARGIN_HIGH,
+                    "contextual_action_costs": {
+                        "clear_violation": ACTION_COST_CLEAR_VIOLATION,
+                        "severe_multi_queue": ACTION_COST_SEVERE_MULTI,
+                        "persistent_buildup": ACTION_COST_PERSISTENT_BUILDUP,
+                        "recovering": ACTION_COST_RECOVERING,
+                        "short_spike": ACTION_COST_SHORT_SPIKE,
+                        "stable": ACTION_COST_STABLE,
+                        "all_sla_met_extra": ACTION_COST_ALL_SLA_MET_EXTRA,
+                        "same_queue_repeat_extra": ACTION_COST_SAME_QUEUE_REPEAT_EXTRA,
+                        "exact_action_repeat_extra": ACTION_COST_EXACT_REPEAT_EXTRA,
+                        "recovering_repeat_extra": ACTION_COST_RECOVERING_REPEAT_EXTRA,
+                    },
                 },
             },
             "traffic": {
@@ -4488,6 +5110,32 @@ class TrainingArtifactLogger:
             "alt_used": info.get("alt_used", ""),
             "alt_idx": info.get("alt_idx", ""),
             "multi_reroute_count": info.get("multi_reroute_count", 0),
+            "intervention_context": info.get("intervention_context", ""),
+            "network_intervention_context": info.get("network_intervention_context", ""),
+            "severe_multi_queue": info.get("severe_multi_queue", False),
+            "target_ratio": info.get("target_ratio", ""),
+            "target_mean_3": info.get("target_mean_3", ""),
+            "target_mean_5": info.get("target_mean_5", ""),
+            "target_mean_8": info.get("target_mean_8", ""),
+            "target_persistence_3": info.get("target_persistence_3", ""),
+            "target_persistence_5": info.get("target_persistence_5", ""),
+            "target_persistence_8": info.get("target_persistence_8", ""),
+            "target_slope_3": info.get("target_slope_3", ""),
+            "target_slope_5": info.get("target_slope_5", ""),
+            "target_drop_trend": info.get("target_drop_trend", ""),
+            "target_util_trend": info.get("target_util_trend", ""),
+            "same_queue_repeat": info.get("same_queue_repeat", False),
+            "exact_action_repeat": info.get("exact_action_repeat", False),
+            "same_queue_repeat_count_3": info.get("same_queue_repeat_count_3", 0),
+            "same_queue_repeat_count_5": info.get("same_queue_repeat_count_5", 0),
+            "exact_action_repeat_count_3": info.get("exact_action_repeat_count_3", 0),
+            "exact_action_repeat_count_5": info.get("exact_action_repeat_count_5", 0),
+            "repeat_penalty": info.get("repeat_penalty", 0.0),
+            "all_sla_penalty": info.get("all_sla_penalty", 0.0),
+            "base_action_cost": info.get("base_action_cost", 0.0),
+            "final_action_cost": info.get("final_action_cost", 0.0),
+            "outcome_class": info.get("outcome_class", ""),
+            "outcome_shaping": info.get("outcome_shaping", 0.0),
             "terminated": info.get("terminated"),
             "truncated": info.get("truncated"),
         }
@@ -4766,7 +5414,7 @@ def train(args):
     log.info(f"  Learning rate: {lr}, Gamma: {GAMMA}")
     log.info(f"  Batch size: {BATCH_SIZE}, Replay capacity: {buffer_capacity}")
     log.info(f"  Min replay: {MIN_REPLAY_SIZE}")
-    log.info(f"  Epsilon: {EPS_START} -> {EPS_END} over {EPS_DECAY_STEPS} steps")
+    log.info(f"  Epsilon: {EPS_START} -> {EPS_END} over {args.eps_decay_steps} steps")
     log.info(f"  Timing: Window={WINDOW_SECONDS}s, Delay={DELAY_AFTER_ACTION}s, Cooldown={COOLDOWN_SECONDS}s")
     log.info(f"  Max steps: {args.steps}, Max episode steps: {MAX_EPISODE_STEPS}")
     if args.multi_buffer:
@@ -4813,7 +5461,8 @@ def train(args):
         lr=lr,
         multi_buffer=args.multi_buffer,
         buffer_capacity=buffer_capacity,
-        balanced_sampling=args.balanced_sampling
+        balanced_sampling=args.balanced_sampling,
+        eps_decay_steps=args.eps_decay_steps,
     )
 
     # Set topology for multi-buffer mode
@@ -4835,15 +5484,15 @@ def train(args):
         if resume_path and os.path.exists(resume_path):
             agent.load(resume_path)
             log.info(f"Resumed training from {resume_path}")
+            agent.eps_decay_steps = max(1, int(args.eps_decay_steps))
+            log.info(
+                f"Using epsilon decay window {agent.eps_decay_steps} "
+                "steps for this training stage"
+            )
 
             # Override epsilon if specified
             if args.resume_eps is not None:
-                agent.eps = args.resume_eps
-                # Calculate eps_step_count to match the desired starting epsilon
-                # eps = EPS_END + (EPS_START - EPS_END) * (1 - progress)
-                # Solving for progress: progress = 1 - (eps - EPS_END) / (EPS_START - EPS_END)
-                progress = 1.0 - (args.resume_eps - EPS_END) / (EPS_START - EPS_END)
-                agent.eps_step_count = int(progress * EPS_DECAY_STEPS)
+                agent.set_epsilon_for_decay(args.resume_eps)
                 log.info(f"Reset epsilon to {agent.eps} for resume training (eps_step_count={agent.eps_step_count}, keeping global step count {agent.step_count})")
         else:
             log.warning(f"Checkpoint not found: {resume_path}, starting fresh")
@@ -5449,6 +6098,9 @@ def main():
                         help='Resume training from checkpoint (e.g., 50pct, best, or path to .pth file)')
     parser.add_argument('--resume-eps', type=float, default=None,
                         help='Reset epsilon to this value when resuming (e.g., 0.10)')
+    parser.add_argument('--eps-decay-steps', type=int, default=EPS_DECAY_STEPS,
+                        help=f'Epsilon decay window for this training run '
+                             f'(default: {EPS_DECAY_STEPS})')
     parser.add_argument('--traffic-weights', type=str, default=None,
                         help='Traffic category weights as "light:0.2,medium:0.3,high:0.5"')
     parser.add_argument('--traffic-profile-weights', type=str, default=None,

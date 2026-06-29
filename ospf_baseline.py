@@ -159,26 +159,33 @@ class OSPFBenchmark:
             "traffic_processes": traffic_state,
             "traffic_profile_warmup": warmup_state,
         }
-        expected_flow_ids = [
-            flow_id for _, _, flow_id in self.traffic_manager.traffic_pairs
-        ]
         telemetry_window_seconds = (
             self.traffic_manager.telemetry_coverage_window_seconds(
                 max(5.0, self.args.warmup_seconds)
             )
         )
-        telemetry_state = self.env.verify_telemetry_flow_coverage(
-            expected_flow_ids,
-            window_seconds=telemetry_window_seconds,
+        telemetry_readiness_window_seconds = float(
+            self.env.telemetry_liveness_window_seconds
+        )
+        telemetry_state = self.env.verify_required_telemetry_freshness(
+            window_seconds=telemetry_readiness_window_seconds,
             raise_on_error=True,
         )
-        self.routing_state["telemetry_flow_coverage"] = telemetry_state
+        self.routing_state["telemetry_required_metrics"] = telemetry_state
         log.info("Verified OSPF forwarding tables on all switches")
-        log.info("Verified telemetry coverage for every OSPF demand and queue")
+        log.info("Verified required queue telemetry for OSPF")
         measurement_shaping = self.traffic_manager.begin_measurement()
         if measurement_shaping:
             self.routing_state["measurement_shaping"] = measurement_shaping
             traffic_state["sender_rate_shaping"] = measurement_shaping
+        post_measurement_traffic_state = self.traffic_manager.verify_exact_processes(
+            raise_on_error=True
+        )
+        traffic_state["post_measurement"] = post_measurement_traffic_state
+        traffic_state["verified"] = bool(
+            traffic_state["verified"]
+            and post_measurement_traffic_state["verified"]
+        )
         self.visualization_file = VisualizationPathFile(self.args.paths_file)
         self.visualization_file.publish(self._visualization_data())
         log.info(
@@ -296,17 +303,16 @@ class OSPFBenchmark:
                 + "; ".join(final_traffic_state["errors"])
             )
 
-        final_telemetry_state = self.env.verify_telemetry_flow_coverage(
-            expected_flow_ids,
-            window_seconds=telemetry_window_seconds,
+        final_telemetry_state = self.env.verify_required_telemetry_freshness(
+            window_seconds=telemetry_readiness_window_seconds,
             raise_on_error=False,
         )
         telemetry_state["final"] = final_telemetry_state
         telemetry_state["final_verified"] = bool(final_telemetry_state["verified"])
         if not final_telemetry_state["verified"]:
             log.warning(
-                "Final OSPF telemetry coverage audit failed; preserving measured "
-                "run because initial coverage, traffic health, and per-step telemetry "
+                "Final OSPF required telemetry audit failed; preserving measured "
+                "run because initial readiness, traffic health, and per-step telemetry "
                 "validity are enforced: "
                 + "; ".join(final_telemetry_state["errors"])
             )
@@ -358,7 +364,7 @@ class OSPFBenchmark:
         log.info(f"  CSV: {output_path}")
         log.info("  Routing state: VERIFIED")
         log.info("  Traffic process state: VERIFIED")
-        log.info("  Telemetry flow coverage: VERIFIED")
+        log.info("  Required telemetry: VERIFIED")
         log.info("=" * 68)
 
         if self.args.summary_json:

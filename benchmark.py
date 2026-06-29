@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reproducible RL vs ECMP vs OSPF routing benchmark orchestrator.
+Reproducible routing benchmark orchestrator.
 
 The independent experimental unit is one complete run. Traffic seeds are
 paired across methods inside each (profile, repetition) block, while method
@@ -38,6 +38,17 @@ from traffic_generator import TrafficManager
 
 
 METHODS = ("rl", "ecmp", "ospf")
+METHOD_DESCRIPTIONS = {
+    "rl": "Greedy trained DQN policy with queue-specific rerouting.",
+    "ecmp": (
+        "Queue-independent CRC16 hash over source/destination IP "
+        "and per-switch group ID across equal-cost next hops."
+    ),
+    "ospf": (
+        "Centralized steady-state single shortest-path SPF model; "
+        "identical forwarding path for all DSCP values; no ECMP."
+    ),
+}
 QIDS = (0, 1, 7)
 
 # Primary metrics selected before the experiment. Positive direction means
@@ -336,6 +347,20 @@ def validate_runner_summary(item: Dict, path: Path) -> Tuple[Dict, List[str]]:
     routing_state = payload.get("routing_state")
     if not isinstance(routing_state, dict) or routing_state.get("verified") is not True:
         errors.append("routing_state evidence is missing or unverified")
+    traffic_processes = (
+        routing_state.get("traffic_processes")
+        if isinstance(routing_state, dict)
+        else None
+    )
+    if (
+        not isinstance(traffic_processes, dict)
+        or traffic_processes.get("verified") is not True
+    ):
+        errors.append("traffic process evidence is missing or unverified")
+    elif not isinstance(traffic_processes.get("post_measurement"), dict):
+        errors.append("post-measurement traffic verification is missing")
+    elif traffic_processes["post_measurement"].get("verified") is not True:
+        errors.append("post-measurement traffic verification is not true")
     if item["method"] == "ecmp" and not (
         isinstance(routing_state, dict) and routing_state.get("plan_sha256")
     ):
@@ -471,20 +496,36 @@ class BenchmarkOrchestrator:
         unknown = sorted(set(self.args.profiles) - available_profiles)
         if unknown:
             raise RuntimeError(f"Unknown traffic profiles: {unknown}")
+        unknown_methods = [
+            method for method in self.args.methods if method not in METHODS
+        ]
+        if unknown_methods:
+            raise RuntimeError(
+                f"Unknown benchmark methods: {unknown_methods}; "
+                f"valid methods are {list(METHODS)}"
+            )
+        if len(set(self.args.methods)) != len(self.args.methods):
+            raise RuntimeError(
+                f"Duplicate benchmark methods are not allowed: {self.args.methods}"
+            )
+        if not self.args.methods:
+            raise RuntimeError("At least one benchmark method is required")
         if "high_2" in self.args.profiles and not self.args.allow_high_2:
             raise RuntimeError(
                 "high_2 is disabled by project guidance; use --allow-high-2 "
                 "only if you intentionally accept CPU-overload risk"
             )
+        method_order_cycle = math.factorial(len(self.args.methods))
         if self.args.repetitions < 2:
             print(
                 "WARNING: fewer than 2 repetitions cannot estimate variance.",
                 flush=True,
             )
-        elif self.args.repetitions < 6:
+        elif self.args.repetitions < method_order_cycle:
             print(
-                "WARNING: use at least 6 repetitions for a complete balanced "
-                "method-order cycle; 12+ is recommended for paper results.",
+                f"WARNING: use at least {method_order_cycle} repetitions for "
+                "a complete balanced method-order cycle; 12+ is recommended "
+                "for paper results.",
                 flush=True,
             )
 
@@ -494,7 +535,7 @@ class BenchmarkOrchestrator:
         normalize_artifact_permissions(self.output_dir / "runs", dir_mode=0o775)
 
     def build_schedule(self) -> None:
-        permutations = list(itertools.permutations(METHODS))
+        permutations = list(itertools.permutations(self.args.methods))
         rng = random.Random(self.args.schedule_seed)
         rng.shuffle(permutations)
 
@@ -539,7 +580,7 @@ class BenchmarkOrchestrator:
 
     def write_manifest(self) -> None:
         checkpoint = self._checkpoint_path()
-        if checkpoint is None:
+        if checkpoint is None and "rl" in self.args.methods:
             raise RuntimeError(
                 f"No RL checkpoint for tag {self.args.weights_tag!r} "
                 f"in {self.args.save_dir}"
@@ -557,8 +598,8 @@ class BenchmarkOrchestrator:
             "config_sha256": file_sha256(Path(self.args.config)),
             "p4_source_sha256": file_sha256(Path("p4src/int_md.p4")),
             "runtime_topology_sha256": file_sha256(Path("/tmp/topology.json")),
-            "rl_checkpoint": str(checkpoint.resolve()),
-            "rl_checkpoint_sha256": file_sha256(checkpoint),
+            "rl_checkpoint": str(checkpoint.resolve()) if checkpoint else None,
+            "rl_checkpoint_sha256": file_sha256(checkpoint) if checkpoint else None,
             "source_artifact_hashes": {
                 path: file_sha256(Path(path))
                 for path in (
@@ -579,15 +620,8 @@ class BenchmarkOrchestrator:
             },
             "arguments": vars(self.args),
             "methods": {
-                "rl": "Greedy trained DQN policy with queue-specific rerouting.",
-                "ecmp": (
-                    "Queue-independent CRC16 hash over source/destination IP "
-                    "and per-switch group ID across equal-cost next hops."
-                ),
-                "ospf": (
-                    "Centralized steady-state single shortest-path SPF model; "
-                    "identical forwarding path for all DSCP values; no ECMP."
-                ),
+                method: METHOD_DESCRIPTIONS[method]
+                for method in self.args.methods
             },
             "experimental_design": {
                 "unit": "one complete run",
@@ -595,7 +629,7 @@ class BenchmarkOrchestrator:
                     "dimensionless inverse bandwidth, normalized so the "
                     "fastest configured link has cost 100"
                 ),
-                "pairing": "same profile and traffic seed across all methods",
+                "pairing": "same profile and traffic seed across selected methods",
                 "order_control": "balanced deterministic permutations",
                 "warmup_excluded_seconds": self.args.warmup_seconds,
                 "measurement_settle_excluded_seconds": (
@@ -618,8 +652,9 @@ class BenchmarkOrchestrator:
                 "treatment_integrity": (
                     "P4 tables are cleared and read back before measurement; "
                     "ECMP entries are read back at start and end; traffic "
-                    "process counts and all-flow telemetry coverage are "
-                    "verified at start and end; traffic restarts invalidate runs"
+                    "process counts and training-style required queue telemetry "
+                    "freshness are verified at start and end; traffic restarts "
+                    "invalidate runs"
                 ),
             },
             "schedule": self.schedule,
@@ -1058,9 +1093,13 @@ class BenchmarkOrchestrator:
             for row in successful
         }
         comparisons = []
+        if "rl" not in self.args.methods:
+            return comparisons
 
         for profile in self.args.profiles:
             for baseline in ("ospf", "ecmp"):
+                if baseline not in self.args.methods:
+                    continue
                 for metric, direction in PRIMARY_METRICS.items():
                     pairs = []
                     for repetition in range(1, self.args.repetitions + 1):
@@ -1222,7 +1261,7 @@ class BenchmarkOrchestrator:
                 f"Mean drops/100ms [{confidence_label}] "
                 f"Mean reward [{confidence_label}]"
             )
-            for method in METHODS:
+            for method in self.args.methods:
                 def item(metric: str) -> Dict:
                     return aggregate.get(
                         (profile, method, metric),
@@ -1246,59 +1285,68 @@ class BenchmarkOrchestrator:
                     f"{reward['mean']:>8.4f} [{reward['ci_low']:>8.4f}, {reward['ci_high']:>8.4f}]"
                 )
 
-            lines.append("  ECMP independent-run audit:")
-            ecmp_runs = sorted(
-                (
-                    row
-                    for row in all_results
-                    if row.get("profile") == profile
-                    and row.get("method") == "ecmp"
-                ),
-                key=lambda row: int(row.get("repetition", 0)),
-            )
-            if not ecmp_runs:
-                lines.append("    none")
-            for row in ecmp_runs:
-                verified = (
-                    "yes"
-                    if row.get("routing_state_verified") is True
-                    else "NO"
+            if "ecmp" in self.args.methods:
+                lines.append("  ECMP independent-run audit:")
+                ecmp_runs = sorted(
+                    (
+                        row
+                        for row in all_results
+                        if row.get("profile") == profile
+                        and row.get("method") == "ecmp"
+                    ),
+                    key=lambda row: int(row.get("repetition", 0)),
                 )
-                traffic_verified = (
-                    "yes"
-                    if row.get("traffic_state_verified") is True
-                    else "NO"
-                )
-                telemetry_verified = (
-                    "yes"
-                    if row.get("telemetry_state_verified") is True
-                    else "NO"
-                )
-                ecmp_path_audit = _audit_text(
-                    row.get("ecmp_path_audit_verified")
-                )
-                lines.append(
-                    f"    rep={int(row.get('repetition', 0)):>2} "
-                    f"seed={int(row.get('seed', 0)):>5} "
-                    f"order={int(row.get('order_index', 0))} "
-                    f"status={row.get('status', 'unknown'):<7} "
-                    f"routing_verified={verified:<3} "
-                    f"traffic_verified={traffic_verified:<3} "
-                    f"telemetry_verified={telemetry_verified:<3} "
-                    f"SLA met={float(row.get('sla_compliance_valid_pct', math.nan)):>7.2f}% "
-                    f"reward={float(row.get('reward_mean_valid', math.nan)):>8.4f} "
-                    f"ecmp_path={ecmp_path_audit:<3} "
-                    f"mismatches={_count_text(row.get('ecmp_path_mismatch_count'))} "
-                    f"qsplit={_count_text(row.get('ecmp_queue_independence_violations'))}"
-                )
-                if row.get("top_bottleneck_egress"):
-                    lines.append(
-                        f"      top_bottleneck={row.get('top_bottleneck_egress')} "
-                        f"p95_util={_percent_text(row.get('top_bottleneck_p95_util'))} "
-                        f"flows={_count_text(row.get('top_bottleneck_flow_count'))}"
+                if not ecmp_runs:
+                    lines.append("    none")
+                for row in ecmp_runs:
+                    verified = (
+                        "yes"
+                        if row.get("routing_state_verified") is True
+                        else "NO"
                     )
+                    traffic_verified = (
+                        "yes"
+                        if row.get("traffic_state_verified") is True
+                        else "NO"
+                    )
+                    telemetry_verified = (
+                        "yes"
+                        if row.get("telemetry_state_verified") is True
+                        else "NO"
+                    )
+                    ecmp_path_audit = _audit_text(
+                        row.get("ecmp_path_audit_verified")
+                    )
+                    lines.append(
+                        f"    rep={int(row.get('repetition', 0)):>2} "
+                        f"seed={int(row.get('seed', 0)):>5} "
+                        f"order={int(row.get('order_index', 0))} "
+                        f"status={row.get('status', 'unknown'):<7} "
+                        f"routing_verified={verified:<3} "
+                        f"traffic_verified={traffic_verified:<3} "
+                        f"telemetry_verified={telemetry_verified:<3} "
+                        f"SLA met={float(row.get('sla_compliance_valid_pct', math.nan)):>7.2f}% "
+                        f"reward={float(row.get('reward_mean_valid', math.nan)):>8.4f} "
+                        f"ecmp_path={ecmp_path_audit:<3} "
+                        f"mismatches={_count_text(row.get('ecmp_path_mismatch_count'))} "
+                        f"qsplit={_count_text(row.get('ecmp_queue_independence_violations'))}"
+                    )
+                    if row.get("top_bottleneck_egress"):
+                        lines.append(
+                            f"      top_bottleneck={row.get('top_bottleneck_egress')} "
+                            f"p95_util={_percent_text(row.get('top_bottleneck_p95_util'))} "
+                            f"flows={_count_text(row.get('top_bottleneck_flow_count'))}"
+                        )
+            if "rl" not in self.args.methods:
+                continue
+            selected_baselines = [
+                method for method in ("ospf", "ecmp")
+                if method in self.args.methods
+            ]
+            if not selected_baselines:
+                continue
             lines.append("  Paired RL comparisons (positive improvement favors RL):")
-            for baseline in ("ospf", "ecmp"):
+            for baseline in selected_baselines:
                 selected = [
                     row
                     for row in comparison_rows
@@ -1410,7 +1458,8 @@ class BenchmarkOrchestrator:
             f"Benchmark directory: {self.output_dir.resolve()}\n"
             f"Planned runs: {len(self.schedule)} "
             f"({len(self.args.profiles)} profiles × "
-            f"{self.args.repetitions} repetitions × 3 methods)\n"
+            f"{self.args.repetitions} repetitions × "
+            f"{len(self.args.methods)} methods)\n"
             f"Approximate minimum runtime: {expected_seconds / 3600:.2f} hours",
             flush=True,
         )
@@ -1457,7 +1506,7 @@ class BenchmarkOrchestrator:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Paper-oriented RL/ECMP/OSPF routing benchmark"
+        description="Paper-oriented routing benchmark"
     )
     parser.add_argument(
         "--config",
@@ -1467,6 +1516,14 @@ def parse_args() -> argparse.Namespace:
         "--profiles",
         default=",".join(TrafficManager.TRAFFIC_PROFILES),
         help="Comma-separated traffic profiles",
+    )
+    parser.add_argument(
+        "--methods",
+        default=",".join(METHODS),
+        help=(
+            "Comma-separated benchmark methods to run. "
+            f"Valid values: {','.join(METHODS)}"
+        ),
     )
     parser.add_argument("--repetitions", type=int, default=6)
     parser.add_argument("--steps", type=int, default=300)
@@ -1513,6 +1570,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.profiles = [
         item.strip() for item in args.profiles.split(",") if item.strip()
+    ]
+    args.methods = [
+        item.strip().lower() for item in args.methods.split(",") if item.strip()
     ]
     return args
 

@@ -330,6 +330,75 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
         self.assertEqual(cache.requests[0]["kind"], "freshness")
         self.assertEqual(cache.requests[0]["qids"], list(QIDS))
 
+    def test_required_telemetry_freshness_uses_training_gate(self):
+        response = {
+            "ok": True,
+            "epoch_id": 7,
+            "queues": {
+                str(qid): {
+                    "lat": {"window_count": 1},
+                    "drop": {"window_count": 1},
+                    "util": {"window_count": 1},
+                }
+                for qid in QIDS
+            },
+            "missing": {},
+            "complete": True,
+        }
+        cache = self.CapturingCache({"freshness": response})
+        env = self._env("high_1")
+        env.telemetry_cache = cache
+        env.telemetry_backend = "cache"
+        env.telemetry_liveness_enabled = True
+        env.telemetry_liveness_window_seconds = 1.0
+        env.telemetry_liveness_retries = 1
+        env.telemetry_liveness_interval_seconds = 0.0
+
+        report = env.verify_required_telemetry_freshness(
+            raise_on_error=False
+        )
+
+        self.assertTrue(report["verified"])
+        self.assertEqual(
+            report["telemetry_policy"],
+            "training_required_queue_metrics",
+        )
+        self.assertEqual(cache.requests[0]["kind"], "freshness")
+        self.assertEqual(cache.requests[0]["qids"], list(QIDS))
+        self.assertEqual(cache.requests[0]["required_labels"], ["lat", "drop", "util"])
+
+    def test_required_telemetry_freshness_reports_missing_metrics(self):
+        response = {
+            "ok": True,
+            "epoch_id": 7,
+            "queues": {
+                str(qid): {
+                    "lat": {"window_count": 1},
+                    "drop": {"window_count": 1},
+                    "util": {"window_count": 1},
+                }
+                for qid in QIDS
+            },
+            "missing": {"7": ["util"]},
+            "complete": False,
+        }
+        cache = self.CapturingCache({"freshness": response})
+        env = self._env("high_1")
+        env.telemetry_cache = cache
+        env.telemetry_backend = "cache"
+        env.telemetry_liveness_enabled = True
+        env.telemetry_liveness_window_seconds = 1.0
+        env.telemetry_liveness_retries = 1
+        env.telemetry_liveness_interval_seconds = 0.0
+
+        report = env.verify_required_telemetry_freshness(
+            raise_on_error=False
+        )
+
+        self.assertFalse(report["verified"])
+        self.assertEqual(report["missing"], {7: ["util"]})
+        self.assertIn("Q7 missing util", report["errors"])
+
     def test_influx_aggregated_metric_filter_tracks_qids(self):
         extended_qids = (0, 1, 7, 9)
         records = [
@@ -458,6 +527,12 @@ class BenchmarkReportingIntegrityTests(unittest.TestCase):
                         "routing_state": {
                             "verified": True,
                             "plan_sha256": "abc123",
+                            "traffic_processes": {
+                                "verified": True,
+                                "post_measurement": {
+                                    "verified": True,
+                                },
+                            },
                         },
                     }
                 )
@@ -466,6 +541,38 @@ class BenchmarkReportingIntegrityTests(unittest.TestCase):
             _, errors = validate_runner_summary(item, path)
 
         self.assertEqual(errors, [])
+
+    def test_runner_summary_requires_post_measurement_traffic_evidence(self):
+        item = {
+            "method": "ospf",
+            "profile": "medium_2",
+            "seed": 43,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "method": "ospf",
+                        "traffic_profile": "medium_2",
+                        "traffic_seed": 43,
+                        "routing_state_verified": True,
+                        "traffic_state_verified": True,
+                        "telemetry_state_verified": True,
+                        "routing_state": {
+                            "verified": True,
+                            "traffic_processes": {
+                                "verified": True,
+                            },
+                        },
+                    }
+                )
+            )
+
+            _, errors = validate_runner_summary(item, path)
+
+        self.assertIn("post-measurement traffic verification is missing", errors)
 
     def test_aggregate_summary_does_not_confuse_two_ecmp_runs(self):
         fieldnames = [
@@ -662,21 +769,12 @@ class TrafficIntegrityTests(unittest.TestCase):
         self.assertEqual(bench_profiles, expected)
         self.assertEqual(
             self._expand_make_value(
-                variables["TRAIN_TEST_PROFILES"],
-                variables,
-            ).split(),
-            expected,
-        )
-        self.assertEqual(
-            self._expand_make_value(
                 variables["PRODUCTION_PROFILES"],
                 variables,
             ).split(),
             expected,
         )
-
         for name in (
-            "TRAIN_PROFILE_WEIGHTS",
             "TRAIN_FOUNDATION_PROFILE_WEIGHTS",
             "TRAIN_BURST_PROFILE_WEIGHTS",
             "TRAIN_POLISH_PROFILE_WEIGHTS",
@@ -693,6 +791,45 @@ class TrafficIntegrityTests(unittest.TestCase):
         with patch.object(sys, "argv", ["benchmark.py"]):
             args = parse_args()
         self.assertEqual(args.profiles, list(TrafficManager.TRAFFIC_PROFILES))
+        self.assertEqual(args.methods, ["rl", "ecmp", "ospf"])
+
+    def test_benchmark_methods_are_configurable(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["benchmark.py", "--methods", "rl,ecmp"],
+        ):
+            args = parse_args()
+        self.assertEqual(args.methods, ["rl", "ecmp"])
+
+    def test_benchmark_schedule_uses_selected_methods(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "benchmark.py",
+                "--profiles",
+                "high_1",
+                "--repetitions",
+                "3",
+                "--methods",
+                "rl,ecmp",
+            ],
+        ):
+            args = parse_args()
+        orchestrator = BenchmarkOrchestrator(args)
+
+        orchestrator.build_schedule()
+
+        self.assertEqual(len(orchestrator.schedule), 6)
+        self.assertEqual(
+            {item["method"] for item in orchestrator.schedule},
+            {"rl", "ecmp"},
+        )
+        self.assertNotIn(
+            "ospf",
+            {item["method"] for item in orchestrator.schedule},
+        )
 
     def test_tc_root_class_and_rate_parser(self):
         parsed = TrafficManager._parse_root_htb_class(

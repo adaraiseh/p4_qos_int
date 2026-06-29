@@ -538,10 +538,14 @@ class ProductionRunner:
             if traffic_manager
             else max(5.0, args.warmup_seconds)
         )
+        telemetry_readiness_window_seconds = (
+            float(env.telemetry_liveness_window_seconds)
+            if traffic_manager
+            else telemetry_window_seconds
+        )
         telemetry_state = (
-            env.verify_telemetry_flow_coverage(
-                [flow_id for _, _, flow_id in traffic_manager.traffic_pairs],
-                window_seconds=telemetry_window_seconds,
+            env.verify_required_telemetry_freshness(
+                window_seconds=telemetry_readiness_window_seconds,
                 raise_on_error=True,
             )
             if traffic_manager
@@ -551,12 +555,20 @@ class ProductionRunner:
             }
         )
         log.info("Verified clean initial forwarding tables for RL")
-        log.info("Verified telemetry coverage for every RL demand and queue")
+        log.info("Verified required queue telemetry for RL")
         if traffic_manager:
             measurement_shaping = traffic_manager.begin_measurement()
             if measurement_shaping:
                 traffic_state["measurement_shaping"] = measurement_shaping
                 traffic_state["sender_rate_shaping"] = measurement_shaping
+            post_measurement_traffic_state = traffic_manager.verify_exact_processes(
+                raise_on_error=True
+            )
+            traffic_state["post_measurement"] = post_measurement_traffic_state
+            traffic_state["verified"] = bool(
+                traffic_state["verified"]
+                and post_measurement_traffic_state["verified"]
+            )
             state = env.reset(
                 force_reset=False,
                 cooldown_seconds=0.0,
@@ -668,9 +680,8 @@ class ProductionRunner:
                         "Final traffic-state verification failed: "
                         + "; ".join(final_traffic_state['errors'])
                     )
-                final_telemetry_state = env.verify_telemetry_flow_coverage(
-                    [flow_id for _, _, flow_id in traffic_manager.traffic_pairs],
-                    window_seconds=telemetry_window_seconds,
+                final_telemetry_state = env.verify_required_telemetry_freshness(
+                    window_seconds=telemetry_readiness_window_seconds,
                     raise_on_error=False,
                 )
                 telemetry_state['final'] = final_telemetry_state
@@ -679,8 +690,8 @@ class ProductionRunner:
                 )
                 if not final_telemetry_state['verified']:
                     log.warning(
-                        "Final telemetry coverage audit failed; preserving measured "
-                        "run because initial coverage, traffic health, and per-step "
+                        "Final required telemetry audit failed; preserving measured "
+                        "run because initial readiness, traffic health, and per-step "
                         "telemetry validity are enforced: "
                         + "; ".join(final_telemetry_state['errors'])
                     )
@@ -729,7 +740,7 @@ class ProductionRunner:
                 + ("VERIFIED" if traffic_state['verified'] else "FAILED")
             )
             log.info(
-                "  Telemetry flow coverage: "
+                "  Required telemetry: "
                 + ("VERIFIED" if telemetry_state['verified'] else "FAILED")
             )
             log.info("=" * 68)
@@ -751,7 +762,7 @@ class ProductionRunner:
                         'verified': routing_state['verified'],
                         'initial_tables': routing_state,
                         'traffic_processes': traffic_state,
-                        'telemetry_flow_coverage': telemetry_state,
+                        'telemetry_required_metrics': telemetry_state,
                         'top_bottleneck_egresses': top_bottlenecks,
                         'note': (
                             'Initial clean baseline verified before RL actions; '
