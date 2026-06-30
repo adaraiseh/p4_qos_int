@@ -15,20 +15,21 @@ profile    ?= high_1
 LOG_LEVEL  ?= info
 STEPS      ?= 300
 TRAFFIC_SEED ?= 42
-TRAIN_FOUNDATION_STEPS ?= 55000
-TRAIN_BURST_STEPS ?= 20000
-TRAIN_POLISH_STEPS ?= 25000
-TRAIN_FOUNDATION_EPS_DECAY_STEPS ?= 50000
-TRAIN_BURST_EPS_DECAY_STEPS ?= 20000
-TRAIN_POLISH_EPS_DECAY_STEPS ?= 20000
-TRAIN_BURST_RESUME_EPS ?= 0.50
-TRAIN_POLISH_RESUME_EPS ?= 0.10
-TRAIN_FOUNDATION_RESET_PROB_START ?= 0.85
-TRAIN_FOUNDATION_RESET_PROB_END ?= 0.45
-TRAIN_BURST_RESET_PROB_START ?= 0.65
-TRAIN_BURST_RESET_PROB_END ?= 0.35
-TRAIN_POLISH_RESET_PROB_START ?= 0.60
-TRAIN_POLISH_RESET_PROB_END ?= 0.40
+TRAIN_REPLAY_CAPACITY ?= 80000
+TRAIN_FOUNDATION_STEPS ?= 35000
+TRAIN_BURST_STEPS ?= 25000
+TRAIN_POLISH_STEPS ?= 20000
+TRAIN_FOUNDATION_EPS_DECAY_STEPS ?= 45000
+TRAIN_BURST_EPS_DECAY_STEPS ?= 25000
+TRAIN_POLISH_EPS_DECAY_STEPS ?= 15000
+TRAIN_BURST_RESUME_EPS ?= 0.45
+TRAIN_POLISH_RESUME_EPS ?= 0.15
+TRAIN_FOUNDATION_RESET_PROB_START ?= 0.95
+TRAIN_FOUNDATION_RESET_PROB_END ?= 0.70
+TRAIN_BURST_RESET_PROB_START ?= 0.85
+TRAIN_BURST_RESET_PROB_END ?= 0.60
+TRAIN_POLISH_RESET_PROB_START ?= 0.65
+TRAIN_POLISH_RESET_PROB_END ?= 0.45
 TRAIN_BASELINE_COOLDOWN ?= 5
 TRAIN_WARM_COOLDOWN ?= 3
 TRAIN_LOG_FLUSH_EVERY ?= 100
@@ -49,9 +50,9 @@ TRAIN_LOG_DIR ?=
 ALL_TRAFFIC_PROFILES ?= light_1 light_2 medium_1 medium_2 high_1 high_2 bursty_vo_1 bursty_vo_2 bursty_vo_3 bursty_vi_1 bursty_vi_2 bursty_vi_3 bursty_be_1 bursty_be_2 bursty_be_3
 ALL_TRAFFIC_PROFILES_CSV ?= light_1,light_2,medium_1,medium_2,high_1,high_2,bursty_vo_1,bursty_vo_2,bursty_vo_3,bursty_vi_1,bursty_vi_2,bursty_vi_3,bursty_be_1,bursty_be_2,bursty_be_3
 PRODUCTION_PROFILES ?= $(ALL_TRAFFIC_PROFILES)
-TRAIN_FOUNDATION_PROFILE_WEIGHTS ?= light_1:9,light_2:9,medium_1:27,medium_2:27,high_1:27,high_2:27,bursty_vo_1:6,bursty_vo_2:6,bursty_vo_3:6,bursty_vi_1:6,bursty_vi_2:6,bursty_vi_3:6,bursty_be_1:6,bursty_be_2:6,bursty_be_3:6
-TRAIN_BURST_PROFILE_WEIGHTS ?= light_1:2.5,light_2:2.5,medium_1:2.5,medium_2:2.5,high_1:12.5,high_2:12.5,bursty_vo_1:7.222222,bursty_vo_2:7.222222,bursty_vo_3:7.222222,bursty_vi_1:7.222222,bursty_vi_2:7.222222,bursty_vi_3:7.222222,bursty_be_1:7.222222,bursty_be_2:7.222222,bursty_be_3:7.222222
-TRAIN_POLISH_PROFILE_WEIGHTS ?= light_1:2.5,light_2:2.5,medium_1:7.5,medium_2:7.5,high_1:15,high_2:15,bursty_vo_1:5.555556,bursty_vo_2:5.555556,bursty_vo_3:5.555556,bursty_vi_1:5.555556,bursty_vi_2:5.555556,bursty_vi_3:5.555556,bursty_be_1:5.555556,bursty_be_2:5.555556,bursty_be_3:5.555556
+TRAIN_FOUNDATION_PROFILE_WEIGHTS ?= light_1:2,light_2:2,medium_1:7,medium_2:9,high_1:24,high_2:12,bursty_vo_1:2,bursty_vo_2:3,bursty_vo_3:9,bursty_vi_1:2,bursty_vi_2:3,bursty_vi_3:10,bursty_be_1:2,bursty_be_2:3,bursty_be_3:10
+TRAIN_BURST_PROFILE_WEIGHTS ?= light_1:1,light_2:1,medium_1:4,medium_2:4,high_1:22,high_2:8,bursty_vo_1:1,bursty_vo_2:2,bursty_vo_3:16,bursty_vi_1:1,bursty_vi_2:2,bursty_vi_3:18,bursty_be_1:1,bursty_be_2:2,bursty_be_3:17
+TRAIN_POLISH_PROFILE_WEIGHTS ?= light_1:2.5,light_2:2.5,medium_1:7,medium_2:8,high_1:24,high_2:11,bursty_vo_1:4,bursty_vo_2:4,bursty_vo_3:7,bursty_vi_1:4,bursty_vi_2:4,bursty_vi_3:7,bursty_be_1:4,bursty_be_2:4,bursty_be_3:7
 BENCH_PROFILES ?= $(ALL_TRAFFIC_PROFILES_CSV)
 BENCH_REPETITIONS ?= 6
 BENCH_BASE_SEED ?= 42
@@ -82,6 +83,7 @@ BENCH_OUTPUT_FLAG := $(if $(BENCH_OUTPUT),--output-dir $(BENCH_OUTPUT),)
 TRAIN_LOG_DIR_FLAG = $(if $(TRAIN_LOG_DIR),--training-log-dir $(TRAIN_LOG_DIR),)
 TRAIN_ARTIFACT_FLAGS = --artifact-root $(EXTERNAL_ARTIFACT_ROOT) --training-state-file $(TRAINING_STATE_FILE) --collector-spool-split-steps $(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)
 TRAIN_LOGGING_FLAGS = --training-log-flush-every $(TRAIN_LOG_FLUSH_EVERY) $(TRAIN_LOG_DIR_FLAG) $(TRAIN_ARTIFACT_FLAGS)
+TRAIN_REPLAY_FLAGS = --buffer-capacity $(TRAIN_REPLAY_CAPACITY)
 TELEMETRY_FLAGS = --telemetry-backend $(TELEMETRY_BACKEND) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --telemetry-cache-timeout $(TELEMETRY_CACHE_TIMEOUT)
 COLLECTOR_ARTIFACT_FLAGS = --artifact-root $(EXTERNAL_ARTIFACT_ROOT) --training-state-file $(TRAINING_STATE_FILE) --local-spool-split-steps $(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)
 COLLECTOR_TELEMETRY_FLAGS = --influx-write $(COLLECTOR_INFLUX_WRITE) --telemetry-cache-socket $(TELEMETRY_CACHE_SOCKET) --local-spool $(COLLECTOR_LOCAL_SPOOL) --local-spool-dir $(COLLECTOR_LOCAL_SPOOL_DIR) $(COLLECTOR_ARTIFACT_FLAGS)
@@ -175,20 +177,23 @@ visualize:
 # RL Training
 # =============================================
 
-# Paper training curriculum after traffic-generator calibration and
-# intervention-context reward shaping:
-# 1) steady foundation, 2) short-burst recovery, 3) balanced polishing.
+# Recovery/burst/stability curriculum for the 14-action K1/K2 agent:
+# 1) reset-heavy recovery foundation, 2) bursty_3 specialization,
+# 3) stability/no-op polishing.
+train: train_paper
+
 train_paper:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
 	@echo "Influx training detail: $(TRAIN_INFLUX_DETAIL)"
 	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
 	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
+	@echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"
 	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
-	@echo "=== Stage 1/3: balanced foundation ($(TRAIN_FOUNDATION_STEPS) steps, eps_decay=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS)) ==="
+	@echo "=== Stage 1/3: reset-heavy recovery foundation ($(TRAIN_FOUNDATION_STEPS) steps, eps_decay=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_FOUNDATION_STEPS) \
-		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_FOUNDATION_RESET_PROB_START) \
 		--reset-prob-end $(TRAIN_FOUNDATION_RESET_PROB_END) \
 		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
@@ -199,7 +204,7 @@ train_paper:
 	@echo "=== Stage 2/3: burst specialization ($(TRAIN_BURST_STEPS) steps, resume final, eps=$(TRAIN_BURST_RESUME_EPS), eps_decay=$(TRAIN_BURST_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_BURST_PROFILE_WEIGHTS)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_BURST_STEPS) \
-		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_BURST_RESET_PROB_START) \
 		--reset-prob-end $(TRAIN_BURST_RESET_PROB_END) \
 		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
@@ -208,10 +213,10 @@ train_paper:
 		--eps-decay-steps $(TRAIN_BURST_EPS_DECAY_STEPS) \
 		--resume final --resume-eps $(TRAIN_BURST_RESUME_EPS) \
 		--traffic-profile-weights "$(TRAIN_BURST_PROFILE_WEIGHTS)"
-	@echo "=== Stage 3/3: all-profile polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="
+	@echo "=== Stage 3/3: stability/no-op polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_POLISH_PROFILE_WEIGHTS)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_POLISH_STEPS) \
-		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_POLISH_RESET_PROB_START) \
 		--reset-prob-end $(TRAIN_POLISH_RESET_PROB_END) \
 		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
@@ -227,11 +232,12 @@ train_stage2:
 	@echo "Influx training detail: $(TRAIN_INFLUX_DETAIL)"
 	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
 	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
+	@echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"
 	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
 	@echo "=== Stage 2/3: burst specialization ($(TRAIN_BURST_STEPS) steps, resume final, eps=$(TRAIN_BURST_RESUME_EPS), eps_decay=$(TRAIN_BURST_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_BURST_PROFILE_WEIGHTS)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_BURST_STEPS) \
-		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_BURST_RESET_PROB_START) \
 		--reset-prob-end $(TRAIN_BURST_RESET_PROB_END) \
 		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
@@ -247,11 +253,12 @@ train_stage3:
 	@echo "Influx training detail: $(TRAIN_INFLUX_DETAIL)"
 	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
 	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
+	@echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"
 	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
-	@echo "=== Stage 3/3: all-profile polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="
+	@echo "=== Stage 3/3: stability/no-op polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_POLISH_PROFILE_WEIGHTS)"
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_POLISH_STEPS) \
-		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) \
+		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_POLISH_RESET_PROB_START) \
 		--reset-prob-end $(TRAIN_POLISH_RESET_PROB_END) \
 		--baseline-cooldown-seconds $(TRAIN_BASELINE_COOLDOWN) \
@@ -403,13 +410,14 @@ help:
 	@echo "  Three-Tier:  three_tier_4, three_tier_6, three_tier_8"
 	@echo ""
 	@echo "Training:"
-	@echo "  make train_paper          3-stage paper curriculum: foundation, burst, polish"
+	@echo "  make train_paper          3-stage curriculum: recovery, burst, stability"
 	@echo "  make train_stage2         Resume final checkpoint and run stage 2 only"
 	@echo "  make train_stage3         Resume final checkpoint and run stage 3 only"
 	@echo "  Training artifacts: $(EXTERNAL_ARTIFACT_ROOT)/<run_id>/{logs,checkpoints,collector}/"
 	@echo "  TRAIN_INFLUX_DETAIL=minimal|off"
 	@echo "  TRAIN_LOG_FLUSH_EVERY=100 EXTERNAL_ARTIFACT_ROOT=/media/sf_amjad/p4_qos_int/training_runs"
 	@echo "  TRAINING_STATE_FILE=$(TRAINING_STATE_FILE) COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS=10000"
+	@echo "  TRAIN_REPLAY_CAPACITY=$(TRAIN_REPLAY_CAPACITY)"
 	@echo "  TRAIN_BASELINE_COOLDOWN=5 TRAIN_WARM_COOLDOWN=3"
 	@echo "  Paper plan defaults: $(TRAIN_FOUNDATION_STEPS)+$(TRAIN_BURST_STEPS)+$(TRAIN_POLISH_STEPS) steps"
 	@echo "  Epsilon decay defaults: foundation=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS), burst=$(TRAIN_BURST_EPS_DECAY_STEPS), polish=$(TRAIN_POLISH_EPS_DECAY_STEPS)"
@@ -453,13 +461,13 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make run topo=fat_tree_k4"
-	@echo "  make train_paper LOG_LEVEL=debug"
+	@echo "  make train LOG_LEVEL=debug"
 	@echo "  make train_stage2 LOG_LEVEL=debug"
 	@echo "  make test_traffic profile=high_2"
 	@echo "  make production profile=bursty_be_1"
 
 .PHONY: all validate rules run stop clean collect monitor visualize \
-        train_paper train_stage2 train_stage3 test test_best test_traffic \
+        train train_paper train_stage2 train_stage3 test test_best test_traffic \
         traffic_stress_test traffic_stress_test_quick traffic_stress_test_custom \
         production production_best production_final production_75pct production_all \
         rl_compare ecmp ecmp_plan ospf benchmark clean_bench clean-benchmark \

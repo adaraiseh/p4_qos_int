@@ -1,6 +1,9 @@
 # DQN Training Plan for QoS Routing
 
-This document provides training configurations for the RL-based QoS routing agent (`rl_agent_4.py`).
+This document provides training configurations for the RL-based QoS routing
+agent (`rl_agent_4.py`). The current agent uses a 14-action K1/K2 reroute
+space, batch-aware observations, and demand-unit lockout to balance fast
+recovery from bad SLA states with lower churn during bursty `_3` profiles.
 
 ---
 
@@ -20,39 +23,65 @@ For training on a single topology (e.g., `fat_tree_k4`), use the default paramet
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| Steps | 40,000-50,000 | Sufficient for convergence on single topology |
+| Steps | 80,000 total | Three-stage curriculum sized for the new K1/K2 action space |
 | Learning Rate | `1e-4` (default) | Optimal for stable training |
-| Epsilon | `1.0 → 0.05` | Linear decay over 40K steps |
+| Epsilon | Stage-local decay | Re-open exploration when resuming into burst and polish stages |
 | Batch Size | 64 | Stable gradient estimates |
-| Replay Buffer | 50,000 | Default capacity |
+| Replay Buffer | 80,000 | Holds the full recommended run while keeping checkpoints manageable |
+| Reset Probability | High early, moderate late | Trains fast recovery from OSPF baseline instead of only warm-state maintenance |
 
 ### Training Command
 
 ```bash
-# Basic training on fat-tree k=4
-python3 rl_agent_4.py --mode train \
-    --config config/topologies/fat_tree_k4.yaml \
-    --steps 55000
-
-# With traffic mix (recommended, rebalanced for more stationary training)
-python3 rl_agent_4.py --mode train \
-    --config config/topologies/fat_tree_k4.yaml \
-    --steps 55000 \
-    --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
+# Recommended fat-tree k=4 training curriculum
+make train_paper
 ```
 
-### Alternative: Leaf-Spine Topology
+The Makefile default is:
 
-```bash
-python3 rl_agent_4.py --mode train \
-    --config config/topologies/leaf_spine_16x4.yaml \
-    --steps 55000 \
-    --traffic-weights "light:0.02,medium:0.02,high:0.50,bursty:0.46"
-```
+| Stage | Steps | Resume epsilon | Epsilon decay | Reset probability | Traffic emphasis |
+|-------|-------|----------------|---------------|-------------------|------------------|
+| 1. Foundation | 35,000 | fresh `1.00` | 45,000 | `0.95 → 0.70` | high baseline recovery plus `_3` burst exposure |
+| 2. Burst specialization | 25,000 | `0.45` | 25,000 | `0.85 → 0.60` | high_1 and bursty `_3`, especially `bursty_vi_3`/`bursty_be_3` |
+| 3. Stability polish | 20,000 | `0.15` | 15,000 | `0.65 → 0.45` | balanced high/bursty with enough light/medium no-op examples |
+
+The old three-stage run ending in
+`/media/sf_amjad/p4_qos_int/training_runs/20260628-223323` filled a 50K replay
+buffer while the agent reached about 99K valid learning steps. That meant later
+burst/polish experience displaced much of the early OSPF-baseline recovery
+distribution. With the new 1200-state/14-action design, 80K replay is the
+default compromise: it retains the full recommended 80K curriculum, gives K2
+and `multi-k1` enough samples, and avoids pushing every checkpoint into an
+unnecessarily large 100K+ replay snapshot.
+
+Keep the default as three stages rather than one mixed 80K run. A single stage
+is simpler, but it cannot reopen exploration when the traffic emphasis changes.
+The stage-local resume epsilons deliberately do that: Stage 2 explores the new
+K2/lockout behavior under bursty `_3` pressure, and Stage 3 reintroduces
+controlled exploration while adding more light/medium no-op examples. Because
+the replay buffer now spans the full 80K curriculum, the stages no longer erase
+the earlier recovery distribution.
 
 ### Expected Training Time
-- ~50,000 steps × ~2s/step ≈ **28 hours**
+- ~80,000 steps × ~2s/step ≈ **44 hours**
 - Checkpoints saved at 25%, 50%, 75%, best, and final
+
+### Behavioral Targets
+
+The current enhancement targets two behaviors that should both be checked
+during training:
+
+- **Fast recovery:** high-load profiles should move from OSPF baseline routing
+  to a better distribution quickly. The action space supports this with K2
+  single-queue actions and `multi-k1`.
+- **Burst stability:** bursty `_3` profiles should not cause the agent to chase
+  the same demand unit every burst step. Successful reroutes lock
+  `(qid, dst_ip, bottleneck_sid)` for five control steps while leaving other
+  demand units on the same queue eligible.
+
+The observation space exposes only minimal batch awareness:
+`eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm` per
+queue. Demand IDs are not part of the neural-network input.
 
 ### What NOT to Use (Single Topology)
 - `--multi-buffer` - Not needed, single topology
@@ -171,20 +200,23 @@ python3 rl_agent_4.py --mode train \
 
 ```
 # Network Architecture
-STATE_DIM = 464          # 50 metrics × 8 frames + 8 actions × 8 frames
-ACTION_DIM = 8           # No-op + 6 single-queue + 1 multi-queue
+RAW_STATE_DIM = 61       # 3×16 queue features + 3×3 batch features + 4 global/topology
+STACK_SIZE = 16          # Observation/action history frames
+ACTION_DIM = 14          # No-op + 12 queue-alt-K actions + multi-k1
+STATE_DIM = 1200         # 61 obs × 16 frames + 14 actions × 16 frames
 HIDDEN_DIM = 128         # Network hidden layer size
 
 # Learning
 LR = 1e-4                # Learning rate
 GAMMA = 0.97             # Discount factor
 BATCH_SIZE = 64          # Training batch size
-REPLAY_CAPACITY = 50,000 # Replay buffer size
+MIN_REPLAY_SIZE = 500    # Start learning after this many transitions
+REPLAY_CAPACITY = 80,000 # Replay buffer size
 
 # Exploration
 EPS_START = 1.0          # Initial epsilon
 EPS_END = 0.05           # Final epsilon
-EPS_DECAY_STEPS = 40,000 # Steps to decay epsilon
+EPS_DECAY_STEPS = 45,000 # Steps to decay epsilon
 
 # Prioritized Experience Replay
 PER_ALPHA = 0.6          # Prioritization exponent
@@ -199,7 +231,12 @@ MAX_EPISODE_STEPS = 100  # Steps per episode
 
 # Timing
 WINDOW_SECONDS = 1.0     # Observation window
-DELAY_AFTER_ACTION = 0.8 # Wait after action for data
+DELAY_AFTER_ACTION = 1.0 # Wait after action for data
+
+# Batch rerouting
+K_CHOICES = (1, 2)
+TOP_N_HOT_DEMANDS = 6
+DEMAND_LOCK_STEPS = 5
 ```
 
 ### EWC Hyperparameters
@@ -209,10 +246,10 @@ EWC_LAMBDA = 5000.0      # Regularization strength (tune: 1000-10000)
 EWC_FISHER_SAMPLES = 200 # Samples for Fisher matrix estimation
 ```
 
-### Multi-Buffer Defaults
+### Replay Buffer Defaults
 
 ```
-buffer_capacity = 25,000 # Per-topology buffer size
+buffer_capacity = 80,000 # Per topology when --multi-buffer is used
 ```
 
 ---
@@ -246,6 +283,39 @@ python3 rl_agent_4.py --mode eval \
     --baseline-only \
     --steps 2000
 ```
+
+### Quick Checkpoint Smoke Benchmark
+
+Use this after creating a checkpoint to verify the production path, local
+telemetry cache, benchmark wrapper, batch reroute counters, and lockout
+invariant:
+
+```bash
+sudo -E env PYTHONUNBUFFERED=1 python3 -u benchmark.py \
+    --config config/topologies/fat_tree_k4.yaml \
+    --profiles high_1,bursty_vi_3 \
+    --methods rl \
+    --repetitions 1 \
+    --steps 20 \
+    --max-retries 0 \
+    --save-dir /path/to/checkpoints \
+    --weights-tag final \
+    --telemetry-backend cache \
+    --telemetry-cache-socket /tmp/p4_qos_int_telemetry.sock \
+    --production-influx-write off \
+    --no-resume
+```
+
+Success criteria for the smoke benchmark:
+
+- All selected runs complete with `status=success`.
+- `valid_fraction >= 0.80`; for a healthy collector, expect `1.0`.
+- Runner summaries verify routing, traffic, and telemetry state.
+- No rerouted unit repeats within the five-step `(qid, dst_ip, bottleneck_sid)`
+  lock window.
+- Batch columns are present in the per-step CSVs:
+  `requested_batch_size`, `batch_reroute_count`, `locked_units_count`, and
+  `rerouted_units`.
 
 ---
 
@@ -281,7 +351,7 @@ python3 rl_agent_4.py --mode eval \
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--multi-buffer` | flag | False | Use separate buffers per topology |
-| `--buffer-capacity` | int | 25000 | Buffer capacity per topology |
+| `--buffer-capacity` | int | 80000 | Replay buffer capacity; per topology with `--multi-buffer` |
 | `--balanced-sampling` | flag | False | Balance sampling across topologies |
 
 ### Traffic
@@ -317,3 +387,6 @@ python3 rl_agent_4.py --mode eval \
 - **Epsilon**: Should decay from 1.0 to 0.05
 - **Loss**: Should stabilize (not necessarily decrease)
 - **SLA Compliance**: Target >80% across all queues
+- **First all-SLA step on high profiles**: Measures recovery speed from OSPF baseline
+- **Burst `_3` churn**: Watch repeated reroutes of the same `(qid, dst_ip, bottleneck_sid)` unit
+- **Batch usage**: `batch_reroute_count > 1` confirms K2 or `multi-k1` paths are exercised

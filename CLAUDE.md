@@ -7,8 +7,8 @@ This project implements a **DQN-based Reinforcement Learning agent** for dynamic
 ### Key Features
 - P4 switch programming with INT support
 - Real-time telemetry collection via INT reports
-- DQN agent with 960-dimensional state space (stacked observations + actions)
-- 8-action space for queue-specific and multi-queue rerouting
+- DQN agent with 1200-dimensional state space (stacked observations + action history)
+- 14-action space for queue-specific K1/K2 rerouting and `multi-k1`
 - InfluxDB for metrics storage and querying
 - Support for multiple topology types (Fat-Tree, Leaf-Spine, Three-Tier)
 
@@ -83,8 +83,10 @@ This project implements a **DQN-based Reinforcement Learning agent** for dynamic
 ### RL Layer
 
 #### `rl_agent_4.py`
-- **State**: 960 dimensions (52 metrics × 16 frame stack + 8 actions × 16 history)
-- **Actions**: 8 total (0=no-op, 1-6=single queue reroute, 7=multi-queue)
+- **State**: 1200 dimensions (`61` raw observation features × 16 frames + `14` action-history features × 16 frames)
+- **Actions**: 14 total (`0` no-op, `1-12` queue-specific reroute with two alternatives and `K={1,2}`, `13` `multi-k1`)
+- **Batch candidate observations**: per queue `eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm`
+- **Demand-unit lockout**: successful reroutes lock `(qid, dst_ip, bottleneck_sid)` for 5 control steps
 - **Reward**: SLA-based with drop penalty and action cost
 - **Architecture**: Dueling DQN with prioritized experience replay
 
@@ -92,6 +94,7 @@ This project implements a **DQN-based Reinforcement Learning agent** for dynamic
 - Loads trained model for production inference
 - Greedy action selection (no exploration)
 - Logs Q-values and actions to InfluxDB
+- Logs batch and lock diagnostics to CSV: `requested_batch_size`, `batch_reroute_count`, `locked_units_count`, `rerouted_units`
 - Hot-reload support for model updates
 
 ---
@@ -118,15 +121,51 @@ link_bandwidths:
   spine_core: 10
 ```
 
-### Timing Constants (rl_agent_4.py:146-153)
+### Timing Constants (`rl_agent_4.py`)
 
 ```python
 WINDOW_SECONDS = 1.0        # InfluxDB query window
 SAFETY_LAG_MS = 0           # No safety lag (aggressive)
 DELAY_AFTER_ACTION = 1.0    # Sleep after action
 DELAY_NO_ACTION = 1.0       # Sleep when no action taken
-MIN_POINTS_PER_METRIC = 1   # Minimum data points for freshness
+MIN_POINTS_PER_METRIC = 1   # Legacy constant; validity now uses present+sane metrics
 ```
+
+### Current Action Space
+
+The policy has one output per action ID:
+
+| Action | Meaning |
+|--------|---------|
+| `0` | No-op |
+| `1` | Q0 alt0 K1 |
+| `2` | Q0 alt0 K2 |
+| `3` | Q0 alt1 K1 |
+| `4` | Q0 alt1 K2 |
+| `5` | Q1 alt0 K1 |
+| `6` | Q1 alt0 K2 |
+| `7` | Q1 alt1 K1 |
+| `8` | Q1 alt1 K2 |
+| `9` | Q7 alt0 K1 |
+| `10` | Q7 alt0 K2 |
+| `11` | Q7 alt1 K1 |
+| `12` | Q7 alt1 K2 |
+| `13` | `multi-k1`: one K1 reroute per violating queue |
+
+`K=1` means reroute the worst eligible demand unit for that queue and
+alternate path. `K=2` means reroute the worst two eligible demand units when
+at least two unlocked candidates are available. The action mask hides K2 when
+there are fewer than two eligible units.
+
+The dataplane overlay is keyed by queue and destination. To avoid immediately
+moving the same practical demand unit again, the controller-side lock key is
+`(qid, dst_ip, bottleneck_sid)`. A successful reroute locks that key for
+`DEMAND_LOCK_STEPS=5`, while other demand units on the same queue remain
+eligible.
+
+`multi-k1` is deliberately named this way because it is not a K2 batch action.
+It can reroute up to one eligible demand unit from each violating queue in a
+single control step.
 
 ---
 
@@ -185,7 +224,7 @@ make production profile=medium_2
 | `make run topo=<name>` | Start network with topology |
 | `make stop` | Stop mininet |
 | `make collect` | Start INT collector |
-| `make train` | Full training (50K steps) |
+| `make train` | Full training curriculum |
 | `make production profile=<name>` | Run with best weights |
 | `make test_traffic profile=<name>` | Test traffic profile |
 | `make validate` | Validate topology config |
@@ -301,7 +340,10 @@ sudo python3 int_metrics_tester.py --config config/topologies/fat_tree_k4.yaml -
 
 ### Overview
 
-The RL agent collects metrics from InfluxDB at each step to build a state snapshot. The collection follows a **retry-based recovery** strategy with **no stale cache fallback** - data must come from fresh InfluxDB queries or be declared missing.
+The RL agent collects telemetry at each step to build a state snapshot. It can
+read from InfluxDB or from the local telemetry cache socket. In both cases, the
+state builder uses fresh windowed telemetry; stale cache fallback is not used
+to fill missing metrics.
 
 ### Metrics Collected Per Step
 
@@ -312,7 +354,12 @@ For each of the 3 QoS queues (Q0=voice, Q1=video, Q7=best_effort), the agent col
 | `lat_p95` | `flow_latency` | P95 end-to-end latency | ms |
 | `drop_p95` | `q_drop_rate_100ms` | P95 drop rate | ratio (0-1) |
 | `util_p95` | `tx_utilization` | P95 egress utilization | % |
-| `hot_demand` | `flow_latency` | Highest-latency (src_ip, dst_ip) pair | IP tuple |
+| `hot_demand` | `flow_latency` | Highest-latency `(src_ip, dst_ip)` pair | IP tuple |
+| `top_demands` | `flow_latency` | Top latency-ranked demand candidates per queue | list |
+
+The local cache accepts `top_n` for demand queries. The agent requests
+`TOP_N_HOT_DEMANDS=6`; this gives the action code enough candidates to skip
+locked units and still select the worst one or two eligible demand units.
 
 ### Query Flow
 
@@ -320,9 +367,9 @@ For each of the 3 QoS queues (Q0=voice, Q1=video, Q7=best_effort), the agent col
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    _collect_snapshot()                              │
 ├─────────────────────────────────────────────────────────────────────┤
-│  1. Parallel queries via ThreadPoolExecutor:                        │
-│     ├─ _query_aggregated_metrics() → lat_p95, drop_p95, util_p95   │
-│     └─ _get_all_hottest_demands() → hot_demand per queue           │
+│  1. Parallel telemetry requests:                                    │
+│     ├─ aggregated metrics -> lat_p95, drop_p95, util_p95           │
+│     └─ hot-demand query -> hot_demand and top_demands per queue    │
 │                                                                     │
 │  2. For each metric type missing from initial query:                │
 │     └─ _retry_metric_query() with 5 retries, 1s delay, window exp  │
@@ -331,7 +378,7 @@ For each of the 3 QoS queues (Q0=voice, Q1=video, Q7=best_effort), the agent col
 │     ├─ metrics_present: all 3 metrics received?                    │
 │     └─ values_sane: within reasonable bounds?                      │
 │                                                                     │
-│  4. Mark data_valid = metrics_present AND values_sane              │
+│  4. Add batch candidate features and mark data_valid               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -398,7 +445,7 @@ After initial query, each missing metric type triggers its own retry loop:
 
 #### Hot Demands (`_get_all_hottest_demands`)
 
-Finds the (src_ip, dst_ip) pair with highest mean latency per queue:
+Finds the `(src_ip, dst_ip)` pairs with highest mean latency per queue:
 
 ```flux
 from(bucket:"int_telemetry")
@@ -409,26 +456,35 @@ from(bucket:"int_telemetry")
     |> mean(column:"_value")
     |> group(columns:["queue_id"])
     |> sort(columns:["_value"], desc:true)
-    |> limit(n:1)
+    |> limit(n:TOP_N_HOT_DEMANDS)
 ```
 
 Has its own built-in retry loop (same 5 retries, 1s delay, window expansion).
+The first result remains the legacy `hot_demand`; the ranked list is also
+stored as `top_demands`.
 
-#### Freshness Check (`_check_all_queues_freshness`)
+### Batch-Aware Observation Features
 
-Counts data points per queue to ensure sufficient data exists:
+The raw observation has 61 features. For each of Q0, Q1, and Q7, three of
+those features summarize demand-unit batching:
 
-```flux
-from(bucket:"int_telemetry")
-    |> range(start:<start>, stop:<stop>)
-    |> filter(fn: (r) => r._measurement == "flow_latency" or
-                         r._measurement == "q_drop_rate_100ms" or
-                         r._measurement == "tx_utilization")
-    |> group(columns:["queue_id"])
-    |> count()
-```
+| Feature | Values | Meaning |
+|---------|--------|---------|
+| `eligible_count_norm` | `0.0`, `0.5`, `1.0` | no eligible units, one eligible unit, or at least two eligible units |
+| `top1_pressure_norm` | `0.0` to `1.0` | pressure of the best unlocked candidate |
+| `top2_pressure_norm` | `0.0` to `1.0` | pressure of the second unlocked candidate, or `0.0` if missing |
 
-A queue is "fresh" if it has >= `MIN_POINTS_PER_METRIC` (default: 1) data points.
+These features let the policy distinguish "K2 can help now" from "only one
+candidate is available" without exposing demand IDs in the neural-network
+input. Demand identity is still used by the controller side for lockout and
+reroute selection.
+
+#### Freshness Policy
+
+There is no separate freshness-count gate in the current agent. A queue is
+valid when the required metrics are present in the queried window and pass
+sanity checks. This avoids rejecting useful windows only because the INT sample
+count was low.
 
 ### Data Validation
 
@@ -466,21 +522,22 @@ If data is invalid after all retries:
 ## Key Code Locations
 
 ### Telemetry Collection
-- `rl_agent_4.py:1099-1193` - `_query_aggregated_metrics()`: P95 metrics query with retry
-- `rl_agent_4.py:1195-1285` - `_retry_metric_query()`: Generalized retry logic for any metric
-- `rl_agent_4.py:1287-1500` - `_collect_snapshot()`: Main telemetry function
-- `rl_agent_4.py:1567-1655` - `_get_all_hottest_demands()`: Hot flow detection with retry
+- `QoSRoutingEnv._query_aggregated_metrics()`: P95 metrics query with retry
+- `QoSRoutingEnv._retry_metric_query()`: generalized retry logic for any metric
+- `QoSRoutingEnv._collect_snapshot()`: main telemetry snapshot function
+- `QoSRoutingEnv._get_all_hottest_demands()`: hot-demand and top-demand detection with retry
+- `QoSRoutingEnv._update_batch_candidate_features()`: top candidate pressure and eligibility features
 
 ### Data Validation
-- `rl_agent_4.py:1360-1390` - Data validity checks with diagnostic logging
-- `rl_agent_4.py:1657-1700` - `_metric_sane()`: Sanity checks for metric values
+- `QoSRoutingEnv._collect_snapshot()`: data validity checks with diagnostic logging
+- `QoSRoutingEnv._metric_sane()`: sanity checks for metric values
 
 ### Query Execution
-- `rl_agent_4.py:1065-1097` - `_influx_query_with_retry()`: Base retry logic with timing
+- `QoSRoutingEnv._influx_query_with_retry()`: base retry logic with timing
+- `report_collector/local_telemetry_cache.py`: local cache request handlers for metrics, hot demands, and top egresses
 
 ### Collector
-- `collector.py:260-278` - `log_export_rate()`: Export statistics
-- `collector.py:279-329` - `record_drop_rate_instant()`: Drop rate calculation
+- `report_collector/collector.py`: export statistics and drop-rate calculation
 
 ---
 
@@ -504,9 +561,10 @@ building a queue from an unrealistically clean start.
 Queue weights for these totals are Q0=22.327%, Q1=34.591%, and Q7=43.082%.
 Stage changes use verified sender HTB shaping and do not restart iperf.
 
-Bursty profiles use a 0.5 Mbps low stage and a queue-biased 3.2 Mbps high
-stage. `_1` profiles have three high steps per ten-step cycle; `_2` profiles
-have six.
+Bursty profiles use a 0.70 Mbps low stage and queue-biased class-specific high
+stages. `_1` profiles have three high steps per ten-step cycle, `_2` profiles
+have six, and `_3` profiles have eight. The `_3` tier is the churn-sensitive
+case that motivated K1/K2 batching and demand-unit lockout.
 
 ---
 
@@ -635,6 +693,12 @@ Traffic configurations are automatically logged to `log/traffic_log.csv` with th
 
 ## Recent Changes
 
+- **14-action RL policy**: Replaced the old 8-action space with queue-alt-K actions plus `multi-k1`.
+- **K1/K2 batch rerouting**: Single-queue actions can request the worst one or two eligible demand units.
+- **Demand-unit lockout**: Successful reroutes lock `(qid, dst_ip, bottleneck_sid)` for five control steps so the same practical dataplane overlay is not chased repeatedly.
+- **Batch-aware observation features**: Added per-queue `eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm`.
+- **Top-demand cache queries**: The local telemetry cache can return ranked `top_demands` with `top_n`; the agent requests six candidates per queue.
+- **Batch diagnostics in logs**: Training, production, and benchmark CSVs include requested batch size, actual reroute count, lock count, and JSON rerouted units.
 - **Removed freshness check**: Validation simplified to `data_valid = metrics_present AND values_sane`. If metrics are retrieved from InfluxDB, they're considered fresh.
 - **Step numbers in retry logs**: All retry logs now include `[Query S<step>]` prefix to identify which step triggered the retry.
 - **Removed stale cache fallback**: All metrics now use retry-only recovery (5 retries, 1s delay, expanding window). No cache fallback - data must come from fresh InfluxDB queries.
@@ -746,4 +810,4 @@ The fallback to `path_map` is essential for:
 1. **Queue Independence**: Q0's reroute doesn't contaminate Q1's path lookup
 2. **Safe Fallback**: `path_map` always has valid OSPF paths for any (src, dst) pair
 3. **Clean Reset**: Episode reset just calls `compute_forwarding_entries()` to re-sync all stores
-4. **Multi-queue Reroutes**: Action 7 (multi-queue) can reroute Q0, Q1, Q7 independently without interference
+4. **Multi-queue Reroutes**: Action 13 (`multi-k1`) can reroute Q0, Q1, Q7 independently without interference

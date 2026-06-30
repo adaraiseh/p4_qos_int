@@ -271,10 +271,13 @@ class ProductionMetricsWriter:
                 .field("reward", float(reward))
                 .field("q_values_max", float(q_stats['q_max']))
                 .field("sla_met_count", int(sla_met_count))
-                .field("data_valid", int(info.get('data_valid', False)))
-                .field("pressure", float(info.get('pressure', 0.0)))
-                .time(datetime.utcnow())
-            )
+	                .field("data_valid", int(info.get('data_valid', False)))
+	                .field("pressure", float(info.get('pressure', 0.0)))
+	                .field("requested_batch_size", int(info.get('requested_batch_size', 0) or 0))
+	                .field("batch_reroute_count", int(info.get('batch_reroute_count', 0) or 0))
+	                .field("locked_units_count", int(info.get('locked_units_count', 0) or 0))
+	                .time(datetime.utcnow())
+	            )
 
             # Per-queue latency and drops
             for qid in QIDS:
@@ -492,9 +495,11 @@ class ProductionRunner:
             'step', 'action', 'action_name', 'reward', 'raw_reward',
             'q_max', 'q_mean', 'chosen_q', 'q_gap',
             'sla_met_count', 'sla_streak', 'action_applied', 'data_valid',
-            'routing_state_verified', 'traffic_state_verified',
-            'telemetry_state_verified', 'pressure',
-            'routing_mode', 'traffic_profile', 'traffic_seed',
+	            'routing_state_verified', 'traffic_state_verified',
+	            'telemetry_state_verified', 'pressure',
+	            'requested_batch_size', 'batch_reroute_count',
+	            'locked_units_count', 'rerouted_units',
+	            'routing_mode', 'traffic_profile', 'traffic_seed',
             'load_q0_mbps', 'load_q1_mbps', 'load_q7_mbps',
             'q0_latency_ms', 'q0_drop', 'q0_util_pct',
             'q1_latency_ms', 'q1_drop', 'q1_util_pct',
@@ -604,14 +609,7 @@ class ProductionRunner:
                 next_state, reward, terminated, truncated, info = env.step(action)
 
                 # Console logging (matches training format) - placed immediately after env.step
-                action_names = {
-                    0: "noop",
-                    1: "vo-alt0", 2: "vo-alt1",           # Voice
-                    3: "vi-alt0", 4: "vi-alt1",           # Video
-                    5: "be-alt0", 6: "be-alt1",           # BE
-                    7: "multi",                            # Multi-queue
-                }
-                action_name = action_names.get(action, str(action))
+                action_name = rl_agent_4.action_to_name(action)
                 log.info(
                     f"[Step {self.step}] action={action_name:8s} "
                     f"reward={reward:+.2f} "
@@ -639,6 +637,10 @@ class ProductionRunner:
                     int(traffic_state['verified']),
                     int(telemetry_state['verified']),
                     info.get('pressure', 0),
+                    info.get('requested_batch_size', 0),
+                    info.get('batch_reroute_count', 0),
+                    info.get('locked_units_count', 0),
+                    json.dumps(info.get('rerouted_units', [])),
                     'rl',
                     traffic_manager.current_profile_name if traffic_manager else args.traffic_profile,
                     args.traffic_seed if args.traffic_seed is not None else '',

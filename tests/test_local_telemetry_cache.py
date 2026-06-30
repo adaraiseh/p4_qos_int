@@ -135,11 +135,16 @@ class LocalTelemetryCacheTests(unittest.TestCase):
             "start_ns": self.base_ns,
             "stop_ns": self.base_ns + 10_000_000,
             "qids": [1],
+            "top_n": 2,
         })
 
         self.assertTrue(response["ok"])
         self.assertEqual(response["demands"]["1"]["src_ip"], "10.0.0.3")
         self.assertEqual(response["demands"]["1"]["dst_ip"], "10.0.0.4")
+        self.assertEqual(
+            [item["dst_ip"] for item in response["top_demands"]["1"]],
+            ["10.0.0.4", "10.0.0.2"],
+        )
 
     def test_queue_summary_combines_exact_window_metrics_and_demands(self):
         q0 = {"flow_id": "10", "queue_id": "0"}
@@ -158,6 +163,7 @@ class LocalTelemetryCacheTests(unittest.TestCase):
             "start_ns": self.base_ns,
             "stop_ns": self.base_ns + 10_000_000,
             "qids": [0],
+            "top_n": 2,
         })
 
         self.assertTrue(response["ok"])
@@ -167,6 +173,10 @@ class LocalTelemetryCacheTests(unittest.TestCase):
         self.assertEqual(response["metrics"]["0"]["util_p95"], 72.0)
         self.assertEqual(response["demands"]["0"]["src_ip"], "10.0.0.3")
         self.assertEqual(response["demands"]["0"]["dst_ip"], "10.0.0.4")
+        self.assertEqual(
+            [item["dst_ip"] for item in response["top_demands"]["0"]],
+            ["10.0.0.4", "10.0.0.2"],
+        )
         self.assertEqual(response["window"]["count"], 5)
         self.assertEqual(response["window"]["min_ns"], self.base_ns + 1_000_000)
         self.assertEqual(response["window"]["max_ns"], self.base_ns + 3_000_000)

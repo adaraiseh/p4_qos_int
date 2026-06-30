@@ -5,20 +5,20 @@ rl_agent_4.py - Simplified DQN for per-queue QoS path optimization using P4 INT 
 
 Key Design Principles:
 1. Single centralized DQN agent
-2. Frame stacking (960 features) - stacked observations + stacked one-hot actions
+2. Frame stacking (1200 features) - stacked observations + stacked one-hot actions
 3. Action history as one-hot vectors - agent knows "I caused this" vs "happened naturally"
 4. Clear SLA-based reward - bounded, no improvement bonus (avoids rewarding noise)
-5. Focused action space (8 actions) - no-op + 6 single + 1 multi-queue
+5. Focused action space (14 actions) - no-op + queue/alt/K choices + multi-K1
 6. Prioritized Experience Replay - learn from rare important events
 7. Proper episode boundaries - clear termination conditions
 8. Tuned timing for 100% post-action data capture
 9. Queue-specific bottleneck detection and alternative metrics
 10. EMA temporal smoothing for latency trends
 
-State Composition (960 features):
-- Stacked Observations: 52 metrics * 16 frames = 832 features
-- Stacked Actions (one-hot): 8 actions * 16 frames = 128 features
-- Total: 960 features
+State Composition (1200 features):
+- Stacked Observations: 61 metrics * 16 frames = 976 features
+- Stacked Actions (one-hot): 14 actions * 16 frames = 224 features
+- Total: 1200 features
 
 Benefits:
 - Agent sees velocity/trends (is latency rising or falling?)
@@ -124,14 +124,14 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 # =============================================================================
 # Network
 HIDDEN_DIM = 128        # Reduced from 256 for smaller state space
-RAW_STATE_DIM = 52      # INCREASED from 50 to 52: 3×16 + 2 + 2 (added topology encoding: is_fat_tree, is_leaf_spine)
+RAW_STATE_DIM = 61      # 3×16 queue features + 3×3 batch features + 4 global/topology features
 STACK_SIZE = 16         # Extended for burst detection (~32s history at ~2s/step)
 STACK_DECAY = 0.85      # SHARPENED from 0.95 to 0.85 - reduces weight of stale data (oldest ~8% vs 46%)
-ACTION_DIM = 8          # No-op + 6 single (3 queues × 2 alts) + 1 multi
+ACTION_DIM = 14         # No-op + 12 single (3 queues × 2 alts × K{1,2}) + 1 multi-K1
 # State composition: stacked observations + stacked one-hot actions
-# Observations: 52 metrics * 16 frames = 832
-# Actions: 8 (one-hot) * 16 frames = 128
-# Total: 832 + 128 = 960
+# Observations: 61 metrics * 16 frames = 976
+# Actions: 14 (one-hot) * 16 frames = 224
+# Total: 976 + 224 = 1200
 STATE_DIM = (RAW_STATE_DIM * STACK_SIZE) + (ACTION_DIM * STACK_SIZE)
 
 # Per-queue raw-state layout. Keep these in sync with _build_raw_state().
@@ -148,13 +148,13 @@ LR = 1e-4  # Increased from 1e-5 for faster convergence
 GAMMA = 0.97  # Faster credit assignment for ~2s step delay
 BATCH_SIZE = 64  # Increased from 32 for more stable gradients
 MIN_REPLAY_SIZE = 500  # Start learning much sooner
-REPLAY_CAPACITY = 50_000
+REPLAY_CAPACITY = 80_000
 
 # Prioritized Experience Replay
 PER_ALPHA = 0.6  # Prioritization exponent
 PER_BETA_START = 0.4  # Importance sampling start
 PER_BETA_END = 1.0
-PER_BETA_STEPS = 25_000  # Anneal to 1.0 by ~50% of 50K training
+PER_BETA_STEPS = 25_000  # Anneal to 1.0 early in the curriculum
 
 # Epsilon schedule
 EPS_START = 1.0
@@ -237,6 +237,13 @@ ACTION_COST_ALL_SLA_MET_EXTRA = 0.25
 ACTION_COST_SAME_QUEUE_REPEAT_EXTRA = 0.10
 ACTION_COST_EXACT_REPEAT_EXTRA = 0.20
 ACTION_COST_RECOVERING_REPEAT_EXTRA = 0.05
+ACTION_COST_BATCH_EXTRA = 0.05
+
+# Batch demand-unit rerouting. The dataplane overlay key is qid+dst_ip, so the
+# control-plane lock key is qid+dst_ip+bottleneck_sid.
+K_CHOICES = (1, 2)
+TOP_N_HOT_DEMANDS = 6
+DEMAND_LOCK_STEPS = 5
 
 # Soft margin around SLA (reduces reward flip-flopping)
 SLA_SOFT_MARGIN = 0.1  # REDUCED from 0.2 to 0.1 (10%) - tighter margin provides stronger training signal
@@ -287,10 +294,13 @@ def action_to_name(action: int) -> str:
     """Convert action index to human-readable name."""
     ACTION_NAMES = {
         0: "noop",
-        1: "v0-alt0", 2: "v0-alt1",
-        3: "v1-alt0", 4: "v1-alt1",
-        5: "be-alt0", 6: "be-alt1",
-        7: "multi"
+        1: "v0-alt0-k1", 2: "v0-alt0-k2",
+        3: "v0-alt1-k1", 4: "v0-alt1-k2",
+        5: "v1-alt0-k1", 6: "v1-alt0-k2",
+        7: "v1-alt1-k1", 8: "v1-alt1-k2",
+        9: "be-alt0-k1", 10: "be-alt0-k2",
+        11: "be-alt1-k1", 12: "be-alt1-k2",
+        13: "multi-k1",
     }
     return ACTION_NAMES.get(action, str(action))
 
@@ -493,7 +503,61 @@ class PrioritizedReplayBuffer:
             self.max_priority = max(self.max_priority, raw_priority)
             # Tree stores exponentiated priority
             self.tree.update(idx, raw_priority ** self.alpha)
-    
+
+    def load_state(
+        self,
+        tree_values,
+        data_values,
+        write: int,
+        n_entries: int,
+        max_priority: float,
+    ) -> None:
+        """Load replay state, resizing safely when capacity changed."""
+        old_data = np.asarray(data_values, dtype=object)
+        old_capacity = int(len(old_data))
+        if old_capacity <= 0:
+            self.tree = SumTree(self.capacity)
+            self.max_priority = max(float(max_priority or 1.0), 1.0)
+            return
+
+        old_tree = np.asarray(tree_values)
+        old_write = int(write or 0) % old_capacity
+        old_entries = min(max(0, int(n_entries or 0)), old_capacity)
+
+        if old_capacity == self.capacity:
+            self.tree.tree = old_tree.copy()
+            self.tree.data = old_data.copy()
+            self.tree.write = old_write
+            self.tree.n_entries = old_entries
+            self.max_priority = max(float(max_priority or 1.0), 1.0)
+            return
+
+        old_leaves = old_tree[old_capacity - 1: old_capacity - 1 + old_capacity]
+        if old_entries < old_capacity:
+            chronological = list(range(old_entries))
+        else:
+            chronological = list(range(old_write, old_capacity)) + list(range(0, old_write))
+
+        keep_indexes = chronological[-self.capacity:]
+        resized = SumTree(self.capacity)
+        for old_idx in keep_indexes:
+            item = old_data[old_idx]
+            if item is None:
+                continue
+            priority = float(old_leaves[old_idx]) if old_idx < len(old_leaves) else 0.0
+            if priority <= 0.0:
+                priority = 1.0 ** self.alpha
+            resized.add(priority, item)
+
+        self.tree = resized
+        self.max_priority = max(float(max_priority or 1.0), 1.0)
+        log.info(
+            "Resized replay buffer from %d to %d capacity; loaded %d entries",
+            old_capacity,
+            self.capacity,
+            self.tree.n_entries,
+        )
+
     def __len__(self) -> int:
         return self.tree.n_entries
 
@@ -905,21 +969,25 @@ class DQNAgent:
             for topo_name, state in checkpoint['multi_replay_buffers'].items():
                 self.replay_buffer.set_topology(topo_name)
                 buf = self.replay_buffer.buffers[topo_name]
-                buf.tree.tree = state['tree']
-                buf.tree.data = state['data']
-                buf.tree.write = state['write']
-                buf.tree.n_entries = state['n_entries']
-                buf.max_priority = state['max_priority']
+                buf.load_state(
+                    state['tree'],
+                    state['data'],
+                    state['write'],
+                    state['n_entries'],
+                    state['max_priority'],
+                )
             current_topology = checkpoint.get('current_topology')
             if current_topology:
                 self.replay_buffer.set_topology(current_topology)
             log.info(f"Loaded multi-topology replay buffer with {len(self.replay_buffer)} experiences")
         elif 'replay_tree' in checkpoint and not self.multi_buffer:
-            self.replay_buffer.tree.tree = checkpoint['replay_tree']
-            self.replay_buffer.tree.data = checkpoint['replay_data']
-            self.replay_buffer.tree.write = checkpoint['replay_write']
-            self.replay_buffer.tree.n_entries = checkpoint['replay_n_entries']
-            self.replay_buffer.max_priority = checkpoint['replay_max_priority']
+            self.replay_buffer.load_state(
+                checkpoint['replay_tree'],
+                checkpoint['replay_data'],
+                checkpoint['replay_write'],
+                checkpoint['replay_n_entries'],
+                checkpoint['replay_max_priority'],
+            )
             log.info(f"Loaded replay buffer with {len(self.replay_buffer)} experiences")
         elif 'replay_tree' in checkpoint and self.multi_buffer:
             log.warning("Checkpoint has single replay buffer but agent uses --multi-buffer; replay not loaded")
@@ -1039,36 +1107,40 @@ class QoSRoutingEnv:
     """
     Environment for QoS-aware routing optimization using P4 INT metrics.
     
-    State: 464 features (8-frame stacking to capture action delay + trends)
+    State: 1200 features (16-frame stacking to capture action delay + trends)
       Frame stacking provides velocity/trend information.
       
-      Raw observation (50 features):
+      Raw observation (61 features):
         - Per queue (16 features × 3 = 48):
             - Basic metrics: lat_ratio, drop_norm, util_norm, sla_met, lat_ema, lat_ema_diff (6)
             - Bottleneck: present, drop, lat, util (4)
             - Alternatives (2 × 3 = 6): available, drop_vs_bn, lat_vs_bn
-        - Global (2): max_pressure, steps_since_action (2)
+        - Batch features (3 × 3 = 9): eligible_count_norm, top1_pressure_norm, top2_pressure_norm
+        - Global/topology (4): max_pressure, steps_since_action, is_fat_tree, is_leaf_spine
       
-    Actions: 8
+    Actions: 14
       - 0: No-op
-      - 1-2: Queue 0 -> Alt 0, 1 (Voice)
-      - 3-4: Queue 1 -> Alt 0, 1 (Video)
-      - 5-6: Queue 7 -> Alt 0, 1 (BE)
-      - 7: Multi-queue reroute (all violating queues)
+      - 1-4: Queue 0 -> Alt 0/1, K1/K2 (Voice)
+      - 5-8: Queue 1 -> Alt 0/1, K1/K2 (Video)
+      - 9-12: Queue 7 -> Alt 0/1, K1/K2 (BE)
+      - 13: Multi-queue reroute, K1 per violating queue
     
     Reward:
       - SLA-based with soft margin, drop penalty, action cost
     """
     
-    # Action to (queue, alt_index) mapping
+    # Action to (queue, alt_index, batch_k) mapping
     # alt_index is 0-based index into the available alternatives list
-    # 'multi' triggers multi-queue rerouting for all violating queues
+    # 'multi' triggers K1 rerouting for all violating queues
     ACTION_MAP = {
         0: None,                         # No-op
-        1: (0, 0), 2: (0, 1),            # Voice alts
-        3: (1, 0), 4: (1, 1),            # Video alts
-        5: (7, 0), 6: (7, 1),            # BE alts
-        7: 'multi',                       # Multi-queue reroute
+        1: (0, 0, 1), 2: (0, 0, 2),      # Voice alt0 K1/K2
+        3: (0, 1, 1), 4: (0, 1, 2),      # Voice alt1 K1/K2
+        5: (1, 0, 1), 6: (1, 0, 2),      # Video alt0 K1/K2
+        7: (1, 1, 1), 8: (1, 1, 2),      # Video alt1 K1/K2
+        9: (7, 0, 1), 10: (7, 0, 2),     # BE alt0 K1/K2
+        11: (7, 1, 1), 12: (7, 1, 2),    # BE alt1 K1/K2
+        13: 'multi',                      # Multi-queue reroute, K1 per queue
     }
     
     MAX_ALTS = 2
@@ -1152,13 +1224,16 @@ class QoSRoutingEnv:
         # Cache snapshots for comparison
         self.last_snapshot = None
         self._last_rerouted_qids = []
+        self._last_rerouted_units: List[Dict[str, Any]] = []
+        self._last_batch_reroute_count = 0
+        self._demand_unit_locks: Dict[Tuple[int, str, int], int] = {}
 
         # Frame stacking for velocity/trend detection
-        # Stores last STACK_SIZE raw observation states (each 50-dim)
+        # Stores last STACK_SIZE raw observation states (each RAW_STATE_DIM-dim)
         self.frame_stack: deque = deque(maxlen=STACK_SIZE)
         
         # Action stacking for causality tracking
-        # Stores last STACK_SIZE actions as one-hot vectors (each 8-dim)
+        # Stores last STACK_SIZE actions as one-hot vectors (each ACTION_DIM-dim)
         self.action_stack: deque = deque(maxlen=STACK_SIZE)
 
         # CPU Optimization: Preallocated arrays for _build_stacked_state()
@@ -1227,6 +1302,45 @@ class QoSRoutingEnv:
     def _min_required_valid_count(self) -> int:
         required_count = len(self._required_qids_for_current_profile())
         return required_count if required_count <= 2 else 2
+
+    @staticmethod
+    def _unit_key(qid: int, dst_ip: str, bottleneck_sid: int) -> Tuple[int, str, int]:
+        return (int(qid), str(dst_ip), int(bottleneck_sid))
+
+    def _expire_demand_unit_locks(self) -> None:
+        if not self._demand_unit_locks:
+            return
+        now_step = int(getattr(self, "global_step", 0))
+        expired = [
+            key for key, unlock_step in self._demand_unit_locks.items()
+            if int(unlock_step) <= now_step
+        ]
+        for key in expired:
+            self._demand_unit_locks.pop(key, None)
+
+    def _is_unit_locked(self, qid: int, dst_ip: str, bottleneck_sid: int) -> bool:
+        self._expire_demand_unit_locks()
+        key = self._unit_key(qid, dst_ip, bottleneck_sid)
+        return int(self._demand_unit_locks.get(key, -1)) > int(getattr(self, "global_step", 0))
+
+    def _lock_demand_unit(self, qid: int, dst_ip: str, bottleneck_sid: int) -> None:
+        key = self._unit_key(qid, dst_ip, bottleneck_sid)
+        self._demand_unit_locks[key] = int(getattr(self, "global_step", 0)) + DEMAND_LOCK_STEPS
+
+    def _unlock_demand_unit(self, qid: int, dst_ip: str, bottleneck_sid: int) -> None:
+        self._demand_unit_locks.pop(self._unit_key(qid, dst_ip, bottleneck_sid), None)
+
+    @staticmethod
+    def _candidate_pressure(mean_latency: float, sla: float, bottleneck_score: float) -> float:
+        try:
+            lat_ratio_norm = min(max(float(mean_latency) / float(sla), 0.0), LAT_RATIO_CAP) / LAT_RATIO_CAP
+        except (TypeError, ValueError, ZeroDivisionError):
+            lat_ratio_norm = 0.0
+        try:
+            bn_norm = min(max(float(bottleneck_score), 0.0), 1.0)
+        except (TypeError, ValueError):
+            bn_norm = 0.0
+        return float(min(max(0.7 * lat_ratio_norm + 0.3 * bn_norm, 0.0), 1.0))
 
     def _program_baseline_routing(self) -> None:
         """Clear P4 state and restore the OSPF baseline."""
@@ -1422,6 +1536,9 @@ class QoSRoutingEnv:
         if do_reset:
             log.info("=== BASELINE START: Resetting network to OSPF ===")
             self._program_baseline_routing()
+            self._demand_unit_locks.clear()
+            self._last_rerouted_units = []
+            self._last_batch_reroute_count = 0
         else:
             log.info("=== WARM START: Continuing from current routing state ===")
 
@@ -1758,12 +1875,13 @@ class QoSRoutingEnv:
         start: str,
         stop: str,
         target_queues: List[int],
-    ) -> Tuple[Dict, Dict[int, Tuple[str, str]]]:
+    ) -> Tuple[Dict, Dict[int, List[Dict[str, Any]]]]:
         response = self._cache_request({
             "kind": "queue_summary",
             "start_ns": iso_to_ns(start),
             "stop_ns": iso_to_ns(stop),
             "qids": target_queues,
+            "top_n": TOP_N_HOT_DEMANDS,
         })
         result = {
             'metrics': {qid: {'lat_p95': None, 'drop_p95': None, 'util_p95': None} for qid in QIDS},
@@ -1772,7 +1890,7 @@ class QoSRoutingEnv:
             'window': None,
             'recovered_via_retry': set(),
         }
-        demands: Dict[int, Tuple[str, str]] = {}
+        demands: Dict[int, List[Dict[str, Any]]] = {}
         if response is None:
             return result, demands
 
@@ -1797,37 +1915,102 @@ class QoSRoutingEnv:
                     src_counts.get(received_name, 0) or 0
                 )
 
+        top_demands = response.get("top_demands")
+        if not isinstance(top_demands, dict):
+            top_demands = {}
+
+        for qid_text, items in top_demands.items():
+            try:
+                qid = int(qid_text)
+            except (TypeError, ValueError):
+                continue
+            if qid not in target_queues:
+                continue
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                src = item.get("src_ip")
+                dst = item.get("dst_ip")
+                if src and dst:
+                    demands.setdefault(qid, []).append({
+                        "src_ip": str(src),
+                        "dst_ip": str(dst),
+                        "mean_latency": float(item.get("mean_latency", 0.0) or 0.0),
+                        "count": int(item.get("count", 0) or 0),
+                    })
+
+        # Backward compatibility with older cache responses that expose only the
+        # hottest demand per queue under "demands".
         for qid_text, item in response.get("demands", {}).items():
             try:
                 qid = int(qid_text)
             except (TypeError, ValueError):
                 continue
+            if qid in demands:
+                continue
             src = item.get("src_ip")
             dst = item.get("dst_ip")
             if qid in target_queues and src and dst:
-                demands[qid] = (str(src), str(dst))
+                demands[qid] = [{
+                    "src_ip": str(src),
+                    "dst_ip": str(dst),
+                    "mean_latency": float(item.get("mean_latency", 0.0) or 0.0),
+                    "count": int(item.get("count", 0) or 0),
+                }]
 
         return result, demands
 
-    def _cache_hot_demands(self, start: str, stop: str, target_queues: List[int]) -> Dict[int, Tuple[str, str]]:
+    def _cache_hot_demands(self, start: str, stop: str, target_queues: List[int]) -> Dict[int, List[Dict[str, Any]]]:
         response = self._cache_request({
             "kind": "hot_demands",
             "start_ns": iso_to_ns(start),
             "stop_ns": iso_to_ns(stop),
             "qids": target_queues,
+            "top_n": TOP_N_HOT_DEMANDS,
         })
         if response is None:
             return {}
         demands = {}
+        top_demands = response.get("top_demands")
+        if isinstance(top_demands, dict):
+            for qid_text, items in top_demands.items():
+                try:
+                    qid = int(qid_text)
+                except (TypeError, ValueError):
+                    continue
+                if qid not in target_queues or not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    src = item.get("src_ip")
+                    dst = item.get("dst_ip")
+                    if src and dst:
+                        demands.setdefault(qid, []).append({
+                            "src_ip": str(src),
+                            "dst_ip": str(dst),
+                            "mean_latency": float(item.get("mean_latency", 0.0) or 0.0),
+                            "count": int(item.get("count", 0) or 0),
+                        })
+
         for qid_text, item in response.get("demands", {}).items():
             try:
                 qid = int(qid_text)
             except (TypeError, ValueError):
                 continue
+            if qid in demands:
+                continue
             src = item.get("src_ip")
             dst = item.get("dst_ip")
             if qid in target_queues and src and dst:
-                demands[qid] = (str(src), str(dst))
+                demands[qid] = [{
+                    "src_ip": str(src),
+                    "dst_ip": str(dst),
+                    "mean_latency": float(item.get("mean_latency", 0.0) or 0.0),
+                    "count": int(item.get("count", 0) or 0),
+                }]
         return demands
 
     def _cache_switch_metrics_for_queue(self, start: str, stop: str,
@@ -2482,6 +2665,12 @@ class QoSRoutingEnv:
             'bottleneck_lat': 0.0,   # Bottleneck switch latency
             'bottleneck_role': 'other',  # Bottleneck switch role (tor/agg/core/other)
             'path_nodes': [],
+            'candidate_units': [],
+            'eligible_count': 0,
+            'eligible_count_norm': 0.0,
+            'top1_pressure_norm': 0.0,
+            'top2_pressure_norm': 0.0,
+            'locked_units_skipped': 0,
             'data_valid': False,  # Track telemetry validity
             'telemetry_counts': {'lat': 0, 'drop': 0, 'util': 0},
         } for qid in QIDS}
@@ -2657,7 +2846,7 @@ class QoSRoutingEnv:
         # This ensures accurate per-queue congestion identification
         # Note: all_hot_demands already retrieved from parallel query above
 
-        cache_path_context = {}
+        cache_path_context: Dict[int, List[Dict[str, Any]]] = {}
         cache_path_metrics = {}
         phase_t0 = time.perf_counter()
         if self._read_from_cache():
@@ -2668,28 +2857,38 @@ class QoSRoutingEnv:
                 if not self.controller._is_edge_switch(int(sid))
             ]
             for qid in QIDS:
-                hot = all_hot_demands.get(qid)
-                if not hot:
-                    continue
-                src_ip, dst_ip = hot
-                path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
-                if not path:
-                    continue
-                sw_names = [n for n in path if n in self.controller.switch_name_to_id]
-                sw_ids = [int(self.controller.switch_name_to_id[n]) for n in sw_names]
-                if not sw_ids:
-                    continue
-                cache_path_context[qid] = {
-                    'src_ip': src_ip,
-                    'dst_ip': dst_ip,
-                    'path': list(path),
-                    'sw_ids': sw_ids,
-                }
+                for item in all_hot_demands.get(qid, []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    src_ip = item.get("src_ip")
+                    dst_ip = item.get("dst_ip")
+                    if not (src_ip and dst_ip):
+                        continue
+                    path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
+                    if not path:
+                        continue
+                    sw_names = [n for n in path if n in self.controller.switch_name_to_id]
+                    sw_ids = [int(self.controller.switch_name_to_id[n]) for n in sw_names]
+                    if not sw_ids:
+                        continue
+                    cache_path_context.setdefault(qid, []).append({
+                        'src_ip': str(src_ip),
+                        'dst_ip': str(dst_ip),
+                        'path': list(path),
+                        'sw_ids': sw_ids,
+                        'mean_latency': float(item.get("mean_latency", 0.0) or 0.0),
+                        'count': int(item.get("count", 0) or 0),
+                    })
                 # The cache scans the exact same time window either way. Asking
                 # for all reroutable switches once lets us reuse the result for
                 # both bottleneck and alternative ranking, avoiding a second
                 # full cache scan without changing the observation data.
-                sw_ids_by_qid[qid] = metric_switch_ids or sw_ids
+                if cache_path_context.get(qid):
+                    sw_ids_by_qid[qid] = metric_switch_ids or sorted({
+                        sid
+                        for ctx in cache_path_context.get(qid, [])
+                        for sid in ctx.get('sw_ids', [])
+                    })
             snapshot_timing['path_context'] = (time.perf_counter() - phase_t0) * 1000.0
 
             if sw_ids_by_qid:
@@ -2709,127 +2908,167 @@ class QoSRoutingEnv:
 
         phase_t0 = time.perf_counter()
         for qid in QIDS:
-            cached_path = cache_path_context.get(qid)
-            if cached_path is not None:
-                src_ip = cached_path['src_ip']
-                dst_ip = cached_path['dst_ip']
-                path = cached_path['path']
-                sw_ids = cached_path['sw_ids']
-            else:
-                # Find hottest demand for this queue from batch result
-                hot = all_hot_demands.get(qid)
-                if not hot:
-                    if qid not in required_qids:
+            contexts = list(cache_path_context.get(qid, []) or [])
+            if not contexts:
+                for item in all_hot_demands.get(qid, []) or []:
+                    if not isinstance(item, dict):
                         continue
-                    # No cache fallback - retry logic already exhausted in _get_all_hottest_demands
-                    log.info(f"[Snapshot] Queue {qid}: No hot demand found after retries, skipping bottleneck detection")
-                    continue
+                    src_ip = item.get("src_ip")
+                    dst_ip = item.get("dst_ip")
+                    if not (src_ip and dst_ip):
+                        continue
+                    path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
+                    if not path:
+                        continue
+                    sw_names = [n for n in path if n in self.controller.switch_name_to_id]
+                    sw_ids = [int(self.controller.switch_name_to_id[n]) for n in sw_names]
+                    if not sw_ids:
+                        continue
+                    contexts.append({
+                        'src_ip': str(src_ip),
+                        'dst_ip': str(dst_ip),
+                        'path': list(path),
+                        'sw_ids': sw_ids,
+                        'mean_latency': float(item.get("mean_latency", 0.0) or 0.0),
+                        'count': int(item.get("count", 0) or 0),
+                    })
 
-                src_ip, dst_ip = hot
-                # Get current path for THIS queue (uses queue-specific paths after reroutes)
-                path = self.controller.get_path_by_ips_for_queue(src_ip, dst_ip, qid)
-                if not path:
-                    log.info(f"[Snapshot] Queue {qid}: No path found for ({src_ip}, {dst_ip})")
-                    continue
-
-                # --- Step A: Path Metrics (Queue-Specific) ---
-                # Query metrics filtered by this queue_id for accurate bottleneck detection
-                # Filter to switches only (exclude hosts) - check against known switch names
-                sw_names = [n for n in path if n in self.controller.switch_name_to_id]
-                sw_ids = [self.controller.switch_name_to_id[n] for n in sw_names]
-                sw_ids = [int(s) for s in sw_ids]
-
-            log.debug(f"[Snapshot] Queue {qid}: hot_demand=({src_ip}, {dst_ip})")
-            snapshot[qid]['hot_src_ip'] = src_ip
-            snapshot[qid]['hot_dst_ip'] = dst_ip
-            snapshot[qid]['path_nodes'] = list(path)
-            
-            if not sw_ids:
+            if not contexts:
+                if qid in required_qids:
+                    log.info(f"[Snapshot] Queue {qid}: No hot demand candidates found after retries")
                 continue
-                
-            # Query path switches with queue_id filter for accurate per-queue bottleneck
-            if qid in cache_path_metrics:
-                path_metrics = cache_path_metrics.get(qid, {})
-            else:
-                path_metrics = self._query_switch_metrics_for_queue(
-                    sw_ids,
-                    qid,
-                    start,
-                    stop,
-                )
-            
-            # Identify Bottleneck (SKIP edge switches - they have no alternatives)
-            best_sid, best_score = None, -1.0
-            for sid in sw_ids:
-                # Skip edge switches (leaf/tor/access) - they're at edge and have no alt paths
-                if self.controller._is_edge_switch(sid):
+
+            by_unit: Dict[Tuple[int, str, int], Dict[str, Any]] = {}
+            locked_skipped = 0
+            for ctx in contexts:
+                sw_ids = ctx.get('sw_ids') or []
+                if not sw_ids:
                     continue
-                
-                r = path_metrics.get(sid, {'drop': 0, 'lat': 0})
-                drop_norm = min(r['drop'], DROP_CAP) / DROP_CAP
-                lat_norm = min(r['lat'], SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
-                score = 0.6 * drop_norm + 0.4 * lat_norm
-                if score > best_score:
-                    best_sid, best_score = sid, score
-            
-            snapshot[qid]['bottleneck_sid'] = best_sid
-            # Cache the bottleneck score for later use (CPU optimization - avoid recomputation)
-            snapshot[qid]['bottleneck_score'] = best_score
 
-            if best_sid is not None:
-                # Store bottleneck stats (queue-specific)
-                bm = path_metrics.get(best_sid, {'drop': 0, 'lat': 0, 'util': 0})
-                snapshot[qid]['bottleneck_drop'] = bm['drop']
-                snapshot[qid]['bottleneck_lat'] = bm['lat']
-                snapshot[qid]['bottleneck_util'] = bm['util']
-                snapshot[qid]['bottleneck_role'] = self.controller._normalize_role(self.controller._role_of_sid(best_sid))
+                if qid in cache_path_metrics:
+                    path_metrics = cache_path_metrics.get(qid, {})
+                else:
+                    path_metrics = self._query_switch_metrics_for_queue(
+                        sw_ids,
+                        qid,
+                        start,
+                        stop,
+                    )
 
-                # --- Step B: Alternatives (Queue-Specific) ---
-                # Get alternatives only for the selected bottleneck. The previous
-                # local-cache fast path eagerly expanded alternates for every
-                # switch on every path, which made route-context work dominate
-                # each step under CPU pressure.
-                alts = self.controller.find_all_alternates(best_sid, path)
-                log.debug(f"[Snapshot] Queue {qid}: bottleneck={best_sid}, role={snapshot[qid]['bottleneck_role']}, alternatives={alts}")
+                best_sid, best_score = None, -1.0
+                for sid in sw_ids:
+                    if self.controller._is_edge_switch(sid):
+                        continue
+                    r = path_metrics.get(sid, {'drop': 0, 'lat': 0})
+                    drop_norm = min(r.get('drop', 0), DROP_CAP) / DROP_CAP
+                    lat_norm = min(r.get('lat', 0), SLA_THRESHOLDS[qid]) / SLA_THRESHOLDS[qid]
+                    score = 0.6 * drop_norm + 0.4 * lat_norm
+                    if score > best_score:
+                        best_sid, best_score = sid, score
 
-                # Collect valid alt switch IDs for this queue
+                if best_sid is None:
+                    continue
+
+                dst_ip = str(ctx['dst_ip'])
+                unit_key = self._unit_key(qid, dst_ip, int(best_sid))
+                if self._is_unit_locked(qid, dst_ip, int(best_sid)):
+                    locked_skipped += 1
+                    continue
+
+                alts = self.controller.find_all_alternates(best_sid, ctx['path'])
                 valid_alts = []
-                alt_sids = []
                 for alt_name in alts:
                     alt_sid = self.controller.switch_name_to_id.get(alt_name)
                     if alt_sid is not None:
                         valid_alts.append((alt_name, int(alt_sid)))
-                        alt_sids.append(int(alt_sid))
 
-                # Query alternative metrics for THIS queue specifically
-                if alt_sids:
-                    if self._read_from_cache() and qid in cache_path_metrics:
-                        final_alts = self._rank_alternatives(
-                            qid,
-                            best_score,
-                            valid_alts,
-                            cache_path_metrics.get(qid, {}),
-                        )
-                        snapshot[qid]['alternatives'] = final_alts
-                        snapshot[qid]['alt_exists'] = bool(final_alts)
-                    else:
-                        alt_metrics = self._query_switch_metrics_for_queue(
-                            alt_sids,
-                            qid,
-                            start,
-                            stop,
-                        )
-                        final_alts = self._rank_alternatives(
-                            qid,
-                            best_score,
-                            valid_alts,
-                            alt_metrics,
-                        )
-                        snapshot[qid]['alternatives'] = final_alts
-                        snapshot[qid]['alt_exists'] = bool(final_alts)
+                if valid_alts:
+                    final_alts = self._rank_alternatives(
+                        qid,
+                        best_score,
+                        valid_alts,
+                        path_metrics,
+                    )
                 else:
-                    snapshot[qid]['alternatives'] = []
-                    snapshot[qid]['alt_exists'] = False
+                    final_alts = []
+
+                bm = path_metrics.get(best_sid, {'drop': 0, 'lat': 0, 'util': 0})
+                pressure = self._candidate_pressure(
+                    ctx.get('mean_latency', 0.0),
+                    SLA_THRESHOLDS[qid],
+                    best_score,
+                )
+                candidate = {
+                    'qid': qid,
+                    'src_ip': ctx['src_ip'],
+                    'dst_ip': dst_ip,
+                    'bottleneck_sid': int(best_sid),
+                    'unit_key': unit_key,
+                    'path_nodes': list(ctx['path']),
+                    'sw_ids': list(sw_ids),
+                    'mean_latency': float(ctx.get('mean_latency', 0.0) or 0.0),
+                    'count': int(ctx.get('count', 0) or 0),
+                    'pressure_norm': pressure,
+                    'bottleneck_score': float(best_score),
+                    'bottleneck_drop': bm.get('drop', 0.0),
+                    'bottleneck_lat': bm.get('lat', 0.0),
+                    'bottleneck_util': bm.get('util', 0.0),
+                    'bottleneck_role': self.controller._normalize_role(
+                        self.controller._role_of_sid(best_sid)
+                    ),
+                    'alternatives': final_alts,
+                }
+
+                existing = by_unit.get(unit_key)
+                if existing is None or candidate['pressure_norm'] > existing.get('pressure_norm', 0.0):
+                    by_unit[unit_key] = candidate
+
+            eligible = sorted(
+                by_unit.values(),
+                key=lambda item: (
+                    float(item.get('pressure_norm', 0.0)),
+                    float(item.get('mean_latency', 0.0)),
+                ),
+                reverse=True,
+            )
+            snapshot[qid]['locked_units_skipped'] = locked_skipped
+            if not eligible:
+                continue
+
+            selected = eligible[0]
+            selected_bn = int(selected['bottleneck_sid'])
+            same_bn = [
+                item for item in eligible
+                if int(item.get('bottleneck_sid')) == selected_bn
+            ]
+
+            snapshot[qid]['candidate_units'] = same_bn
+            snapshot[qid]['eligible_count'] = len(same_bn)
+            snapshot[qid]['eligible_count_norm'] = (
+                0.0 if len(same_bn) <= 0 else 0.5 if len(same_bn) == 1 else 1.0
+            )
+            snapshot[qid]['top1_pressure_norm'] = float(same_bn[0].get('pressure_norm', 0.0))
+            snapshot[qid]['top2_pressure_norm'] = (
+                float(same_bn[1].get('pressure_norm', 0.0))
+                if len(same_bn) >= 2 else 0.0
+            )
+
+            log.debug(
+                f"[Snapshot] Queue {qid}: selected_unit=({selected['src_ip']}, "
+                f"{selected['dst_ip']}) bn={selected_bn} "
+                f"eligible_same_bn={len(same_bn)}"
+            )
+            snapshot[qid]['hot_src_ip'] = selected['src_ip']
+            snapshot[qid]['hot_dst_ip'] = selected['dst_ip']
+            snapshot[qid]['path_nodes'] = list(selected['path_nodes'])
+            snapshot[qid]['bottleneck_sid'] = selected_bn
+            snapshot[qid]['bottleneck_score'] = selected['bottleneck_score']
+            snapshot[qid]['bottleneck_drop'] = selected['bottleneck_drop']
+            snapshot[qid]['bottleneck_lat'] = selected['bottleneck_lat']
+            snapshot[qid]['bottleneck_util'] = selected['bottleneck_util']
+            snapshot[qid]['bottleneck_role'] = selected['bottleneck_role']
+            snapshot[qid]['alternatives'] = list(selected.get('alternatives', []))
+            snapshot[qid]['alt_exists'] = bool(snapshot[qid]['alternatives'])
         snapshot_timing['bottleneck_rank'] = (time.perf_counter() - phase_t0) * 1000.0
 
         snapshot_timing['total'] = (time.perf_counter() - snap_t0) * 1000.0
@@ -2945,8 +3184,8 @@ class QoSRoutingEnv:
         self,
         step: int,
         target_qids: Optional[List[int]] = None,
-    ) -> Dict[int, Tuple[str, str]]:
-        """Get the demand with highest latency for ALL queues in one query.
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Get the highest-latency demand candidates for all requested queues.
 
         Uses retry logic similar to flow_latency recovery:
         - Up to 5 retries with 1 second delay between each
@@ -2959,7 +3198,7 @@ class QoSRoutingEnv:
         start, stop = self._time_window()
 
         requested_qids = [int(qid) for qid in (target_qids or QIDS)]
-        results = {}
+        results: Dict[int, List[Dict[str, Any]]] = {}
         remaining_queues = set(requested_qids)
         max_retries = 5
         retry_delay = 1.0
@@ -2987,7 +3226,7 @@ class QoSRoutingEnv:
                 |> mean(column:"_value")
                 |> group(columns:["queue_id"])
                 |> sort(columns:["_value"], desc:true)
-                |> limit(n:1)
+                |> limit(n:{TOP_N_HOT_DEMANDS})
             '''
 
             t0 = time.time()
@@ -2999,9 +3238,9 @@ class QoSRoutingEnv:
                         list(remaining_queues),
                     )
                     elapsed_ms = (time.time() - t0) * 1000
-                    for qid, demand in cache_results.items():
+                    for qid, demands in cache_results.items():
                         if qid in remaining_queues:
-                            results[qid] = demand
+                            results[qid] = list(demands)
                             remaining_queues.discard(qid)
                 else:
                     tables = self.query_api.query(org=self.org, query=flux)
@@ -3014,11 +3253,19 @@ class QoSRoutingEnv:
                                     qid = int(record.values.get('queue_id', -1))
                                     src = record.values.get('src_ip')
                                     dst = record.values.get('dst_ip')
+                                    value = record.get_value()
                                     if qid in remaining_queues and src and dst:
-                                        results[qid] = (str(src), str(dst))
-                                        remaining_queues.discard(qid)
+                                        results.setdefault(qid, []).append({
+                                            "src_ip": str(src),
+                                            "dst_ip": str(dst),
+                                            "mean_latency": float(value or 0.0),
+                                            "count": int(record.values.get("_count", 0) or 0),
+                                        })
                                 except (ValueError, TypeError):
                                     continue
+                        for qid in list(remaining_queues):
+                            if results.get(qid):
+                                remaining_queues.discard(qid)
 
                 window_info = f"+{window_extension:.0f}s window" if window_extension > 0 else ""
                 if not remaining_queues:
@@ -3053,11 +3300,19 @@ class QoSRoutingEnv:
                                         qid = int(record.values.get('queue_id', -1))
                                         src = record.values.get('src_ip')
                                         dst = record.values.get('dst_ip')
+                                        value = record.get_value()
                                         if qid in remaining_queues and src and dst:
-                                            results[qid] = (str(src), str(dst))
-                                            remaining_queues.discard(qid)
+                                            results.setdefault(qid, []).append({
+                                                "src_ip": str(src),
+                                                "dst_ip": str(dst),
+                                                "mean_latency": float(value or 0.0),
+                                                "count": int(record.values.get("_count", 0) or 0),
+                                            })
                                     except (ValueError, TypeError):
                                         continue
+                            for qid in list(remaining_queues):
+                                if results.get(qid):
+                                    remaining_queues.discard(qid)
                     except Exception as influx_exc:
                         if attempt > 0:
                             log.warning(f"[Query S{step}] hot_demands retry {attempt+1}/{max_retries} FAILED "
@@ -3120,7 +3375,7 @@ class QoSRoutingEnv:
     
     def _build_raw_state(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
-        Build 52-dimensional raw observation vector with relative metrics encoding.
+        Build 61-dimensional raw observation vector with relative metrics encoding.
         (Actions are stacked separately as one-hot vectors)
 
         Layout per queue (16 features):
@@ -3128,13 +3383,16 @@ class QoSRoutingEnv:
           [6-9]: Bottleneck info (present, drop, lat, util)
           [10-15]: Alternatives 2 × 3 = 6 (available, drop_vs_bn, lat_vs_bn)
 
+        Batch features (9):
+          - Per queue: eligible_count_norm, top1_pressure_norm, top2_pressure_norm
+
         Global (4):
           - Max pressure
           - Steps since last action (normalized, helps avoid rapid oscillation)
           - is_fat_tree (1.0 or 0.0)
           - is_leaf_spine (1.0 or 0.0)
 
-        Total: 3×16 + 4 = 52 features
+        Total: 3×16 + 3×3 + 4 = 61 features
         """
         state = np.zeros(RAW_STATE_DIM, dtype=np.float32)
         
@@ -3211,6 +3469,14 @@ class QoSRoutingEnv:
             # Track pressure for global feature
             pressure = 0.5 * lat_ratio + 0.3 * drop_norm + 0.2 * util_norm
             pressures.append(pressure)
+
+        # --- 4. Batch candidate features (3 per queue) ---
+        for qid in QIDS:
+            q = snapshot[qid]
+            state[idx] = min(max(float(q.get('eligible_count_norm', 0.0) or 0.0), 0.0), 1.0)
+            state[idx+1] = min(max(float(q.get('top1_pressure_norm', 0.0) or 0.0), 0.0), 1.0)
+            state[idx+2] = min(max(float(q.get('top2_pressure_norm', 0.0) or 0.0), 0.0), 1.0)
+            idx += 3
         
         # Global max pressure
         state[idx] = max(pressures) if pressures else 0.0
@@ -3262,15 +3528,15 @@ class QoSRoutingEnv:
         Newer frames have more impact than older ones.
 
         Returns:
-            928-dimensional state vector:
-              - [0-799]: Stacked observations (50 * 16 = 800 features)
-              - [800-927]: Stacked one-hot actions (8 * 16 = 128 features)
+            1200-dimensional state vector:
+              - [0-975]: Stacked observations (61 * 16 = 976 features)
+              - [976-1199]: Stacked one-hot actions (14 * 16 = 224 features)
 
         Layout: [obs_t-15, ..., obs_t-1, obs_t,
                  act_t-15, ..., act_t-1, act_t]
 
-        Decay weights (STACK_DECAY=0.95, 16 frames):
-          frame 0 (oldest): 0.95^15 = 0.46
+        Decay weights (STACK_DECAY=0.85, 16 frames):
+          frame 0 (oldest): 0.85^15 ~= 0.087
           frame 15 (newest): 0.95^0 = 1.0
 
         This allows the agent to see:
@@ -3719,11 +3985,14 @@ class QoSRoutingEnv:
                 "base_action_cost": base,
                 "final_action_cost": base * max(1, count),
                 "targeted_qid": -1,
+                "requested_batch_size": 1,
+                "batch_reroute_count": count,
+                "batch_penalty": 0.0,
                 "multi_reroute_count": count,
             })
             return info
 
-        targeted_qid, _alt_idx = mapping
+        targeted_qid, _alt_idx, batch_k = mapping
         q_ctx = self._queue_intervention_context(targeted_qid, snapshot)
         repeat_ctx = self._action_repeat_context(action)
         context = q_ctx["intervention_context"]
@@ -3769,11 +4038,16 @@ class QoSRoutingEnv:
             if repeat_ctx["same_queue_repeat"] or repeat_ctx["exact_action_repeat"]:
                 repeat_penalty = ACTION_COST_RECOVERING_REPEAT_EXTRA
 
-        final_cost = base_cost + all_sla_penalty + repeat_penalty
+        actual_count = int(reroute_count or batch_k or 1)
+        batch_penalty = max(0, actual_count - 1) * ACTION_COST_BATCH_EXTRA
+        final_cost = base_cost + all_sla_penalty + repeat_penalty + batch_penalty
         info.update(self._queue_context_log_fields(q_ctx))
         info.update(repeat_ctx)
         info.update({
             "targeted_qid": targeted_qid,
+            "requested_batch_size": int(batch_k),
+            "batch_reroute_count": actual_count,
+            "batch_penalty": batch_penalty,
             "repeat_penalty": repeat_penalty,
             "all_sla_penalty": all_sla_penalty,
             "base_action_cost": base_cost,
@@ -3784,15 +4058,15 @@ class QoSRoutingEnv:
     def _get_valid_actions(self, snapshot: Dict[int, Dict]) -> np.ndarray:
         """
         Get mask of valid actions based on available alternatives.
-        Action 7 (multi) is valid if ANY queue has valid alternatives.
+        Action 13 (multi-K1) is valid when multiple violating queues have eligible units.
         """
         mask = np.zeros(ACTION_DIM, dtype=bool)
         mask[0] = True  # No-op always valid
+        if not snapshot:
+            return mask
         
         now = time.monotonic()
         in_cooldown = (now - self.last_action_time) < COOLDOWN_SECONDS
-        
-        any_valid_for_multi = False
         
         if not in_cooldown:
             actionable_qids = set(self._required_qids_for_current_profile())
@@ -3802,29 +4076,24 @@ class QoSRoutingEnv:
                 if mapping == 'multi':  # Handle multi-action separately
                     continue
                     
-                qid, alt_idx = mapping
+                qid, alt_idx, batch_k = mapping
                 if qid not in actionable_qids:
                     continue
                 
-                # Check if this queue has enough alternatives
-                q = snapshot[qid]
-                if q.get('bottleneck_sid') is not None:
-                    alts = q.get('alternatives', [])
-                    if alt_idx < len(alts):
-                        mask[action] = True
-                        any_valid_for_multi = True
+                units = self._eligible_units_for_action(snapshot, qid, alt_idx)
+                if len(units) >= int(batch_k):
+                    mask[action] = True
             
-            # Multi-action is valid ONLY if 2+ queues are VIOLATING SLA *and* have alternatives
+            # Multi-action is valid ONLY if 2+ queues are VIOLATING SLA *and* have eligible K1 units
             # This ensures multi-action is reserved for situations where multiple queues need help
             violating_with_alts = 0
             for qid in actionable_qids:
-                q = snapshot[qid]
                 # Check soft margin violation (consistent with step logic)
-                if self._is_sla_violated(qid, snapshot) and q.get('bottleneck_sid') is not None and len(q.get('alternatives', [])) > 0:
+                if self._is_sla_violated(qid, snapshot) and self._eligible_units_for_action(snapshot, qid, 0):
                     violating_with_alts += 1
 
             if violating_with_alts >= 2:
-                mask[7] = True
+                mask[13] = True
         
         return mask
     
@@ -3911,14 +4180,51 @@ class QoSRoutingEnv:
         
         return reward, info
     
+    def _eligible_units_for_action(
+        self,
+        snapshot: Dict[int, Dict],
+        qid: int,
+        alt_idx: int,
+    ) -> List[Dict[str, Any]]:
+        if not snapshot or qid not in snapshot:
+            return []
+        q = snapshot[qid]
+        selected_bn = q.get('bottleneck_sid')
+        if selected_bn is None:
+            return []
+        units = []
+        for unit in q.get('candidate_units', []) or []:
+            try:
+                unit_bn = int(unit.get('bottleneck_sid'))
+                dst_ip = str(unit.get('dst_ip'))
+            except (TypeError, ValueError):
+                continue
+            if unit_bn != int(selected_bn):
+                continue
+            if self._is_unit_locked(qid, dst_ip, unit_bn):
+                continue
+            alts = unit.get('alternatives', []) or []
+            if alt_idx >= len(alts):
+                continue
+            units.append(unit)
+        return sorted(
+            units,
+            key=lambda item: (
+                float(item.get('pressure_norm', 0.0)),
+                float(item.get('mean_latency', 0.0)),
+            ),
+            reverse=True,
+        )
+
     def _apply_multi_reroute(self, snapshot: Dict[int, Dict]) -> Tuple[bool, Optional[str], int]:
         """
-        Apply multi-queue reroute: reroutes ONLY queues violating SLA.
+        Apply multi-queue reroute: reroutes at most one unit per violating queue.
         
         Returns:
             (success, description, reroute_count) - count of queues rerouted
         """
         rerouted = []
+        rerouted_units = []
         actionable_qids = set(self._required_qids_for_current_profile())
         
         for qid in QIDS:
@@ -3929,17 +4235,17 @@ class QoSRoutingEnv:
             # Only reroute if SLA is violated
             if q['lat_p95'] <= SLA_THRESHOLDS[qid]:
                 continue
-                
-            # Need bottleneck and alternatives
-            src_ip = q.get('hot_src_ip')
-            dst_ip = q.get('hot_dst_ip')
-            bottleneck_sid = q.get('bottleneck_sid')
-            alts = q.get('alternatives', [])
-            
+
+            units = self._eligible_units_for_action(snapshot, qid, 0)
+            if not units:
+                continue
+            unit = units[0]
+            src_ip = unit.get('src_ip')
+            dst_ip = unit.get('dst_ip')
+            bottleneck_sid = unit.get('bottleneck_sid')
+            alts = unit.get('alternatives', [])
             if not (src_ip and dst_ip and bottleneck_sid and alts):
                 continue
-            
-            # Use first alternative
             alt_name = alts[0]['name']
             
             ok, msg = self.controller.reroute_one_demand_symmetric(
@@ -3949,11 +4255,22 @@ class QoSRoutingEnv:
             
             if ok:
                 rerouted.append(qid)
+                self._lock_demand_unit(qid, dst_ip, int(bottleneck_sid))
+                rerouted_units.append({
+                    "qid": qid,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "bottleneck_sid": int(bottleneck_sid),
+                    "alt_name": alt_name,
+                    "alt_idx": 0,
+                })
                 self.controller.track_usage(alt_name)
                 self.controller.record_queue_change(qid, self.global_step)
-                log.info(f"[MULTI] Rerouted qid={qid} to {alt_name} [bn={bottleneck_sid}]")
+                log.info(f"[MULTI-K1] Rerouted qid={qid} dst={dst_ip} to {alt_name} [bn={bottleneck_sid}]")
         
-        self._last_rerouted_qids = list(rerouted)
+        self._last_rerouted_qids = sorted(set(rerouted))
+        self._last_rerouted_units = list(rerouted_units)
+        self._last_batch_reroute_count = len(rerouted_units)
         if rerouted:
             return True, f"multi:{len(rerouted)}", len(rerouted)
         else:
@@ -4065,6 +4382,8 @@ class QoSRoutingEnv:
             For multi-action: alt_name is 'multi:N', alt_idx is count of rerouted queues
         """
         self._last_rerouted_qids = []
+        self._last_rerouted_units = []
+        self._last_batch_reroute_count = 0
         if action == 0:
             return False, None, None  # No-op
         
@@ -4078,53 +4397,75 @@ class QoSRoutingEnv:
             return self._apply_multi_reroute(snapshot)
         
         # Single queue action
-        qid, alt_idx = mapping
+        qid, alt_idx, batch_k = mapping
         if qid not in set(self._required_qids_for_current_profile()):
             log.debug(
                 f"Action {action} targets Q{qid}, which is optional for "
                 f"profile {self.current_traffic_profile}"
             )
             return False, None, None
-        q = snapshot[qid]
-        src_ip = q.get('hot_src_ip')
-        dst_ip = q.get('hot_dst_ip')
-        bottleneck_sid = q.get('bottleneck_sid')
-        alts = q.get('alternatives', [])
-        
-        if not (src_ip and dst_ip and bottleneck_sid):
-            log.warning(f"Cannot apply action {action} (q={qid}): missing path info")
+
+        units = self._eligible_units_for_action(snapshot, qid, alt_idx)
+        if len(units) < int(batch_k):
+            log.debug(
+                f"Cannot apply action {action}: requested K{batch_k} but only "
+                f"{len(units)} eligible Q{qid} units are available"
+            )
             return False, None, None
-            
-        # Check if requested alternative index exists
-        if alt_idx >= len(alts):
-            log.warning(f"Cannot apply action {action}: alt index {alt_idx} out of range ({len(alts)} avail)")
-            return False, None, None
-            
-        target_alt = alts[alt_idx]
-        alt_name = target_alt['name']
-        
-        ok, msg = self.controller.reroute_one_demand_symmetric(
-            src_ip=src_ip, dst_ip=dst_ip, qid=qid,
-            worst_switch_id=int(bottleneck_sid), alt_switch_name=alt_name
-        )
-        
-        if ok:
-            log.info(f"[ACTION {action}] Rerouted qid={qid} to Alt {alt_idx} ({alt_name}) [bn={bottleneck_sid}]")
-            # Track usage and history
-            self.controller.track_usage(alt_name)
-            self.controller.record_queue_change(qid, self.global_step)
+
+        successes = []
+        alt_names = []
+        for unit in units[:int(batch_k)]:
+            src_ip = unit.get('src_ip')
+            dst_ip = unit.get('dst_ip')
+            bottleneck_sid = unit.get('bottleneck_sid')
+            alts = unit.get('alternatives', [])
+            if not (src_ip and dst_ip and bottleneck_sid) or alt_idx >= len(alts):
+                continue
+            alt_name = alts[alt_idx]['name']
+
+            ok, msg = self.controller.reroute_one_demand_symmetric(
+                src_ip=src_ip, dst_ip=dst_ip, qid=qid,
+                worst_switch_id=int(bottleneck_sid), alt_switch_name=alt_name
+            )
+
+            if ok:
+                self._lock_demand_unit(qid, dst_ip, int(bottleneck_sid))
+                successes.append({
+                    "qid": qid,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "bottleneck_sid": int(bottleneck_sid),
+                    "alt_name": alt_name,
+                    "alt_idx": alt_idx,
+                })
+                alt_names.append(alt_name)
+                self.controller.track_usage(alt_name)
+                self.controller.record_queue_change(qid, self.global_step)
+                log.info(
+                    f"[ACTION {action}] Rerouted qid={qid} dst={dst_ip} "
+                    f"to Alt {alt_idx} ({alt_name}) [bn={bottleneck_sid}]"
+                )
+            else:
+                log.warning(
+                    f"[ACTION {action}] Reroute failed for qid={qid} "
+                    f"dst={dst_ip}, bn={bottleneck_sid}: {msg}"
+                )
+
+        if successes:
             self._last_rerouted_qids = [qid]
-        else:
-            log.warning(f"[ACTION {action}] Reroute failed: {msg}")
-        
-        return ok, alt_name, alt_idx
+            self._last_rerouted_units = successes
+            self._last_batch_reroute_count = len(successes)
+            return True, ",".join(alt_names), alt_idx
+
+        return False, None, None
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         """
         Execute one environment step.
         
         Args:
-            action: Action index (0-7)
+            action: Action index (0-13)
         
         Returns:
             (next_state, reward, terminated, truncated, info)
@@ -4182,15 +4523,30 @@ class QoSRoutingEnv:
                     if mapping == 'multi'
                     else f"reroute to {alt_name}"
                 )
-                log.warning(f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
-                           f"No traffic data for Q{rerouted_qid} after {action_desc}")
-                log.warning(f"[Step {self.episode_step}] Reroute details: action={action}, "
-                           f"qid={rerouted_qid}, alt={alt_name}, "
-                           f"bn={current_snapshot[rerouted_qid].get('bottleneck_sid')}")
-                self._rollback_failed_reroute(
-                    rerouted_qid,
-                    f"post-reroute traffic verification failure at step {self.episode_step}",
+                log.warning(
+                    f"[Step {self.episode_step}] POST-REROUTE VERIFICATION FAILED: "
+                    f"No traffic data for Q{rerouted_qid} after {action_desc}"
                 )
+                log.warning(
+                    f"[Step {self.episode_step}] Reroute details: action={action}, "
+                    f"qid={rerouted_qid}, alt={alt_name}, "
+                    f"bn={current_snapshot[rerouted_qid].get('bottleneck_sid')}"
+                )
+                failed_units_for_qid = [
+                    unit for unit in getattr(self, "_last_rerouted_units", [])
+                    if int(unit.get("qid", -1)) == int(rerouted_qid)
+                ] or [{"qid": rerouted_qid}]
+                for unit in failed_units_for_qid:
+                    self._rollback_failed_reroute(
+                        rerouted_qid,
+                        f"post-reroute traffic verification failure at step {self.episode_step}",
+                    )
+                    if unit.get("dst_ip") is not None and unit.get("bottleneck_sid") is not None:
+                        self._unlock_demand_unit(
+                            rerouted_qid,
+                            str(unit.get("dst_ip")),
+                            int(unit.get("bottleneck_sid")),
+                        )
                 failed_reroute_qids.append(rerouted_qid)
             if failed_reroute_qids:
                 action_applied = False
@@ -4242,7 +4598,10 @@ class QoSRoutingEnv:
         cost_info = self._contextual_action_cost_info(
             action,
             current_snapshot,
-            reroute_count=(alt_idx if mapping == 'multi' else None),
+            reroute_count=(
+                self._last_batch_reroute_count
+                if action_applied else (alt_idx if mapping == 'multi' else None)
+            ),
         )
         info.update(cost_info)
         if action != 0 and action_applied:
@@ -4281,6 +4640,14 @@ class QoSRoutingEnv:
         info['episode_step'] = self.episode_step
         info['sla_streak'] = self.sla_streak
         info['action_applied'] = action_applied
+        info['requested_batch_size'] = info.get(
+            'requested_batch_size',
+            self.ACTION_MAP.get(action, (None, None, 0))[2]
+            if isinstance(self.ACTION_MAP.get(action), tuple) else 0,
+        )
+        info['batch_reroute_count'] = self._last_batch_reroute_count
+        info['locked_units_count'] = len(self._demand_unit_locks)
+        info['rerouted_units'] = list(getattr(self, "_last_rerouted_units", []))
         info['terminated'] = terminated
         info['truncated'] = truncated
         info['pre_action_snapshot'] = current_snapshot
@@ -4749,7 +5116,9 @@ class TrainingArtifactLogger:
         "episode_start_telemetry_valid", "telemetry_liveness_missing",
         "recovery_break", "action_applied",
         "action_cost", "action_cost_applied", "targeted_qid", "alt_used",
-        "alt_idx", "multi_reroute_count", "intervention_context",
+        "alt_idx", "requested_batch_size", "batch_reroute_count",
+        "batch_penalty", "locked_units_count", "rerouted_units",
+        "multi_reroute_count", "intervention_context",
         "network_intervention_context", "severe_multi_queue",
         "target_ratio", "target_mean_3", "target_mean_5",
         "target_mean_8", "target_persistence_3",
@@ -4776,7 +5145,9 @@ class TrainingArtifactLogger:
             f"q{qid}_bottleneck_sid", f"q{qid}_bottleneck_score",
             f"q{qid}_bottleneck_drop", f"q{qid}_bottleneck_lat",
             f"q{qid}_bottleneck_util", f"q{qid}_bottleneck_role",
-            f"q{qid}_alternatives_count",
+            f"q{qid}_alternatives_count", f"q{qid}_eligible_count",
+            f"q{qid}_eligible_count_norm", f"q{qid}_top1_pressure_norm",
+            f"q{qid}_top2_pressure_norm", f"q{qid}_locked_units_skipped",
         )
     ]
 
@@ -4916,11 +5287,14 @@ class TrainingArtifactLogger:
                 "target_update_freq": TARGET_UPDATE_FREQ,
                 "window_seconds": WINDOW_SECONDS,
                 "delay_after_action": DELAY_AFTER_ACTION,
-                "delay_no_action": DELAY_NO_ACTION,
-                "cooldown_seconds": COOLDOWN_SECONDS,
-                "sla_thresholds": SLA_THRESHOLDS,
-                "qids": QIDS,
-                "action_names": {idx: action_to_name(idx) for idx in range(ACTION_DIM)},
+	                "delay_no_action": DELAY_NO_ACTION,
+	                "cooldown_seconds": COOLDOWN_SECONDS,
+	                "sla_thresholds": SLA_THRESHOLDS,
+	                "qids": QIDS,
+	                "k_choices": K_CHOICES,
+	                "top_n_hot_demands": TOP_N_HOT_DEMANDS,
+	                "demand_lock_steps": DEMAND_LOCK_STEPS,
+	                "action_names": {idx: action_to_name(idx) for idx in range(ACTION_DIM)},
                 "reward": {
                     "sla_met_scale": REWARD_SLA_MET_SCALE,
                     "sla_violated_scale": REWARD_SLA_VIOLATED_SCALE,
@@ -4936,11 +5310,12 @@ class TrainingArtifactLogger:
                         "recovering": ACTION_COST_RECOVERING,
                         "short_spike": ACTION_COST_SHORT_SPIKE,
                         "stable": ACTION_COST_STABLE,
-                        "all_sla_met_extra": ACTION_COST_ALL_SLA_MET_EXTRA,
-                        "same_queue_repeat_extra": ACTION_COST_SAME_QUEUE_REPEAT_EXTRA,
-                        "exact_action_repeat_extra": ACTION_COST_EXACT_REPEAT_EXTRA,
-                        "recovering_repeat_extra": ACTION_COST_RECOVERING_REPEAT_EXTRA,
-                    },
+	                        "all_sla_met_extra": ACTION_COST_ALL_SLA_MET_EXTRA,
+	                        "same_queue_repeat_extra": ACTION_COST_SAME_QUEUE_REPEAT_EXTRA,
+	                        "exact_action_repeat_extra": ACTION_COST_EXACT_REPEAT_EXTRA,
+	                        "recovering_repeat_extra": ACTION_COST_RECOVERING_REPEAT_EXTRA,
+	                        "batch_extra": ACTION_COST_BATCH_EXTRA,
+	                    },
                 },
             },
             "traffic": {
@@ -5020,6 +5395,9 @@ class TrainingArtifactLogger:
                     "path_nodes", "bottleneck_sid", "bottleneck_score",
                     "bottleneck_drop", "bottleneck_lat", "bottleneck_util",
                     "bottleneck_role", "alternatives", "alt_exists",
+                    "candidate_units", "eligible_count", "eligible_count_norm",
+                    "top1_pressure_norm", "top2_pressure_norm",
+                    "locked_units_skipped",
                     "lat_ema", "lat_ema_diff", "transitioning",
                 )
             }
@@ -5109,6 +5487,11 @@ class TrainingArtifactLogger:
             "targeted_qid": info.get("targeted_qid", ""),
             "alt_used": info.get("alt_used", ""),
             "alt_idx": info.get("alt_idx", ""),
+            "requested_batch_size": info.get("requested_batch_size", 0),
+            "batch_reroute_count": info.get("batch_reroute_count", 0),
+            "batch_penalty": info.get("batch_penalty", 0.0),
+            "locked_units_count": info.get("locked_units_count", 0),
+            "rerouted_units": json.dumps(_json_safe(info.get("rerouted_units", []))),
             "multi_reroute_count": info.get("multi_reroute_count", 0),
             "intervention_context": info.get("intervention_context", ""),
             "network_intervention_context": info.get("network_intervention_context", ""),
@@ -5163,6 +5546,11 @@ class TrainingArtifactLogger:
                 f"q{qid}_bottleneck_util": q.get("bottleneck_util"),
                 f"q{qid}_bottleneck_role": q.get("bottleneck_role"),
                 f"q{qid}_alternatives_count": len(q.get("alternatives", []) or []),
+                f"q{qid}_eligible_count": q.get("eligible_count", 0),
+                f"q{qid}_eligible_count_norm": q.get("eligible_count_norm", 0.0),
+                f"q{qid}_top1_pressure_norm": q.get("top1_pressure_norm", 0.0),
+                f"q{qid}_top2_pressure_norm": q.get("top2_pressure_norm", 0.0),
+                f"q{qid}_locked_units_skipped": q.get("locked_units_skipped", 0),
             })
         self._step_writer.writerow({
             k: _json_safe(row.get(k, "")) for k in self.STEP_FIELDS
@@ -5402,7 +5790,7 @@ def train(args):
     
     # Determine learning rate (override or default)
     lr = args.lr if args.lr is not None else LR
-    buffer_capacity = args.buffer_capacity if args.multi_buffer else REPLAY_CAPACITY
+    buffer_capacity = args.buffer_capacity
 
     log.info("=" * 60)
     log.info("Starting RL Training - DQN Agent v4 (Stacked Obs + Actions)")
@@ -6127,8 +6515,9 @@ def main():
     # Multi-topology replay buffer
     parser.add_argument('--multi-buffer', action='store_true',
                         help='Use separate replay buffers per topology')
-    parser.add_argument('--buffer-capacity', type=int, default=25000,
-                        help='Replay buffer capacity per topology (default: 25000)')
+    parser.add_argument('--buffer-capacity', type=int, default=REPLAY_CAPACITY,
+                        help='Replay buffer capacity; per topology when --multi-buffer is used '
+                             f'(default: {REPLAY_CAPACITY})')
     parser.add_argument('--balanced-sampling', action='store_true',
                         help='Balance sampling across topology buffers (requires --multi-buffer)')
 

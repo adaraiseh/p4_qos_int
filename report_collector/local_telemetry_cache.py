@@ -215,6 +215,7 @@ class LocalTelemetryCache:
         """Return queue metrics and hottest demands from one exact window scan."""
         start_ns, stop_ns = _request_range_ns(request)
         qids = {str(int(qid)) for qid in request.get("qids", [0, 1, 7])}
+        top_n = max(1, int(request.get("top_n", 1)))
         metrics = {
             qid: {"lat_p95": None, "drop_p95": None, "util_p95": None}
             for qid in qids
@@ -289,21 +290,31 @@ class LocalTelemetryCache:
                 counts[qid][label] = len(values)
 
         demands: Dict[str, Dict[str, Any]] = {}
+        top_demands: Dict[str, List[Dict[str, Any]]] = {}
         for qid, groups in grouped_demands.items():
-            best_pair = None
-            best_mean = -math.inf
+            ranked = []
             for pair, (total, count) in groups.items():
                 if count <= 0:
                     continue
                 mean_value = total / count
-                if mean_value > best_mean:
-                    best_pair = pair
-                    best_mean = mean_value
-            if best_pair is not None:
+                ranked.append((mean_value, pair, count))
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            top_demands[qid] = [
+                {
+                    "src_ip": pair[0],
+                    "dst_ip": pair[1],
+                    "mean_latency": mean_value,
+                    "count": count,
+                }
+                for mean_value, pair, count in ranked[:top_n]
+            ]
+            if ranked:
+                best_mean, best_pair, best_count = ranked[0]
                 demands[qid] = {
                     "src_ip": best_pair[0],
                     "dst_ip": best_pair[1],
                     "mean_latency": best_mean,
+                    "count": best_count,
                 }
 
         return {
@@ -312,6 +323,7 @@ class LocalTelemetryCache:
             "metrics_received": received,
             "counts": counts,
             "demands": demands,
+            "top_demands": top_demands,
             "window": window,
         }
 
@@ -437,6 +449,7 @@ class LocalTelemetryCache:
     def _hot_demands(self, request: Dict[str, Any]) -> Dict[str, Any]:
         start_ns, stop_ns = _request_range_ns(request)
         qids = {str(int(qid)) for qid in request.get("qids", [0, 1, 7])}
+        top_n = max(1, int(request.get("top_n", 1)))
         grouped: Dict[str, Dict[Tuple[str, str], List[float]]] = {
             qid: {} for qid in qids
         }
@@ -459,24 +472,39 @@ class LocalTelemetryCache:
                 bucket[1] += 1
 
         demands: Dict[str, Dict[str, Any]] = {}
+        top_demands: Dict[str, List[Dict[str, Any]]] = {}
         for qid, groups in grouped.items():
-            best_pair = None
-            best_mean = -math.inf
+            ranked = []
             for pair, (total, count) in groups.items():
                 if count <= 0:
                     continue
                 mean_value = total / count
-                if mean_value > best_mean:
-                    best_pair = pair
-                    best_mean = mean_value
-            if best_pair is not None:
+                ranked.append((mean_value, pair, count))
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            top_demands[qid] = [
+                {
+                    "src_ip": pair[0],
+                    "dst_ip": pair[1],
+                    "mean_latency": mean_value,
+                    "count": count,
+                }
+                for mean_value, pair, count in ranked[:top_n]
+            ]
+            if ranked:
+                best_mean, best_pair, best_count = ranked[0]
                 demands[qid] = {
                     "src_ip": best_pair[0],
                     "dst_ip": best_pair[1],
                     "mean_latency": best_mean,
+                    "count": best_count,
                 }
 
-        return {"ok": True, "demands": demands, "window": window}
+        return {
+            "ok": True,
+            "demands": demands,
+            "top_demands": top_demands,
+            "window": window,
+        }
 
     def _switch_metrics(self, request: Dict[str, Any]) -> Dict[str, Any]:
         start_ns, stop_ns = _request_range_ns(request)

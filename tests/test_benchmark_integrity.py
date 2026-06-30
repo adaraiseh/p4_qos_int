@@ -133,6 +133,8 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
         env = object.__new__(QoSRoutingEnv)
         env.current_traffic_profile = profile
         env.last_action_time = 0.0
+        env.global_step = 0
+        env._demand_unit_locks = {}
         return env
 
     @staticmethod
@@ -150,6 +152,21 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
                 "lat_p95": SLA_THRESHOLDS[qid] * 1.25,
                 "bottleneck_sid": qid + 10,
                 "alternatives": [{"name": "alt0"}, {"name": "alt1"}],
+                "candidate_units": [
+                    {
+                        "qid": qid,
+                        "src_ip": f"10.0.{qid}.{idx + 1}",
+                        "dst_ip": f"10.1.{qid}.{idx + 1}",
+                        "bottleneck_sid": qid + 10,
+                        "mean_latency": 100.0 - idx,
+                        "pressure_norm": 0.80 - (idx * 0.10),
+                        "alternatives": [
+                            {"name": f"q{qid}-alt0"},
+                            {"name": f"q{qid}-alt1"},
+                        ],
+                    }
+                    for idx in range(2)
+                ],
             }
             for qid in QIDS
         }
@@ -175,6 +192,7 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
                 for qid in QIDS
             },
             "demands": {},
+            "top_demands": {},
         }
 
     class CapturingCache:
@@ -260,7 +278,7 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
                 self.assertEqual(observed, reference)
 
     def test_action_mask_is_profile_invariant(self):
-        expected = [True] * 8
+        expected = [True] * 14
         for profile in self.PROFILES:
             env = self._env(profile)
 
@@ -314,6 +332,7 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
 
         self.assertEqual(cache.requests[0]["kind"], "queue_summary")
         self.assertEqual(cache.requests[0]["qids"], list(QIDS))
+        self.assertEqual(cache.requests[0]["top_n"], rl_agent_4.TOP_N_HOT_DEMANDS)
         self.assertTrue(all(snapshot[qid]["data_valid"] for qid in QIDS))
 
     def test_bursty_local_cache_freshness_requests_all_queues(self):
@@ -453,8 +472,10 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
         )
 
         self.assertEqual(set(result), set(QIDS))
+        self.assertTrue(all(isinstance(result[qid], list) for qid in QIDS))
         for qid in QIDS:
             self.assertIn(f'r.queue_id == "{qid}"', query_api.queries[0])
+        self.assertIn(f"limit(n:{rl_agent_4.TOP_N_HOT_DEMANDS})", query_api.queries[0])
 
     def test_influx_flow_coverage_uses_int_liveness_measurement(self):
         query_api = self.CapturingQueryApi([

@@ -56,8 +56,43 @@ This is an example of how you may give instructions on setting up your project l
    ```
 4. start RL_Agent:
    ```
-   python3 rl_agent_3.py
+   python3 rl_agent_4.py
    ```
+
+## Current RL Behavior
+
+The active training and production agent is `rl_agent_4.py`.
+
+Key behavior:
+
+- State dimension: `1200` stacked features.
+  - `61` raw observation features per frame.
+  - `16` observation frames.
+  - `14` one-hot action history entries per frame.
+- Action dimension: `14`.
+  - `0`: no-op.
+  - `1-12`: queue-specific reroute actions for Q0, Q1, and Q7, with two
+    alternate paths and `K={1,2}` demand units.
+  - `13`: `multi-k1`, which reroutes at most one eligible demand unit per
+    violating queue.
+- `K=1` reroutes the worst eligible demand unit for the selected queue and
+  alternate path.
+- `K=2` reroutes the worst two eligible demand units for the selected queue
+  and alternate path when at least two unlocked units are available.
+- A successfully rerouted demand unit is locked for `5` control steps using
+  the dataplane-compatible key `(qid, dst_ip, bottleneck_sid)`. Other demand
+  units on the same queue may still be rerouted during that lock window.
+- The observation includes batch-awareness per queue:
+  `eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm`.
+  These expose whether K2 is meaningful without exposing full demand IDs.
+- The local telemetry cache can return `top_demands` with `top_n`; the agent
+  requests the top `6` hot demands per queue so it can choose eligible K1/K2
+  units and skip locked units.
+
+Production and benchmark CSV logs include batch and lock diagnostics:
+`requested_batch_size`, `batch_reroute_count`, `locked_units_count`, and
+`rerouted_units`.
+
 # Hosts terminal tests:
 1. in mininet terminal
    ```sh

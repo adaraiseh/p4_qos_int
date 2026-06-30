@@ -2,7 +2,8 @@
 
 This benchmark compares:
 
-- **RL:** the trained greedy DQN policy with queue-specific rerouting.
+- **RL:** the trained greedy DQN policy with queue-specific K1/K2 rerouting,
+  demand-unit lockout, and `multi-k1`.
 - **ECMP:** shortest-path equal-cost multipath with a stable CRC16 flow hash.
   DSCP and transport ports are excluded so all QoS queues of the same demand
   receive the same routing decision.
@@ -48,7 +49,7 @@ To include transient QoS stress, add the short burst profiles:
 
 ```bash
 make benchmark \
-  BENCH_PROFILES=light_2,medium_2,high_1,bursty_vo_1,bursty_vi_1,bursty_be_1 \
+  BENCH_PROFILES=light_2,medium_2,high_1,bursty_vo_1,bursty_vi_1,bursty_be_1,bursty_vo_3,bursty_vi_3,bursty_be_3 \
   BENCH_REPETITIONS=12 STEPS=300
 ```
 
@@ -125,8 +126,36 @@ outcome.
 All steady and bursty names live in the single
 `TrafficManager.TRAFFIC_PROFILES` registry. Bursty profiles use queue-biased
 load vectors and deterministic bursts in every ten-step block: three high
-steps for `_1` and six for `_2`. A short benchmark therefore always exercises
+steps for `_1`, six for `_2`, and eight for `_3`. The `_3` burst profiles are
+the churn-sensitive cases used to check whether the RL policy can avoid
+chasing every burst transition. A short benchmark therefore always exercises
 the named burst, and changing stages does not restart iperf.
+
+## RL policy behavior
+
+The current RL checkpoint format expects `ACTION_DIM=14` and `STATE_DIM=1200`.
+Do not compare old 8-action checkpoints against new code without retraining or
+explicit compatibility testing.
+
+RL action IDs are:
+
+- `0`: no-op.
+- `1-12`: queue-specific reroute actions for Q0, Q1, and Q7, two alternate
+  paths, and `K={1,2}`.
+- `13`: `multi-k1`, which reroutes at most one eligible demand unit per
+  violating queue.
+
+`K=1` moves the worst eligible demand unit for the selected queue and
+alternate. `K=2` moves the worst two eligible demand units when two unlocked
+candidates are available. After a successful reroute, `(qid, dst_ip,
+bottleneck_sid)` is locked for five control steps, matching the dataplane
+overlay granularity of queue plus destination while still separating different
+bottleneck locations. Other demand units on the same queue remain eligible.
+
+The observation includes three batch-awareness features per queue:
+`eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm`. These
+allow the policy to choose K1 versus K2 without exposing demand IDs as neural
+network inputs.
 
 A 50-step ECMP sanity sweep on `fat_tree_k4` with traffic seed 42 produced the
 expected load staircase with every run verified: `light_1` 100.00% SLA,
@@ -161,6 +190,8 @@ The artifacts also retain:
 - Worst-queue p95 latency.
 - Offered traffic load.
 - RL action application rate.
+- RL batch diagnostics: `requested_batch_size`, `batch_reroute_count`,
+  `locked_units_count`, and JSON `rerouted_units`.
 - All invalid rows, failed attempts, logs, and return codes.
 
 Utilization is descriptive; lower utilization is not automatically better.
@@ -208,6 +239,28 @@ Use a fixed output directory to resume an interrupted experiment:
 ```bash
 make benchmark BENCH_OUTPUT=benchmark_results/paper_fat_tree_k4
 ```
+
+For a quick checkpoint smoke benchmark with no repeated trials, run one
+20-step repetition per profile and disable retries:
+
+```bash
+sudo -E env PYTHONUNBUFFERED=1 python3 -u benchmark.py \
+  --config config/topologies/fat_tree_k4.yaml \
+  --profiles high_1,bursty_vi_3 \
+  --methods rl \
+  --repetitions 1 \
+  --steps 20 \
+  --max-retries 0 \
+  --save-dir /path/to/checkpoints \
+  --weights-tag final \
+  --telemetry-backend cache \
+  --telemetry-cache-socket /tmp/p4_qos_int_telemetry.sock \
+  --production-influx-write off \
+  --no-resume
+```
+
+This is a smoke test only. With one repetition, variance and confidence
+intervals are not meaningful.
 
 The raw artifacts should be archived with the paper. Do not publish only the
 aggregate tables.
