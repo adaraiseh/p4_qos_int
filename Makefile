@@ -16,6 +16,7 @@ LOG_LEVEL  ?= info
 STEPS      ?= 300
 TRAFFIC_SEED ?= 42
 SUDO_KEEPALIVE_INTERVAL ?= 60
+RL_BASE_ROUTING ?= ospf
 TRAIN_REPLAY_CAPACITY ?= 80000
 TRAIN_FOUNDATION_STEPS ?= 35000
 TRAIN_BURST_STEPS ?= 25000
@@ -63,6 +64,7 @@ BENCH_MIN_VALID ?= 0.80
 BENCH_RETRIES ?= 1
 BENCH_WEIGHTS_TAG ?= final
 BENCH_METHODS ?= rl,ecmp,ospf
+BENCH_RL_BASE_ROUTING ?= $(RL_BASE_ROUTING)
 BENCH_OUTPUT ?=
 BENCHMARK_DIR ?= benchmark_results
 CALIBRATION_DIR ?= calibration_results
@@ -94,7 +96,7 @@ COLLECTOR_TELEMETRY_FLAGS = --influx-write $(COLLECTOR_INFLUX_WRITE) --telemetry
 # =============================================
 PYTHON      := python3
 SUDO_PYTHON := sudo -E PYTHONUNBUFFERED=1 python3 -u
-RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(LOG_LEVEL_FLAG) $(TELEMETRY_FLAGS)
+RL_COMMON   := --config $(DETECT_TOPOLOGY) --log-every 1 $(LOG_LEVEL_FLAG) --rl-base-routing $(RL_BASE_ROUTING) $(TELEMETRY_FLAGS)
 
 # Default target
 all: train_paper
@@ -195,6 +197,7 @@ train_paper:
 	echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"; \
 	echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"; \
 	echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"; \
+	echo "RL base routing: $(RL_BASE_ROUTING)"; \
 	echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"; \
 	echo "=== Stage 1/3: reset-heavy recovery foundation ($(TRAIN_FOUNDATION_STEPS) steps, eps_decay=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS)) ==="; \
 	echo "Profile weights: $(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"; \
@@ -239,6 +242,7 @@ train_stage2:
 	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
 	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
 	@echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"
+	@echo "RL base routing: $(RL_BASE_ROUTING)"
 	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
 	@echo "=== Stage 2/3: burst specialization ($(TRAIN_BURST_STEPS) steps, resume final, eps=$(TRAIN_BURST_RESUME_EPS), eps_decay=$(TRAIN_BURST_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_BURST_PROFILE_WEIGHTS)"
@@ -260,6 +264,7 @@ train_stage3:
 	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
 	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
 	@echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"
+	@echo "RL base routing: $(RL_BASE_ROUTING)"
 	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
 	@echo "=== Stage 3/3: stability/no-op polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="
 	@echo "Profile weights: $(TRAIN_POLISH_PROFILE_WEIGHTS)"
@@ -382,6 +387,7 @@ benchmark:
 	@echo "Using topology config: $(DETECT_TOPOLOGY)"
 	@echo "Profiles: $(BENCH_PROFILES)"
 	@echo "Methods: $(BENCH_METHODS)"
+	@echo "RL base routing: $(BENCH_RL_BASE_ROUTING)"
 	@echo "Repetitions: $(BENCH_REPETITIONS), steps/run: $(STEPS)"
 	$(SUDO_PYTHON) benchmark.py --config $(DETECT_TOPOLOGY) \
 		--profiles "$(BENCH_PROFILES)" \
@@ -393,6 +399,7 @@ benchmark:
 		--min-valid-fraction $(BENCH_MIN_VALID) \
 		--max-retries $(BENCH_RETRIES) \
 		--weights-tag $(BENCH_WEIGHTS_TAG) \
+		--rl-base-routing $(BENCH_RL_BASE_ROUTING) \
 		--production-influx-write $(PRODUCTION_INFLUX_WRITE) \
 		$(BENCH_OUTPUT_FLAG) $(LOG_LEVEL_FLAG) $(TELEMETRY_FLAGS)
 
@@ -425,6 +432,7 @@ help:
 	@echo "  TRAINING_STATE_FILE=$(TRAINING_STATE_FILE) COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS=10000"
 	@echo "  TRAIN_REPLAY_CAPACITY=$(TRAIN_REPLAY_CAPACITY)"
 	@echo "  TRAIN_BASELINE_COOLDOWN=5 TRAIN_WARM_COOLDOWN=3"
+	@echo "  RL_BASE_ROUTING=ospf|ecmp (default: $(RL_BASE_ROUTING))"
 	@echo "  Paper plan defaults: $(TRAIN_FOUNDATION_STEPS)+$(TRAIN_BURST_STEPS)+$(TRAIN_POLISH_STEPS) steps"
 	@echo "  Epsilon decay defaults: foundation=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS), burst=$(TRAIN_BURST_EPS_DECAY_STEPS), polish=$(TRAIN_POLISH_EPS_DECAY_STEPS)"
 	@echo "  Resume epsilon defaults: burst=$(TRAIN_BURST_RESUME_EPS), polish=$(TRAIN_POLISH_RESUME_EPS)"
@@ -452,6 +460,7 @@ help:
 	@echo "  make benchmark             Paired routing benchmark"
 	@echo "    BENCH_PROFILES=$(ALL_TRAFFIC_PROFILES_CSV)"
 	@echo "    BENCH_METHODS=rl,ecmp,ospf BENCH_REPETITIONS=6 STEPS=300 BENCH_COOLDOWN=30"
+	@echo "    BENCH_RL_BASE_ROUTING=ospf|ecmp controls the RL start point"
 	@echo "  make clean_bench           Remove benchmark_results/ and run logs"
 	@echo "  make clean_training_logs   Remove legacy training_files/training_logs contents"
 	@echo ""

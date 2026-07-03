@@ -77,6 +77,20 @@ control l3_forward(inout headers hdr,
         default_action = drop();
     }
 
+    table rl_overlay {
+        key = {
+            hdr.ipv4.dst_ipv4_addr : lpm;
+            hdr.ipv4.dscp: exact;
+        }
+        actions = {
+            ipv4_forward;
+            drop;
+            NoAction;
+        }
+        size = 1024;
+        default_action = NoAction();
+    }
+
     apply {
         if(hdr.ipv4.isValid()) {
             if (hdr.ipv4.dscp == 0x2E) { // EF
@@ -90,10 +104,10 @@ control l3_forward(inout headers hdr,
                 standard_metadata.priority = (bit<3>)0;
             }
 
-            // ECMP is an optional queue-agnostic overlay. If no ECMP group is
-            // installed, preserve the existing QoS-aware LPM behavior used by
-            // the RL controller.
-            if (ecmp_group.apply().hit) {
+            // Learned RL /32+DSCP overlays override either base method. ECMP
+            // remains queue-agnostic when no learned overlay is installed.
+            if (rl_overlay.apply().hit) {
+            } else if (ecmp_group.apply().hit) {
                 ecmp_nhop.apply();
             } else {
                 ipv4_lpm.apply();

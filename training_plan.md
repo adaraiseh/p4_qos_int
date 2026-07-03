@@ -28,13 +28,20 @@ For training on a single topology (e.g., `fat_tree_k4`), use the default paramet
 | Epsilon | Stage-local decay | Re-open exploration when resuming into burst and polish stages |
 | Batch Size | 64 | Stable gradient estimates |
 | Replay Buffer | 80,000 | Holds the full recommended run while keeping checkpoints manageable |
-| Reset Probability | High early, moderate late | Trains fast recovery from OSPF baseline instead of only warm-state maintenance |
+| Reset Probability | High early, moderate late | Trains fast recovery from the selected RL base routing instead of only warm-state maintenance |
 
 ### Training Command
 
 ```bash
 # Recommended fat-tree k=4 training curriculum
 make train_paper
+```
+
+By default, baseline reset episodes start from OSPF/SPF. To train the same
+agent to take over from ECMP, use:
+
+```bash
+make train_paper RL_BASE_ROUTING=ecmp
 ```
 
 The Makefile default is:
@@ -71,9 +78,13 @@ the earlier recovery distribution.
 The current enhancement targets two behaviors that should both be checked
 during training:
 
-- **Fast recovery:** high-load profiles should move from OSPF baseline routing
-  to a better distribution quickly. The action space supports this with K2
+- **Fast recovery:** high-load profiles should move from the selected base
+  routing method, OSPF by default or ECMP when `RL_BASE_ROUTING=ecmp`, to a
+  better distribution quickly. The action space supports this with K2
   single-queue actions and `multi-k1`.
+- **Comparable path views:** RL runs publish the same configured-flow
+  visualization schema as standalone OSPF/ECMP, then update those per-queue
+  entries as overlays change the active paths.
 - **Burst stability:** bursty `_3` profiles should not cause the agent to chase
   the same demand unit every burst step. Successful reroutes lock
   `(qid, dst_ip, bottleneck_sid)` for five control steps while leaving other
@@ -387,6 +398,6 @@ Success criteria for the smoke benchmark:
 - **Epsilon**: Should decay from 1.0 to 0.05
 - **Loss**: Should stabilize (not necessarily decrease)
 - **SLA Compliance**: Target >80% across all queues
-- **First all-SLA step on high profiles**: Measures recovery speed from OSPF baseline
+- **First all-SLA step on high profiles**: Measures recovery speed from the selected RL base routing
 - **Burst `_3` churn**: Watch repeated reroutes of the same `(qid, dst_ip, bottleneck_sid)` unit
 - **Batch usage**: `batch_reroute_count > 1` confirms K2 or `multi-k1` paths are exercised

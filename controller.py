@@ -28,6 +28,10 @@ log = logging.getLogger(__name__)
 
 
 class Controller:
+    BASELINE_LPM_TABLE = "l3_forward.ipv4_lpm"
+    RL_OVERLAY_TABLE = "l3_forward.rl_overlay"
+    ECMP_GROUP_TABLE = "l3_forward.ecmp_group"
+    ECMP_NHOP_TABLE = "l3_forward.ecmp_nhop"
 
     # Role normalization: edge switches (can't be rerouted around)
     EDGE_ROLES = {'leaf', 'access', 'tor'}
@@ -60,6 +64,8 @@ class Controller:
         self.paths = []
         self.path_map = {}
         self.alt_rr_pos = {}
+        self.visualization_traffic_pairs = None
+        self.visualization_routing_mode = None
 
         # Store topology builder reference for role lookups
         self._topology_builder = topology_builder
@@ -294,6 +300,7 @@ class Controller:
                     if sw_name not in self.forwarding_entries:
                         self.forwarding_entries[sw_name] = {
                             'lpm': {},
+                            'overlay': {},
                             'switching': {},
                             'mac': {}
                         }
@@ -317,7 +324,8 @@ class Controller:
         integrity check instead of trusting attempted writes.
         """
         table_map = {
-            'lpm': "l3_forward.ipv4_lpm",
+            'lpm': self.BASELINE_LPM_TABLE,
+            'overlay': self.RL_OVERLAY_TABLE,
             'switching': "port_forward.switching_table",
             'mac': "port_forward.mac_rewriting_table",
         }
@@ -328,7 +336,7 @@ class Controller:
             for sw_name, thrift in self.controllers.items():
                 expected_tables = self.forwarding_entries.get(
                     sw_name,
-                    {'lpm': {}, 'switching': {}, 'mac': {}},
+                    {'lpm': {}, 'overlay': {}, 'switching': {}, 'mac': {}},
                 )
                 switch_report = {}
                 for cache_name, table_name in table_map.items():
@@ -388,7 +396,7 @@ class Controller:
             for (dst_prefix, dscp), (next_hop_ip, egress_port) in tables['lpm'].items():
                 self._call(
                     controller.table_add,
-                    "l3_forward.ipv4_lpm",
+                    self.BASELINE_LPM_TABLE,
                     "ipv4_forward",
                     [dst_prefix, dscp],
                     [next_hop_ip, str(egress_port)]
@@ -405,13 +413,12 @@ class Controller:
         with self._lock:
             for sw_name, controller in self.controllers.items():
                 table_names = (
-                    "l3_forward.ipv4_lpm",
+                    self.BASELINE_LPM_TABLE,
+                    self.RL_OVERLAY_TABLE,
                     "port_forward.switching_table",
                     "port_forward.mac_rewriting_table",
-                    # ECMP must also be empty before RL/OSPF starts because it
-                    # takes precedence over ipv4_lpm in the P4 pipeline.
-                    "l3_forward.ecmp_group",
-                    "l3_forward.ecmp_nhop",
+                    self.ECMP_GROUP_TABLE,
+                    self.ECMP_NHOP_TABLE,
                 )
                 for table_name in table_names:
                     try:
@@ -457,29 +464,75 @@ class Controller:
     # Table/aux helpers
     # -----------------------
 
-    def _upsert_lpm(self, sw_name: str, dst_prefix: str, dscp: str, next_hop_ip: str, egress_port: int) -> bool:
+    def _upsert_table_route(
+        self,
+        sw_name: str,
+        dst_prefix: str,
+        dscp: str,
+        next_hop_ip: str,
+        egress_port: int,
+        *,
+        table_name: str,
+        cache_name: str,
+        label: str,
+    ) -> bool:
         controller = self.controllers[sw_name]
         try:
             try:
-                self._call(controller.table_delete_match, "l3_forward.ipv4_lpm", [dst_prefix, dscp])
+                self._call(controller.table_delete_match, table_name, [dst_prefix, dscp])
             except Exception:
                 pass
             self._call(
                 controller.table_add,
-                "l3_forward.ipv4_lpm",
+                table_name,
                 "ipv4_forward",
                 [dst_prefix, dscp],
                 [next_hop_ip, str(egress_port)]
             )
-            self.forwarding_entries.setdefault(sw_name, {}).setdefault('lpm', {})
-            self.forwarding_entries[sw_name]['lpm'][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
+            self.forwarding_entries.setdefault(sw_name, {}).setdefault(cache_name, {})
+            self.forwarding_entries[sw_name][cache_name][(dst_prefix, dscp)] = (next_hop_ip, egress_port)
             return True
         except Exception as e:
-            log.error(f"[LPM upsert FAILED] {sw_name} {dst_prefix} dscp={dscp} -> {next_hop_ip}/{egress_port}: {e}")
+            log.error(f"[{label} upsert FAILED] {sw_name} {dst_prefix} dscp={dscp} -> {next_hop_ip}/{egress_port}: {e}")
             return False
 
+    def _upsert_lpm(self, sw_name: str, dst_prefix: str, dscp: str, next_hop_ip: str, egress_port: int) -> bool:
+        return self._upsert_table_route(
+            sw_name,
+            dst_prefix,
+            dscp,
+            next_hop_ip,
+            egress_port,
+            table_name=self.BASELINE_LPM_TABLE,
+            cache_name='lpm',
+            label='LPM',
+        )
+
+    def _upsert_overlay(self, sw_name: str, dst_prefix: str, dscp: str, next_hop_ip: str, egress_port: int) -> bool:
+        return self._upsert_table_route(
+            sw_name,
+            dst_prefix,
+            dscp,
+            next_hop_ip,
+            egress_port,
+            table_name=self.RL_OVERLAY_TABLE,
+            cache_name='overlay',
+            label='RL overlay',
+        )
+
+    def _delete_overlay(self, sw_name: str, dst_prefix: str, dscp: str) -> None:
+        self._call(
+            self.controllers[sw_name].table_delete_match,
+            self.RL_OVERLAY_TABLE,
+            [dst_prefix, dscp],
+        )
+        try:
+            del self.forwarding_entries[sw_name]['overlay'][(dst_prefix, dscp)]
+        except Exception:
+            pass
+
     def update_path(self, sw_name, dst_prefix, dscp, next_hop_ip, egress_port):
-        return self._upsert_lpm(sw_name, dst_prefix, dscp, next_hop_ip, egress_port)
+        return self._upsert_overlay(sw_name, dst_prefix, dscp, next_hop_ip, egress_port)
 
     def ensure_switching_and_mac(self, sw_name: str, next_hop: str):
         controller = self.controllers[sw_name]
@@ -487,7 +540,7 @@ class Controller:
         port_smac = self.topo.node_to_node_mac(sw_name, next_hop)
 
         if sw_name not in self.forwarding_entries:
-            self.forwarding_entries[sw_name] = {'lpm': {}, 'switching': {}, 'mac': {}}
+            self.forwarding_entries[sw_name] = {'lpm': {}, 'overlay': {}, 'switching': {}, 'mac': {}}
 
         if next_hop in self.topo.get_hosts().keys():
             next_hop_ip = self.topo.get_host_ip(next_hop).split('/')[0]
@@ -824,15 +877,39 @@ class Controller:
     def dump_paths_json(self):
         """Export current paths per queue to JSON for visualization."""
         export_data = {}
-        for qid, pmap in self.paths_per_queue.items():
-            q_list = []
-            for (src, dst), path in pmap.items():
-                q_list.append({
-                    "src": src,
-                    "dst": dst,
-                    "path": path
-                })
-            export_data[qid] = q_list
+        if self.visualization_traffic_pairs is not None:
+            for qid, pmap in self.paths_per_queue.items():
+                q_list = []
+                for src, dst, flow_id in self.visualization_traffic_pairs:
+                    path = pmap.get((src, dst)) or self.path_map.get((src, dst))
+                    if path is None:
+                        log.warning(
+                            "Skipping visualization path for %s->%s Q%s: no active path",
+                            src,
+                            dst,
+                            qid,
+                        )
+                        continue
+                    entry = {
+                        "src": src,
+                        "dst": dst,
+                        "flow_id": flow_id,
+                        "path": list(path),
+                    }
+                    if self.visualization_routing_mode:
+                        entry["routing_mode"] = self.visualization_routing_mode
+                    q_list.append(entry)
+                export_data[qid] = q_list
+        else:
+            for qid, pmap in self.paths_per_queue.items():
+                q_list = []
+                for (src, dst), path in pmap.items():
+                    q_list.append({
+                        "src": src,
+                        "dst": dst,
+                        "path": path
+                    })
+                export_data[qid] = q_list
 
         final_path = "/tmp/p4_paths.json"
         try:
@@ -848,6 +925,62 @@ class Controller:
 
         except Exception:
             pass
+
+    def set_visualization_traffic_pairs(
+        self,
+        traffic_pairs,
+        *,
+        routing_mode: Optional[str] = None,
+    ) -> None:
+        """Restrict visualization export to the active traffic-profile flows."""
+        with self._lock:
+            if traffic_pairs is None:
+                self.visualization_traffic_pairs = None
+                self.visualization_routing_mode = None
+            else:
+                normalized = []
+                for item in traffic_pairs:
+                    src, dst = item[0], item[1]
+                    flow_id = item[2] if len(item) > 2 else None
+                    normalized.append((str(src), str(dst), flow_id))
+                self.visualization_traffic_pairs = normalized
+                self.visualization_routing_mode = routing_mode
+            self.dump_paths_json()
+
+    def set_baseline_paths(
+        self,
+        path_map: Dict[Tuple[str, str], List[str]],
+        *,
+        label: str = "baseline",
+    ) -> None:
+        """Replace controller baseline paths and reset per-queue paths.
+
+        ``path_map`` remains the immutable baseline used as a fallback, while
+        each queue gets an independent copy that RL reroutes may later update.
+        """
+        with self._lock:
+            self.path_map.clear()
+            self.paths.clear()
+            for qid in self.paths_per_queue:
+                self.paths_per_queue[qid].clear()
+
+            for (src_host, dst_host), path in sorted(path_map.items()):
+                path_copy = list(path)
+                self.path_map[(src_host, dst_host)] = path_copy
+                self.paths.append(
+                    f"Path from {src_host} to {dst_host} ({label}): "
+                    f"{' -> '.join(path_copy)}"
+                )
+                for qid in self.paths_per_queue:
+                    self.paths_per_queue[qid][(src_host, dst_host)] = list(path_copy)
+
+            self.change_history_by_qid.clear()
+            self.switch_usage.clear()
+            self.alt_rr_pos.clear()
+            self.queue_changes = {0: 0, 1: 0, 7: 0}
+            self.queue_last_change_step = {0: 0, 1: 0, 7: 0}
+            self._invalidate_route_caches()
+            self.dump_paths_json()
 
     # -----------------------
     # Per-queue change tracking / revert
@@ -877,14 +1010,10 @@ class Controller:
                 dscp = ent["dscp"]
                 before = ent["before"]
                 if before is not None:
-                    self._upsert_lpm(sw, dst_prefix, dscp, before[0], before[1])
+                    self._upsert_overlay(sw, dst_prefix, dscp, before[0], before[1])
                 else:
                     try:
-                        self._call(self.controllers[sw].table_delete_match, "l3_forward.ipv4_lpm", [dst_prefix, dscp])
-                        try:
-                            del self.forwarding_entries[sw]['lpm'][(dst_prefix, dscp)]
-                        except Exception:
-                            pass
+                        self._delete_overlay(sw, dst_prefix, dscp)
                     except Exception:
                         pass
             old_path = side.get("old_path")
@@ -921,11 +1050,7 @@ class Controller:
                 self.update_path(alt_node, dst_prefix, dscp, nh_ip, eport)
             else:
                 try:
-                    self._call(self.controllers[alt_node].table_delete_match, "l3_forward.ipv4_lpm", [dst_prefix, dscp])
-                except Exception:
-                    pass
-                try:
-                    del self.forwarding_entries[alt_node]['lpm'][(dst_prefix, dscp)]
+                    self._delete_overlay(alt_node, dst_prefix, dscp)
                 except Exception:
                     pass
 
@@ -1318,39 +1443,31 @@ class Controller:
                     nh_ip = dst_ip_
 
                 eport = self.topo.node_to_node_port_num(sw, nxt)
-                before = self.forwarding_entries.get(sw, {}).get('lpm', {}).get((dst_prefix, dscp))
+                before = self.forwarding_entries.get(sw, {}).get('overlay', {}).get((dst_prefix, dscp))
                 
                 # Only upsert if different from current
                 if before != (nh_ip, eport):
                     upsert_t0 = time.perf_counter()
-                    ok = self._upsert_lpm(sw, dst_prefix, dscp, nh_ip, eport)
+                    ok = self._upsert_overlay(sw, dst_prefix, dscp, nh_ip, eport)
                     op_ms = (time.perf_counter() - upsert_t0) * 1000.0
                     upsert_ms += op_ms
                     upsert_count += 1
                     if op_ms >= 750.0:
                         log.warning(
-                            f"[Reroute Timing] slow LPM upsert "
+                            f"[Reroute Timing] slow RL overlay upsert "
                             f"qid={qid} dir={label} sw={sw} dst={dst_prefix} "
                             f"dscp={dscp} ms={op_ms:.0f}"
                         )
                     if not ok:
-                        log.warning(f"[Reroute] LPM upsert failed at sw={sw}, rolling back {len(changes)} changes")
+                        log.warning(f"[Reroute] RL overlay upsert failed at sw={sw}, rolling back {len(changes)} changes")
                         # Rollback this path's changes on failure
                         for ent in reversed(changes):
                             b = ent["before"]
                             if b is not None:
-                                self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
+                                self._upsert_overlay(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
                             else:
                                 try:
-                                    self._call(
-                                        self.controllers[ent["sw"]].table_delete_match,
-                                        "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
-                                    )
-                                    # Cleanup local cache
-                                    try:
-                                        del self.forwarding_entries[ent["sw"]]['lpm'][(ent["dst_prefix"], ent["dscp"])]
-                                    except Exception:
-                                        pass
+                                    self._delete_overlay(ent["sw"], ent["dst_prefix"], ent["dscp"])
                                 except Exception:
                                     pass
                         timing[f"{label}_install_ms"] = (time.perf_counter() - install_t0) * 1000.0
@@ -1390,17 +1507,10 @@ class Controller:
                 for ent in reversed(fwd_changes):
                     b = ent["before"]
                     if b is not None:
-                        self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
+                        self._upsert_overlay(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
                     else:
                         try:
-                            self._call(
-                                self.controllers[ent["sw"]].table_delete_match,
-                                "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
-                            )
-                            try:
-                                del self.forwarding_entries[ent["sw"]]['lpm'][(ent["dst_prefix"], ent["dscp"])]
-                            except Exception:
-                                pass
+                            self._delete_overlay(ent["sw"], ent["dst_prefix"], ent["dscp"])
                         except Exception:
                             pass
 
@@ -1409,17 +1519,10 @@ class Controller:
                 for ent in reversed(rev_changes):
                     b = ent["before"]
                     if b is not None:
-                        self._upsert_lpm(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
+                        self._upsert_overlay(ent["sw"], ent["dst_prefix"], ent["dscp"], b[0], b[1])
                     else:
                         try:
-                            self._call(
-                                self.controllers[ent["sw"]].table_delete_match,
-                                "l3_forward.ipv4_lpm", [ent["dst_prefix"], ent["dscp"]]
-                            )
-                            try:
-                                del self.forwarding_entries[ent["sw"]]['lpm'][(ent["dst_prefix"], ent["dscp"])]
-                            except Exception:
-                                pass
+                            self._delete_overlay(ent["sw"], ent["dst_prefix"], ent["dscp"])
                         except Exception:
                             pass
 

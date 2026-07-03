@@ -3,7 +3,8 @@
 This benchmark compares:
 
 - **RL:** the trained greedy DQN policy with queue-specific K1/K2 rerouting,
-  demand-unit lockout, and `multi-k1`.
+  demand-unit lockout, and `multi-k1`. RL runs start from a selectable base
+  routing method, `--rl-base-routing ospf` by default or `ecmp` when requested.
 - **ECMP:** shortest-path equal-cost multipath with a stable CRC16 flow hash.
   DSCP and transport ports are excluded so all QoS queues of the same demand
   receive the same routing decision.
@@ -17,6 +18,11 @@ cost model; it is not protocol overhead or measured dynamic link delay.
 The OSPF condition models steady-state single-path SPF forwarding. It does not
 run distributed OSPF daemons and does not measure protocol convergence or LSA
 overhead. This distinction must be stated in publications.
+
+For RL, the base routing method is only the clean starting point. Learned
+`/32 + DSCP` reroutes are installed into `l3_forward.rl_overlay`, which the P4
+pipeline applies before ECMP or OSPF fallback forwarding. This lets the same
+agent action logic take over from either selected base.
 
 ## Default experiment
 
@@ -37,12 +43,19 @@ The default experiment uses:
 - Thirty-second inter-run cooldown
 - One retry for infrastructure or telemetry-quality failure
 - Minimum valid telemetry fraction of 0.80
+- RL base routing: `ospf` unless `BENCH_RL_BASE_ROUTING=ecmp` is set
 
 This produces 54 runs: 3 profiles × 6 repetitions × 3 methods. For final
 paper results, 12 or more repetitions are recommended:
 
 ```bash
 make benchmark BENCH_REPETITIONS=12 STEPS=300
+```
+
+To benchmark RL taking over from ECMP instead of OSPF, run:
+
+```bash
+make benchmark BENCH_RL_BASE_ROUTING=ecmp
 ```
 
 To include transient QoS stress, add the short burst profiles:
@@ -68,7 +81,8 @@ Each `(traffic profile, repetition)` forms a block:
 2. RL, ECMP, and OSPF use that same seed and profile.
 3. Method order is selected from balanced permutations.
 4. Traffic is stopped and the system is cooled down between runs.
-5. Each routing method starts from a clean routing state.
+5. Each routing method starts from a clean routing state. RL starts from the
+   configured `rl_base_routing` and then applies learned overlays.
 6. P4 tables are read back before measurement; attempted writes alone are not
    accepted as evidence that the requested routing method is active.
 7. The exact iperf3 process population is verified at the beginning and end of
@@ -83,6 +97,11 @@ one iperf3 server and one client for each configured `(flow_id, queue)` port.
 It retries from a clean process state, restarts TaskServers between attempts,
 and raises an error after three unsuccessful attempts. Aggregate process counts
 alone are not accepted because duplicates could otherwise hide missing flows.
+
+Standalone OSPF, standalone ECMP, and RL-base runs publish visualization paths
+for the same configured traffic-flow set. RL-base runs use the selected base
+method's `routing_mode` in `/tmp/p4_paths.json`, then update the same per-queue
+entries as RL overlays are applied.
 
 Shaped profiles apply their first scheduled offered-load stage before iperf
 clients are launched. Exact endpoint and all-flow telemetry coverage are
@@ -229,8 +248,9 @@ Each invocation creates `benchmark_results/benchmark_<timestamp>/` containing:
 
 Every successful run must include `routing_state_verified=true`,
 `traffic_state_verified=true`, and `telemetry_state_verified=true` in its
-runner summary. ECMP summaries also include a SHA-256 digest of the
-deterministic route plan and per-switch expected/observed ECMP table counts.
+runner summary. Standalone ECMP runs, and RL runs with `rl_base_routing=ecmp`,
+also include a SHA-256 digest of the deterministic route plan and per-switch
+expected/observed ECMP table counts.
 Missing verification marks the run invalid even when the available telemetry
 values themselves appear complete.
 

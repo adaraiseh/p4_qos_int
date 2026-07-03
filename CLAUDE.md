@@ -731,14 +731,15 @@ The controller maintains two path storage structures for managing network routes
 
 | Storage | Purpose | Mutability |
 |---------|---------|------------|
-| `path_map` | **Baseline OSPF paths** - Original shortest paths computed during initialization | **Read-only** after init |
+| `path_map` | **Selected RL base paths** - OSPF/SPF by default, or concrete ECMP-selected paths when `--rl-base-routing ecmp` is used | **Read-only** after base reset |
 | `paths_per_queue[qid]` | **Per-queue current paths** - May differ from baseline after reroutes | **Read-write** during reroutes |
 
 This separation ensures **queue independence** - rerouting one queue doesn't affect other queues' path lookups.
 
 ### Initialization Flow
 
-During `compute_forwarding_entries()`:
+During `compute_forwarding_entries()`, the controller builds the OSPF/SPF
+fallback:
 
 ```
 1. path_map.clear()
@@ -751,7 +752,16 @@ During `compute_forwarding_entries()`:
    e. paths_per_queue[7][(src, dst)] = OSPF_path  (copy)
 ```
 
-At initialization, all stores contain the **same OSPF paths** (independent copies).
+When `--rl-base-routing ecmp` is selected, the reset path then installs the
+verified ECMP groups and calls `set_baseline_paths()` with the concrete
+BMv2-hash-selected ECMP path for each source/destination pair. At the end of a
+baseline reset, all stores contain the same selected base paths as independent
+copies.
+
+If a traffic manager supplies configured `(src, dst, flow_id)` demands,
+`dump_paths_json()` exports only those flows using the same `flow_id` and
+`routing_mode` fields as standalone OSPF/ECMP. Without traffic-pair metadata,
+it falls back to the legacy all-host-pair export.
 
 ### Reroute Behavior
 
@@ -763,11 +773,11 @@ When a queue is rerouted (e.g., Q0 for demand h1→h2):
 
 2. **Path update** (controller.py:1209-1211):
    - **Only** updates `paths_per_queue[qid]` with the new path
-   - `path_map` remains **unchanged** (immutable baseline)
+   - `path_map` remains **unchanged** (immutable selected base)
 
 3. **Example state after Q0 reroutes from c1→c2:**
    ```
-   path_map[(h1, h2)]           = [h1, l1, c1, l2, h2]  # Original (unchanged)
+   path_map[(h1, h2)]           = [h1, l1, c1, l2, h2]  # Selected base (unchanged)
    paths_per_queue[0][(h1, h2)] = [h1, l1, c2, l2, h2]  # Q0's rerouted path
    paths_per_queue[1][(h1, h2)] = [h1, l1, c1, l2, h2]  # Q1 still uses original
    paths_per_queue[7][(h1, h2)] = [h1, l1, c1, l2, h2]  # Q7 still uses original
@@ -778,12 +788,15 @@ When a queue is rerouted (e.g., Q0 for demand h1→h2):
 During episode reset (rl_agent_4.py:974-985):
 
 ```python
-controller.clear_all_tables()         # Clears paths_per_queue[*], keeps path_map
-controller.compute_forwarding_entries()  # Repopulates BOTH from fresh OSPF computation
-controller.program_switches()         # Installs baseline rules
+controller.clear_all_tables()            # Clears P4 tables and paths_per_queue[*]
+controller.compute_forwarding_entries()  # Builds OSPF fallback entries and paths
+controller.program_switches()            # Installs OSPF fallback rules
+# If --rl-base-routing ecmp:
+#   ECMPProgrammer.install()             # Installs verified ECMP groups
+#   controller.set_baseline_paths(...)   # Seeds concrete ECMP paths for RL lookup
 ```
 
-After reset, all queues are synchronized back to baseline OSPF paths.
+After reset, all queues are synchronized back to the selected RL base paths.
 
 ### Fallback Behavior
 
@@ -792,7 +805,7 @@ The fallback to `path_map` is essential for:
 | Scenario | `paths_per_queue[qid]` | Result |
 |----------|------------------------|--------|
 | Normal operation | Has current path | Uses queue-specific path |
-| After `clear_all_tables()` | Empty (cleared) | Falls back to `path_map` baseline |
+| After `clear_all_tables()` | Empty (cleared) | Falls back to `path_map` selected base |
 | First reroute for a demand | Has original (same as baseline) | Uses queue-specific path |
 
 ### Key Code Locations
@@ -808,6 +821,14 @@ The fallback to `path_map` is essential for:
 ### Why This Design?
 
 1. **Queue Independence**: Q0's reroute doesn't contaminate Q1's path lookup
-2. **Safe Fallback**: `path_map` always has valid OSPF paths for any (src, dst) pair
-3. **Clean Reset**: Episode reset just calls `compute_forwarding_entries()` to re-sync all stores
+2. **Safe Fallback**: `path_map` always has valid selected-base paths for any (src, dst) pair
+3. **Clean Reset**: Episode reset re-syncs all stores from OSPF or concrete ECMP base paths
 4. **Multi-queue Reroutes**: Action 13 (`multi-k1`) can reroute Q0, Q1, Q7 independently without interference
+
+### Dataplane Overlay Order
+
+The P4 pipeline applies `l3_forward.rl_overlay` before ECMP and OSPF fallback
+forwarding. RL reroutes write only `/32 + DSCP` entries to this overlay table.
+If an overlay misses, packets use ECMP when ECMP groups are installed, otherwise
+they use the OSPF/SPF `ipv4_lpm` fallback. This keeps the learned action logic
+the same while allowing `--rl-base-routing ospf|ecmp`.

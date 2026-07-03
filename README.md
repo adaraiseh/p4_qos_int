@@ -82,6 +82,16 @@ Key behavior:
 - A successfully rerouted demand unit is locked for `5` control steps using
   the dataplane-compatible key `(qid, dst_ip, bottleneck_sid)`. Other demand
   units on the same queue may still be rerouted during that lock window.
+- RL baseline resets start from a selectable base routing method:
+  `--rl-base-routing ospf` (default) or `--rl-base-routing ecmp`. The learned
+  `/32 + DSCP` reroutes are installed in `l3_forward.rl_overlay`, which is
+  applied before either base method, so the agent can take over from the
+  selected base without changing the action logic.
+- When a traffic profile is active, RL publishes `/tmp/p4_paths.json` with the
+  same configured-flow schema as standalone OSPF/ECMP (`flow_id`,
+  `routing_mode`, and per-queue path). This makes the RL-base starting diagram
+  directly comparable with the matching standalone baseline before overlays are
+  applied.
 - The observation includes batch-awareness per queue:
   `eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm`.
   These expose whether K2 is meaningful without exposing full demand IDs.

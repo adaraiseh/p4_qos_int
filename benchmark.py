@@ -323,6 +323,14 @@ def validate_runner_summary(item: Dict, path: Path) -> Tuple[Dict, List[str]]:
             f"runner method={payload.get('method')!r}, "
             f"expected {item['method']!r}"
         )
+    if item["method"] == "rl":
+        expected_base = item.get("rl_base_routing", "ospf")
+        observed_base = payload.get("rl_base_routing", "ospf")
+        if observed_base != expected_base:
+            errors.append(
+                f"runner rl_base_routing={observed_base!r}, "
+                f"expected {expected_base!r}"
+            )
     if payload.get("traffic_profile") != item["profile"]:
         errors.append(
             f"runner profile={payload.get('traffic_profile')!r}, "
@@ -565,6 +573,11 @@ class BenchmarkOrchestrator:
                             "seed": seed,
                             "order_index": order_index,
                             "method": method,
+                            "rl_base_routing": (
+                                self.args.rl_base_routing
+                                if method == "rl"
+                                else None
+                            ),
                             "block_order": list(order),
                         }
                     )
@@ -693,10 +706,13 @@ class BenchmarkOrchestrator:
             subprocess.run(command, capture_output=True, check=False)
 
     def _run_paths(self, item: Dict) -> Dict[str, Path]:
+        method_label = item["method"]
+        if item["method"] == "rl":
+            method_label = f"rl_base_{item.get('rl_base_routing', 'ospf')}"
         stem = (
             f"{item['profile']}__rep{item['repetition']:02d}"
             f"__seed{item['seed']}__order{item['order_index']}"
-            f"__{item['method']}"
+            f"__{method_label}"
         )
         run_dir = self.output_dir / "runs" / item["profile"] / (
             f"rep_{item['repetition']:02d}_seed_{item['seed']}"
@@ -754,6 +770,8 @@ class BenchmarkOrchestrator:
                     self.args.weights_tag,
                     "--production-influx-write",
                     self.args.production_influx_write,
+                    "--rl-base-routing",
+                    self.args.rl_base_routing,
                 ]
             )
         return common
@@ -936,6 +954,11 @@ class BenchmarkOrchestrator:
                         if isinstance(routing_state, dict)
                         else None
                     )
+                    if item["method"] == "rl":
+                        final_summary["rl_base_routing"] = runner_payload.get(
+                            "rl_base_routing",
+                            item.get("rl_base_routing"),
+                        )
                     top_bottlenecks = runner_payload.get(
                         "top_bottleneck_egresses"
                     )
@@ -1539,6 +1562,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-high-2", action="store_true")
     parser.add_argument("--save-dir", default="training_files")
     parser.add_argument("--weights-tag", default="best")
+    parser.add_argument(
+        "--rl-base-routing",
+        choices=["ospf", "ecmp"],
+        default="ospf",
+        help="Base routing method used by RL runs before learned reroute overlays",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-level", default="info")

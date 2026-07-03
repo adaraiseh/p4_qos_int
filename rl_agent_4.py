@@ -107,6 +107,13 @@ log.setLevel(logging.INFO)
 
 # Now import modules that use logging
 from controller import Controller
+from ecmp_baseline import (
+    ECMPPlanner,
+    ECMPProgrammer,
+    _groups_with_runtime_ips,
+    _runtime_host_ips,
+    ecmp_plan_sha256,
+)
 from traffic_generator import TrafficManager
 from config.schema import MAX_SWITCHES
 from report_collector.local_telemetry_cache import (
@@ -1153,6 +1160,7 @@ class QoSRoutingEnv:
                  production_mode: bool = False, topology_builder=None,
                  rules_dir: str = None, config_path: str = None,
                  traffic_seed: Optional[int] = None,
+                 rl_base_routing: str = "ospf",
                  telemetry_backend: str = "influx",
                  telemetry_cache_socket: str = DEFAULT_SOCKET_PATH,
                  telemetry_cache_timeout: float = 1.0):
@@ -1189,6 +1197,13 @@ class QoSRoutingEnv:
         # Store topology builder for reference
         self._topology_builder = topology_builder
         self._config_path = config_path
+        self.rl_base_routing = self._normalize_rl_base_routing(rl_base_routing)
+        self._ecmp_programmer = None
+        self._ecmp_plan_sha256 = None
+        self._ecmp_plan_stats = None
+        self._ecmp_runtime_host_ips = {}
+        self._ecmp_groups = []
+        self._last_baseline_routing_state = None
 
         # Controller for routing changes
         # Pass topology_builder for dynamic role detection if available
@@ -1250,6 +1265,11 @@ class QoSRoutingEnv:
             TrafficManager(config_path=self._config_path, seed=traffic_seed)
             if (reset_network and not production_mode) else None
         )
+        if self.traffic_manager is not None:
+            self.controller.set_visualization_traffic_pairs(
+                self.traffic_manager.traffic_pairs,
+                routing_mode=self.rl_base_routing,
+            )
         
         # Current traffic profile for logging
         self.current_traffic_profile = ""  # e.g., "light_1", "medium_2", "bursty_be_1"
@@ -1342,14 +1362,114 @@ class QoSRoutingEnv:
             bn_norm = 0.0
         return float(min(max(0.7 * lat_ratio_norm + 0.3 * bn_norm, 0.0), 1.0))
 
+    @staticmethod
+    def _normalize_rl_base_routing(value: str) -> str:
+        mode = (value or "ospf").strip().lower()
+        if mode not in ("ospf", "ecmp"):
+            raise ValueError(
+                f"Unsupported RL base routing {value!r}; expected 'ospf' or 'ecmp'"
+            )
+        return mode
+
+    def _build_ecmp_selected_paths(
+        self,
+        planner: ECMPPlanner,
+        groups,
+        runtime_host_ips: Dict[str, str],
+    ) -> Dict[Tuple[str, str], List[str]]:
+        groups_by_key = {
+            (group.switch, group.destination): group for group in groups
+        }
+        selected_paths = {}
+        for src_host in planner.hosts:
+            for dst_host in planner.hosts:
+                if src_host == dst_host:
+                    continue
+                selected_paths[(src_host, dst_host)] = planner.trace_selected_path(
+                    groups_by_key,
+                    src_host,
+                    dst_host,
+                    host_ips=runtime_host_ips,
+                )
+        return selected_paths
+
+    def verify_base_routing(self, raise_on_error: bool = True) -> Dict[str, Any]:
+        fallback_tables = self.controller.verify_forwarding_tables(
+            raise_on_error=raise_on_error
+        )
+        report = {
+            "verified": bool(fallback_tables.get("verified", False)),
+            "base_routing": self.rl_base_routing,
+            "fallback_tables": fallback_tables,
+        }
+        if self.rl_base_routing == "ecmp":
+            if self._ecmp_programmer is None:
+                message = "ECMP base routing was requested but no ECMP programmer is active"
+                if raise_on_error:
+                    raise RuntimeError(message)
+                report.update({"verified": False, "errors": [message]})
+                return report
+            ecmp_tables = self._ecmp_programmer.verify(raise_on_error=raise_on_error)
+            report.update({
+                "verified": bool(report["verified"] and ecmp_tables.get("verified")),
+                "plan_sha256": self._ecmp_plan_sha256,
+                "plan_stats": self._ecmp_plan_stats,
+                "runtime_host_ips": self._ecmp_runtime_host_ips,
+                "ecmp_tables": ecmp_tables,
+            })
+        return report
+
     def _program_baseline_routing(self) -> None:
-        """Clear P4 state and restore the OSPF baseline."""
+        """Clear P4 state and restore the selected RL base routing."""
         self.controller.clear_all_tables(verify=True)
         log.info("Cleared all P4 tables")
         self.controller.compute_forwarding_entries()
         log.info("Recomputed OSPF forwarding entries")
         self.controller.program_switches()
-        log.info("Programmed switches with baseline routing")
+        log.info("Programmed switches with OSPF fallback routing")
+
+        self._ecmp_programmer = None
+        self._ecmp_plan_sha256 = None
+        self._ecmp_plan_stats = None
+        self._ecmp_runtime_host_ips = {}
+        self._ecmp_groups = []
+
+        if self.rl_base_routing == "ecmp":
+            if self._topology_builder is None:
+                raise RuntimeError(
+                    "RL ECMP base routing requires --config so the ECMP planner "
+                    "can use topology metadata"
+                )
+            planner = ECMPPlanner(self._topology_builder)
+            groups = planner.build_groups()
+            self._ecmp_plan_stats = planner.validate(groups)
+            self._ecmp_runtime_host_ips = _runtime_host_ips(
+                self.controller,
+                planner.hosts,
+            )
+            if self._ecmp_runtime_host_ips:
+                groups = _groups_with_runtime_ips(groups, self._ecmp_runtime_host_ips)
+            self._ecmp_groups = list(groups)
+            self._ecmp_plan_sha256 = ecmp_plan_sha256(groups)
+            self._ecmp_programmer = ECMPProgrammer(self.controller, groups)
+            installed = self._ecmp_programmer.install()
+            selected_paths = self._build_ecmp_selected_paths(
+                planner,
+                groups,
+                self._ecmp_runtime_host_ips,
+            )
+            self.controller.set_baseline_paths(selected_paths, label="ecmp")
+            log.info(
+                "Programmed ECMP base routing for RL: "
+                f"{installed['groups']} groups, {installed['members']} members, "
+                f"plan_sha256={self._ecmp_plan_sha256}"
+            )
+        else:
+            log.info("Programmed OSPF base routing for RL")
+
+        self._last_baseline_routing_state = self.verify_base_routing(
+            raise_on_error=True
+        )
 
     def _reset_local_telemetry_epoch(self, reason: str) -> None:
         """Clear only the live in-memory cache between traffic profiles."""
@@ -1513,7 +1633,7 @@ class QoSRoutingEnv:
         Args:
             force_reset: Override reset behavior for this episode.
                 - None: use self.reset_network default
-                - True: force baseline reset (clear tables, reprogram OSPF)
+                - True: force baseline reset (clear tables, reprogram selected base)
                 - False: warm-start from current state
             cooldown_seconds: Optional explicit stabilization interval. When
                 omitted, preserves the training defaults (5s after a baseline
@@ -1534,7 +1654,10 @@ class QoSRoutingEnv:
         
         # Perform full network reset if requested
         if do_reset:
-            log.info("=== BASELINE START: Resetting network to OSPF ===")
+            log.info(
+                "=== BASELINE START: Resetting network to "
+                f"{self.rl_base_routing.upper()} ==="
+            )
             self._program_baseline_routing()
             self._demand_unit_locks.clear()
             self._last_rerouted_units = []
@@ -1611,7 +1734,10 @@ class QoSRoutingEnv:
                     "[Telemetry Gate] Forcing baseline reset before retrying "
                     f"profile {profile_override}"
                 )
-                log.info("=== BASELINE START: Resetting network to OSPF ===")
+                log.info(
+                    "=== BASELINE START: Resetting network to "
+                    f"{self.rl_base_routing.upper()} ==="
+                )
                 self._program_baseline_routing()
                 do_reset = True
                 baseline_recovery_used = True
@@ -5803,6 +5929,7 @@ def train(args):
     log.info(f"  Batch size: {BATCH_SIZE}, Replay capacity: {buffer_capacity}")
     log.info(f"  Min replay: {MIN_REPLAY_SIZE}")
     log.info(f"  Epsilon: {EPS_START} -> {EPS_END} over {args.eps_decay_steps} steps")
+    log.info(f"  RL base routing: {args.rl_base_routing.upper()}")
     log.info(f"  Timing: Window={WINDOW_SECONDS}s, Delay={DELAY_AFTER_ACTION}s, Cooldown={COOLDOWN_SECONDS}s")
     log.info(f"  Max steps: {args.steps}, Max episode steps: {MAX_EPISODE_STEPS}")
     if args.multi_buffer:
@@ -5835,6 +5962,7 @@ def train(args):
         rules_dir=rules_dir,
         config_path=args.config,
         traffic_seed=args.seed,
+        rl_base_routing=args.rl_base_routing,
         telemetry_backend=args.telemetry_backend,
         telemetry_cache_socket=args.telemetry_cache_socket,
         telemetry_cache_timeout=args.telemetry_cache_timeout,
@@ -6328,6 +6456,7 @@ def evaluate(args):
         rules_dir=rules_dir,
         config_path=args.config,
         traffic_seed=args.seed,
+        rl_base_routing=args.rl_base_routing,
         telemetry_backend=args.telemetry_backend,
         telemetry_cache_socket=args.telemetry_cache_socket,
         telemetry_cache_timeout=args.telemetry_cache_timeout,
@@ -6425,6 +6554,12 @@ def main():
     parser.add_argument('--warm-cooldown-seconds', type=float, default=2.0,
                         help='Traffic warmup/cooldown before measured steps '
                              'after a warm-start episode (default: 2.0)')
+    parser.add_argument('--rl-base-routing',
+                        choices=['ospf', 'ecmp'],
+                        default='ospf',
+                        help='Base routing method restored on RL baseline resets '
+                             'before learned reroute overlays take over '
+                             '(default: ospf)')
     
     # Model
     parser.add_argument('--save-dir', default='training_files',

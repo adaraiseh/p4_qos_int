@@ -390,6 +390,7 @@ class ProductionRunner:
         log.info("=" * 60)
         log.info(f"Configuration:")
         log.info(f"  Weights: {args.weights_tag}")
+        log.info(f"  RL base routing: {args.rl_base_routing.upper()}")
         log.info(f"  Max steps: {args.steps} (0 = infinite)")
         log.info(f"  Log frequency: every {args.log_every} steps")
         log.info("=" * 60)
@@ -427,6 +428,7 @@ class ProductionRunner:
             topology_builder=topology_builder,
             rules_dir=rules_dir,
             config_path=args.config,
+            rl_base_routing=args.rl_base_routing,
             telemetry_backend=args.telemetry_backend,
             telemetry_cache_socket=args.telemetry_cache_socket,
             telemetry_cache_timeout=args.telemetry_cache_timeout,
@@ -474,6 +476,10 @@ class ProductionRunner:
                 config_path=args.config,
                 seed=args.traffic_seed,
             )
+            env.controller.set_visualization_traffic_pairs(
+                traffic_manager.traffic_pairs,
+                routing_mode=args.rl_base_routing,
+            )
             log.info(f"Traffic generation enabled with profile: {args.traffic_profile}")
             
             # Start traffic with fixed profile
@@ -519,7 +525,7 @@ class ProductionRunner:
             warmup_state = traffic_manager.warm_profile_for(
                 args.warmup_seconds
             )
-        routing_state = env.controller.verify_forwarding_tables(
+        routing_state = env.verify_base_routing(
             raise_on_error=True
         )
         traffic_state = (
@@ -751,23 +757,28 @@ class ProductionRunner:
                 summary_payload = {
                     **summary,
                     'method': 'rl',
+                    'rl_base_routing': args.rl_base_routing,
                     'traffic_profile': args.traffic_profile,
                     'traffic_seed': args.traffic_seed,
                     'weights_path': os.path.abspath(weights_path),
                     'csv_path': os.path.abspath(csv_path),
                     'status': 'failed' if failed else 'completed',
+                    'route_plan_sha256': routing_state.get('plan_sha256'),
                     'routing_state_verified': routing_state['verified'],
                     'traffic_state_verified': traffic_state['verified'],
                     'telemetry_state_verified': telemetry_state['verified'],
                     'top_bottleneck_egresses': top_bottlenecks,
                     'routing_state': {
                         'verified': routing_state['verified'],
+                        'base_routing': args.rl_base_routing,
+                        'plan_sha256': routing_state.get('plan_sha256'),
                         'initial_tables': routing_state,
                         'traffic_processes': traffic_state,
                         'telemetry_required_metrics': telemetry_state,
                         'top_bottleneck_egresses': top_bottlenecks,
                         'note': (
-                            'Initial clean baseline verified before RL actions; '
+                            f"Initial clean {args.rl_base_routing.upper()} base "
+                            'verified before RL actions; '
                             'per-action success is recorded separately.'
                         ),
                     },
@@ -856,6 +867,11 @@ def main():
                         help='Traffic profile name from TrafficManager.TRAFFIC_PROFILES')
     parser.add_argument('--traffic-seed', type=int, default=None,
                         help='Deterministic traffic seed for fair RL/ECMP comparisons')
+    parser.add_argument('--rl-base-routing',
+                        choices=['ospf', 'ecmp'],
+                        default='ospf',
+                        help='Base routing method installed before RL learned '
+                             'reroute overlays take over (default: ospf)')
     
     args = parser.parse_args()
 
