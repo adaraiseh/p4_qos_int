@@ -15,6 +15,7 @@ profile    ?= high_1
 LOG_LEVEL  ?= info
 STEPS      ?= 300
 TRAFFIC_SEED ?= 42
+SUDO_KEEPALIVE_INTERVAL ?= 60
 TRAIN_REPLAY_CAPACITY ?= 80000
 TRAIN_FOUNDATION_STEPS ?= 35000
 TRAIN_BURST_STEPS ?= 25000
@@ -183,15 +184,20 @@ visualize:
 train: train_paper
 
 train_paper:
-	@echo "Using topology config: $(DETECT_TOPOLOGY)"
-	@echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"
-	@echo "Influx training detail: $(TRAIN_INFLUX_DETAIL)"
-	@echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"
-	@echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"
-	@echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"
-	@echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"
-	@echo "=== Stage 1/3: reset-heavy recovery foundation ($(TRAIN_FOUNDATION_STEPS) steps, eps_decay=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS)) ==="
-	@echo "Profile weights: $(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"
+	@set -e; \
+	sudo -v; \
+	while true; do sudo -n -v || exit; sleep $(SUDO_KEEPALIVE_INTERVAL); done & \
+	SUDO_KEEPALIVE_PID=$$!; \
+	trap 'kill $$SUDO_KEEPALIVE_PID 2>/dev/null || true' EXIT INT TERM; \
+	echo "Using topology config: $(DETECT_TOPOLOGY)"; \
+	echo "Log level: $(LOG_LEVEL) (use LOG_LEVEL=debug for debug output)"; \
+	echo "Influx training detail: $(TRAIN_INFLUX_DETAIL)"; \
+	echo "External artifact root: $(EXTERNAL_ARTIFACT_ROOT)"; \
+	echo "Training state file: $(TRAINING_STATE_FILE), collector split steps=$(COLLECTOR_LOCAL_SPOOL_SPLIT_STEPS)"; \
+	echo "Replay capacity: $(TRAIN_REPLAY_CAPACITY)"; \
+	echo "RL telemetry backend: $(TELEMETRY_BACKEND) ($(TELEMETRY_CACHE_SOCKET))"; \
+	echo "=== Stage 1/3: reset-heavy recovery foundation ($(TRAIN_FOUNDATION_STEPS) steps, eps_decay=$(TRAIN_FOUNDATION_EPS_DECAY_STEPS)) ==="; \
+	echo "Profile weights: $(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"; \
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_FOUNDATION_STEPS) \
 		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_FOUNDATION_RESET_PROB_START) \
@@ -200,9 +206,9 @@ train_paper:
 		--warm-cooldown-seconds $(TRAIN_WARM_COOLDOWN) \
 		--training-influx-detail $(TRAIN_INFLUX_DETAIL) \
 		--eps-decay-steps $(TRAIN_FOUNDATION_EPS_DECAY_STEPS) \
-		--traffic-profile-weights "$(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"
-	@echo "=== Stage 2/3: burst specialization ($(TRAIN_BURST_STEPS) steps, resume final, eps=$(TRAIN_BURST_RESUME_EPS), eps_decay=$(TRAIN_BURST_EPS_DECAY_STEPS)) ==="
-	@echo "Profile weights: $(TRAIN_BURST_PROFILE_WEIGHTS)"
+		--traffic-profile-weights "$(TRAIN_FOUNDATION_PROFILE_WEIGHTS)"; \
+	echo "=== Stage 2/3: burst specialization ($(TRAIN_BURST_STEPS) steps, resume final, eps=$(TRAIN_BURST_RESUME_EPS), eps_decay=$(TRAIN_BURST_EPS_DECAY_STEPS)) ==="; \
+	echo "Profile weights: $(TRAIN_BURST_PROFILE_WEIGHTS)"; \
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_BURST_STEPS) \
 		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_BURST_RESET_PROB_START) \
@@ -212,9 +218,9 @@ train_paper:
 		--training-influx-detail $(TRAIN_INFLUX_DETAIL) \
 		--eps-decay-steps $(TRAIN_BURST_EPS_DECAY_STEPS) \
 		--resume final --resume-eps $(TRAIN_BURST_RESUME_EPS) \
-		--traffic-profile-weights "$(TRAIN_BURST_PROFILE_WEIGHTS)"
-	@echo "=== Stage 3/3: stability/no-op polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="
-	@echo "Profile weights: $(TRAIN_POLISH_PROFILE_WEIGHTS)"
+		--traffic-profile-weights "$(TRAIN_BURST_PROFILE_WEIGHTS)"; \
+	echo "=== Stage 3/3: stability/no-op polishing ($(TRAIN_POLISH_STEPS) steps, resume final, eps=$(TRAIN_POLISH_RESUME_EPS), eps_decay=$(TRAIN_POLISH_EPS_DECAY_STEPS)) ==="; \
+	echo "Profile weights: $(TRAIN_POLISH_PROFILE_WEIGHTS)"; \
 	$(SUDO_PYTHON) rl_agent_4.py --mode train --steps $(TRAIN_POLISH_STEPS) \
 		$(RL_COMMON) $(TRAIN_LOGGING_FLAGS) $(TRAIN_REPLAY_FLAGS) \
 		--reset-prob-start $(TRAIN_POLISH_RESET_PROB_START) \
