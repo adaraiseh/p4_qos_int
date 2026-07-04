@@ -4876,24 +4876,31 @@ class QoSRoutingEnv:
             if required_invalid_qs else {}
         )
         
+        invalid_reasons = []
         if not data_valid:
-            reasons = []
             if required_valid_count < min_required_valid:
-                reasons.append(
+                invalid_reasons.append(
                     f"required telemetry incomplete "
                     f"({required_valid_count}/{len(required_qids)}): "
                     f"queues {required_invalid_qs}"
                 )
             elif valid_count < len(QIDS):
-                reasons.append(
+                invalid_reasons.append(
                     f"queue telemetry missing ({valid_count}/{len(QIDS)}): "
                     f"queues {invalid_qs}"
                 )
             if action != 0 and not action_context_valid:
-                reasons.append("action lacked routing context")
+                invalid_reasons.append("action lacked routing context")
             if action != 0 and not action_applied:
-                reasons.append("action was not applied (controller rejected)")
-            log.warning(f"[Step {self.episode_step}] Invalid transition (action={action}) - {', '.join(reasons)}")
+                invalid_reasons.append("action was not applied (controller rejected)")
+            if not invalid_reasons:
+                invalid_reasons.append("unknown invalid telemetry/action state")
+            log.warning(
+                f"[Step {self.episode_step}] Invalid transition "
+                f"(action={action}) - {', '.join(invalid_reasons)}"
+            )
+        info['invalid_reasons'] = invalid_reasons
+        info['invalid_reason'] = "; ".join(invalid_reasons)
         phase_ms['reward_info'] = (time.perf_counter() - phase_t0) * 1000.0
         
         # Build raw observation - ONLY update state stacks if data is valid

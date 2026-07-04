@@ -90,7 +90,7 @@ class OSPFBenchmark:
             return 2
 
         from rl_agent_4 import QoSRoutingEnv, SLA_THRESHOLDS
-        from traffic_generator import TrafficManager
+        from traffic_generator import TrafficManager, finalize_traffic_validation
 
         builder = create_topology(self.args.config)
         topology_name = builder.config.topology.name.replace("-", "_")
@@ -124,9 +124,11 @@ class OSPFBenchmark:
         traffic_state = self.traffic_manager.verify_exact_processes(
             raise_on_error=True
         )
-        traffic_state["sender_rate_shaping"] = profile_info.get(
-            "traffic_shaping",
-            {},
+        finalize_traffic_validation(
+            traffic_state,
+            profile_info=profile_info,
+            require_measurement_shaping=False,
+            require_post_measurement=False,
         )
         initial_loads = profile_info.get(
             "measurement_loads",
@@ -148,7 +150,8 @@ class OSPFBenchmark:
             collect_initial_snapshot=False,
         )
         warmup_state = self.traffic_manager.warm_profile_for(
-            self.args.warmup_seconds
+            self.args.warmup_seconds,
+            verify_each_step=True,
         )
         initial_verification = self.env.controller.verify_forwarding_tables(
             raise_on_error=True
@@ -175,17 +178,23 @@ class OSPFBenchmark:
         log.info("Verified OSPF forwarding tables on all switches")
         log.info("Verified required queue telemetry for OSPF")
         measurement_shaping = self.traffic_manager.begin_measurement()
-        if measurement_shaping:
-            self.routing_state["measurement_shaping"] = measurement_shaping
-            traffic_state["sender_rate_shaping"] = measurement_shaping
         post_measurement_traffic_state = self.traffic_manager.verify_exact_processes(
             raise_on_error=True
         )
-        traffic_state["post_measurement"] = post_measurement_traffic_state
-        traffic_state["verified"] = bool(
-            traffic_state["verified"]
-            and post_measurement_traffic_state["verified"]
+        finalize_traffic_validation(
+            traffic_state,
+            profile_info=profile_info,
+            warmup_state=warmup_state,
+            measurement_shaping=measurement_shaping,
+            post_measurement=post_measurement_traffic_state,
         )
+        self.routing_state["measurement_shaping"] = measurement_shaping
+        if not traffic_state["validation"]["verified"]:
+            raise RuntimeError(
+                "OSPF traffic validation failed: "
+                + "; ".join(traffic_state["validation"]["errors"])
+            )
+        log.info("Verified traffic validation for OSPF")
         self.visualization_file = VisualizationPathFile(self.args.paths_file)
         self.visualization_file.publish(self._visualization_data())
         log.info(
@@ -217,6 +226,7 @@ class OSPFBenchmark:
                     "raw_reward",
                     "sla_met_count",
                     "data_valid",
+                    "invalid_reason",
                     "routing_state_verified",
                     "traffic_state_verified",
                     "telemetry_state_verified",
@@ -238,7 +248,10 @@ class OSPFBenchmark:
                 self.args.steps == 0 or completed_steps < self.args.steps
             ):
                 next_step = completed_steps + 1
-                self.traffic_manager.apply_step_profile(next_step)
+                self.traffic_manager.apply_step_profile(
+                    next_step,
+                    verify_each_step=True,
+                )
 
                 _, reward, _, _, info = self.env.step(0)
                 completed_steps += 1
@@ -260,6 +273,7 @@ class OSPFBenchmark:
                     info.get("raw_reward", reward),
                     len(info.get("sla_met", [])),
                     int(info.get("data_valid", False)),
+                    info.get("invalid_reason", ""),
                     int(self.routing_state["verified"]),
                     int(traffic_state["verified"]),
                     int(telemetry_state["verified"]),
@@ -281,11 +295,18 @@ class OSPFBenchmark:
                     self.args.log_every > 0
                     and completed_steps % self.args.log_every == 0
                 ):
+                    validity_note = ""
+                    if not info.get("data_valid", False):
+                        validity_note = (
+                            " valid=0 reason="
+                            + str(info.get("invalid_reason", "invalid telemetry"))
+                        )
                     log.info(
                         f"[Step {completed_steps}] reward={reward:+.2f} "
                         f"sla={len(info.get('sla_met', []))}/"
                         f"{info.get('sla_total', len(QIDS))} "
                         f"pressure={pressure:.3f}"
+                        f"{validity_note}"
                     )
 
         final_traffic_state = self.traffic_manager.verify_exact_processes(
@@ -466,6 +487,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     setup_unified_logging(module_name="ospf_baseline", log_level=args.log_level)
+    logging.getLogger("traffic_generator").setLevel(logging.DEBUG)
 
     if args.telemetry_backend in ("influx", "cache-fallback-influx") and not args.influx_token:
         log.error("Set INFLUX_TOKEN or pass --influx-token")

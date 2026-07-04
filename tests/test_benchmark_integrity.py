@@ -499,6 +499,14 @@ class RLRoutingLogicIntegrityTests(unittest.TestCase):
 
 
 class BenchmarkReportingIntegrityTests(unittest.TestCase):
+    @staticmethod
+    def _verified_shaping():
+        return {
+            "verified": True,
+            "verification_skipped": False,
+            "senders": [{"host": "h1", "verified": True}],
+        }
+
     def test_runner_summary_requires_verified_routing_state(self):
         item = {
             "method": "ecmp",
@@ -550,6 +558,12 @@ class BenchmarkReportingIntegrityTests(unittest.TestCase):
                             "plan_sha256": "abc123",
                             "traffic_processes": {
                                 "verified": True,
+                                "start_verification": {
+                                    "verified": True,
+                                },
+                                "startup_sender_rate_shaping": self._verified_shaping(),
+                                "measurement_shaping": self._verified_shaping(),
+                                "sender_rate_shaping": self._verified_shaping(),
                                 "post_measurement": {
                                     "verified": True,
                                 },
@@ -593,7 +607,55 @@ class BenchmarkReportingIntegrityTests(unittest.TestCase):
 
             _, errors = validate_runner_summary(item, path)
 
-        self.assertIn("post-measurement traffic verification is missing", errors)
+        self.assertIn(
+            "traffic validation: post-measurement traffic verification is missing or unverified",
+            errors,
+        )
+
+    def test_runner_summary_requires_verified_htb_evidence(self):
+        item = {
+            "method": "ospf",
+            "profile": "medium_2",
+            "seed": 43,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "method": "ospf",
+                        "traffic_profile": "medium_2",
+                        "traffic_seed": 43,
+                        "routing_state_verified": True,
+                        "traffic_state_verified": True,
+                        "telemetry_state_verified": True,
+                        "routing_state": {
+                            "verified": True,
+                            "traffic_processes": {
+                                "verified": True,
+                                "start_verification": {
+                                    "verified": True,
+                                },
+                                "post_measurement": {
+                                    "verified": True,
+                                },
+                            },
+                        },
+                    }
+                )
+            )
+
+            _, errors = validate_runner_summary(item, path)
+
+        self.assertIn(
+            "traffic validation: startup HTB shaping evidence is missing",
+            errors,
+        )
+        self.assertIn(
+            "traffic validation: measurement HTB shaping evidence is missing",
+            errors,
+        )
 
     def test_aggregate_summary_does_not_confuse_two_ecmp_runs(self):
         fieldnames = [
@@ -664,6 +726,83 @@ class BenchmarkReportingIntegrityTests(unittest.TestCase):
         self.assertEqual(summary["sla_compliance_valid_pct"], 50.0)
         self.assertEqual(summary["sla_met_pct"], 50.0)
         self.assertEqual(summary["reward_mean_valid"], 0.0)
+
+    def test_invalid_rows_are_excluded_from_benchmark_aggregates(self):
+        fieldnames = [
+            "step",
+            "reward",
+            "sla_met_count",
+            "data_valid",
+            "action_applied",
+            "load_q0_mbps",
+            "load_q1_mbps",
+            "load_q7_mbps",
+            "q0_latency_ms",
+            "q0_drop",
+            "q0_util_pct",
+            "q1_latency_ms",
+            "q1_drop",
+            "q1_util_pct",
+            "q7_latency_ms",
+            "q7_drop",
+            "q7_util_pct",
+        ]
+        rows = [
+            {
+                "step": 1,
+                "reward": 1.0,
+                "sla_met_count": 3,
+                "data_valid": 1,
+                "action_applied": 0,
+                "load_q0_mbps": 1,
+                "load_q1_mbps": 1,
+                "load_q7_mbps": 1,
+                "q0_latency_ms": 10,
+                "q0_drop": 0,
+                "q0_util_pct": 10,
+                "q1_latency_ms": 10,
+                "q1_drop": 0,
+                "q1_util_pct": 10,
+                "q7_latency_ms": 10,
+                "q7_drop": 0,
+                "q7_util_pct": 10,
+            },
+            {
+                "step": 2,
+                "reward": -99.0,
+                "sla_met_count": 0,
+                "data_valid": 0,
+                "action_applied": 1,
+                "load_q0_mbps": 100,
+                "load_q1_mbps": 100,
+                "load_q7_mbps": 100,
+                "q0_latency_ms": 1000,
+                "q0_drop": 1,
+                "q0_util_pct": 100,
+                "q1_latency_ms": 1000,
+                "q1_drop": 1,
+                "q1_util_pct": 100,
+                "q7_latency_ms": 1000,
+                "q7_drop": 1,
+                "q7_util_pct": 100,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.csv"
+            with path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            summary = summarize_run_csv(path)
+
+        self.assertEqual(summary["steps"], 2)
+        self.assertEqual(summary["valid_steps"], 1)
+        self.assertEqual(summary["valid_fraction"], 0.5)
+        self.assertEqual(summary["reward_mean_valid"], 1.0)
+        self.assertEqual(summary["sla_compliance_valid_pct"], 100.0)
+        self.assertEqual(summary["offered_load_mean_mbps"], 3.0)
+        self.assertEqual(summary["action_applied_rate"], 0.0)
 
 
 class BenchmarkInterruptTests(unittest.TestCase):
@@ -863,23 +1002,23 @@ class TrafficIntegrityTests(unittest.TestCase):
             4.740,
         )
 
-    def test_short_horizon_shaped_profiles_are_fixed_and_ordered(self):
+    def test_short_horizon_shaped_profiles_are_seeded_and_ordered(self):
         expected_high_steps = {
             "light_1": 0,
             "light_2": 0,
             "medium_1": 3,
-            "medium_2": 4,
-            "high_1": 6,
-            "high_2": 0,
+            "medium_2": 5,
+            "high_1": 5,
+            "high_2": 5,
         }
         average_totals = []
         expected_ranges = {
             "light_1": (0.60, 0.60),
             "light_2": (0.75, 0.75),
             "medium_1": (1.563, 1.803),
-            "medium_2": (1.50, 1.81),
-            "high_1": (2.70, 3.15),
-            "high_2": (2.98, 2.98),
+            "medium_2": (1.60, 2.00),
+            "high_1": (2.00, 2.20),
+            "high_2": (2.20, 2.60),
         }
 
         for profile in (
@@ -915,13 +1054,17 @@ class TrafficIntegrityTests(unittest.TestCase):
                 expected_ranges[profile][1],
                 places=3,
             )
-            average_totals.append(
-                (
-                    sum(pattern) * expected_ranges[profile][1]
-                    + (len(pattern) - sum(pattern)) * expected_ranges[profile][0]
-                )
-                / len(pattern)
-            )
+            average_total = (
+                sum(pattern) * expected_ranges[profile][1]
+                + (len(pattern) - sum(pattern)) * expected_ranges[profile][0]
+            ) / len(pattern)
+            average_totals.append(average_total)
+            if profile == "medium_2":
+                self.assertAlmostEqual(average_total, 1.8)
+            if profile == "high_1":
+                self.assertAlmostEqual(average_total, 2.1)
+            if profile == "high_2":
+                self.assertAlmostEqual(average_total, 2.4)
 
         self.assertLess(average_totals[0], average_totals[1])
         self.assertLess(
@@ -934,6 +1077,36 @@ class TrafficIntegrityTests(unittest.TestCase):
         )
         self.assertLess(average_totals[3], average_totals[4])
         self.assertLess(average_totals[4], average_totals[5])
+
+    def test_shaped_profile_patterns_are_seeded_by_traffic_seed(self):
+        def pattern_for(profile, seed, cycle=0):
+            manager = object.__new__(TrafficManager)
+            manager.current_profile_name = profile
+            manager._seed_material = str(seed)
+            manager._shaped_cycle_patterns = {}
+            return manager._shaped_pattern_for_cycle(cycle)
+
+        expected_high_steps = {
+            "light_1": 0,
+            "light_2": 0,
+            "medium_1": 3,
+            "medium_2": 5,
+            "high_1": 5,
+            "high_2": 5,
+        }
+        for profile, high_steps in expected_high_steps.items():
+            pattern = pattern_for(profile, 42)
+            self.assertEqual(len(pattern), 10)
+            self.assertEqual(sum(pattern), high_steps)
+
+        self.assertEqual(pattern_for("high_2", 42), pattern_for("high_2", 42))
+        self.assertNotEqual(pattern_for("high_2", 42), pattern_for("high_2", 43))
+        self.assertNotEqual(
+            pattern_for("medium_2", 42),
+            pattern_for("medium_2", 42, cycle=1),
+        )
+        self.assertEqual(pattern_for("light_1", 42), (0,) * 10)
+        self.assertEqual(pattern_for("light_2", 43), (0,) * 10)
 
     def test_one_registry_covers_every_profile_and_derives_categories(self):
         expected = {
@@ -968,9 +1141,14 @@ class TrafficIntegrityTests(unittest.TestCase):
 
     def test_bursty_profiles_have_queue_biased_bursts(self):
         expected_high_totals = {
-            "vo": {1: 3.40, 2: 3.155, 3: 3.04},
-            "vi": {1: 3.25, 2: 3.20, 3: 3.03},
-            "be": {1: 3.35, 2: 3.13, 3: 3.148},
+            "vo": {1: 2.70, 2: 2.3333333333333335, 3: 2.625},
+            "vi": {1: 2.55, 2: 2.3333333333333335, 3: 2.625},
+            "be": {1: 2.65, 2: 2.3333333333333335, 3: 2.625},
+        }
+        expected_cycle_averages = {
+            "vo": {1: 1.51, 2: 1.80, 3: 2.30},
+            "vi": {1: 1.465, 2: 1.80, 3: 2.30},
+            "be": {1: 1.495, 2: 1.80, 3: 2.30},
         }
         for queue_name, qid in (("vo", 0), ("vi", 1), ("be", 7)):
             for suffix, high_steps in ((1, 3), (2, 6), (3, 8)):
@@ -985,10 +1163,20 @@ class TrafficIntegrityTests(unittest.TestCase):
                     max(stages["high"], key=stages["high"].get),
                     qid,
                 )
-                self.assertAlmostEqual(sum(stages["low"].values()), 0.70)
+                low_total = sum(stages["low"].values())
+                high_total = sum(stages["high"].values())
+                self.assertAlmostEqual(low_total, 1.00)
                 self.assertAlmostEqual(
-                    sum(stages["high"].values()),
+                    high_total,
                     expected_high_totals[queue_name][suffix],
+                )
+                cycle_average = (
+                    (10 - high_steps) * low_total
+                    + high_steps * high_total
+                ) / 10
+                self.assertAlmostEqual(
+                    cycle_average,
+                    expected_cycle_averages[queue_name][suffix],
                 )
 
     def test_flow_load_plan_is_heterogeneous_bounded_and_preserves_average(self):
@@ -997,21 +1185,33 @@ class TrafficIntegrityTests(unittest.TestCase):
             (f"h{index % 6 + 1}", f"h{index % 6 + 7}", 10 + index)
             for index in range(18)
         ]
-        manager._max_flow_total_mbps = 5.0
+        manager._max_flow_total_mbps = 7.5
         manager._flow_load_weights = manager._build_flow_load_weights()
 
         average_loads = TrafficManager.PROFILE_STAGE_LOADS["high_2"]["high"]
         plan = manager._flow_load_plan(average_loads)
         totals = [sum(loads.values()) for loads in plan.values()]
+        sorted_weights = sorted(manager._flow_load_weights.values())
 
         self.assertEqual(len(plan), 18)
-        self.assertLess(min(totals), max(totals))
-        self.assertLessEqual(max(totals), 5.0)
+        self.assertAlmostEqual(sum(sorted_weights) / len(sorted_weights), 1.0)
+        self.assertAlmostEqual(sorted_weights[0], 0.10)
+        self.assertAlmostEqual(sorted_weights[-1], 2.61)
+        self.assertLess(min(totals), 0.50)
+        self.assertGreater(max(totals), 6.70)
+        self.assertLessEqual(max(totals), 7.5)
+        self.assertEqual(len({round(total, 3) for total in totals}), 18)
         self.assertAlmostEqual(
             sum(totals) / len(totals),
             sum(average_loads.values()),
             places=6,
         )
+
+    def test_flow_cap_uses_75_percent_of_worst_topology_link(self):
+        manager = object.__new__(TrafficManager)
+        manager._topology_config = None
+
+        self.assertAlmostEqual(manager._max_single_flow_mbps(), 7.5)
 
     def test_profiles_are_calibrated_for_single_path_ospf_hot_edge(self):
         link_mbps = 10.0
@@ -1024,20 +1224,20 @@ class TrafficIntegrityTests(unittest.TestCase):
         self.assertAlmostEqual(hot_edge_ratio("light_1", "high"), 0.60)
         self.assertAlmostEqual(hot_edge_ratio("light_2", "high"), 0.75)
         self.assertAlmostEqual(hot_edge_ratio("medium_1", "high"), 1.803)
-        self.assertAlmostEqual(hot_edge_ratio("medium_2", "high"), 1.81)
-        self.assertAlmostEqual(hot_edge_ratio("high_1", "high"), 3.15)
-        self.assertAlmostEqual(hot_edge_ratio("high_2", "high"), 2.98)
+        self.assertAlmostEqual(hot_edge_ratio("medium_2", "high"), 2.00)
+        self.assertAlmostEqual(hot_edge_ratio("high_1", "high"), 2.20)
+        self.assertAlmostEqual(hot_edge_ratio("high_2", "high"), 2.60)
 
         expected_focused = {
-            "bursty_vo_1": (0, 3.40 * 0.72),
-            "bursty_vo_2": (0, 3.155 * 0.72),
-            "bursty_vo_3": (0, 3.04 * 0.72),
-            "bursty_vi_1": (1, 3.25 * 0.70),
-            "bursty_vi_2": (1, 3.20 * 0.70),
-            "bursty_vi_3": (1, 3.03 * 0.70),
-            "bursty_be_1": (7, 3.35 * 0.75),
-            "bursty_be_2": (7, 3.13 * 0.75),
-            "bursty_be_3": (7, 3.148 * 0.75),
+            "bursty_vo_1": (0, 2.70 * 0.72),
+            "bursty_vo_2": (0, 2.3333333333333335 * 0.72),
+            "bursty_vo_3": (0, 2.625 * 0.72),
+            "bursty_vi_1": (1, 2.55 * 0.70),
+            "bursty_vi_2": (1, 2.3333333333333335 * 0.70),
+            "bursty_vi_3": (1, 2.625 * 0.70),
+            "bursty_be_1": (7, 2.65 * 0.75),
+            "bursty_be_2": (7, 2.3333333333333335 * 0.75),
+            "bursty_be_3": (7, 2.625 * 0.75),
         }
         for profile, (qid, expected_total) in expected_focused.items():
             focused_load = TrafficManager.PROFILE_STAGE_LOADS[profile]["high"][qid]
@@ -1164,6 +1364,58 @@ class TrafficIntegrityTests(unittest.TestCase):
             "light_1",
             verify=True,
             verify_reason="step_20",
+        )
+
+    def test_step_profile_can_verify_every_step_for_production_benchmark(self):
+        manager = object.__new__(TrafficManager)
+        manager.current_profile_name = "light_1"
+        manager.current_load = TrafficManager.PROFILE_STAGE_LOADS[
+            "light_1"
+        ]["low"].copy()
+        manager._shaped_stage_high = False
+        manager._apply_sender_caps = Mock(
+            return_value={"verified": True}
+        )
+
+        report = manager.apply_step_profile(
+            1,
+            verify_each_step=True,
+        )
+
+        self.assertEqual(report["step"], 1)
+        self.assertEqual(report["profile_step"], 1)
+        self.assertFalse(report["stage_changed"])
+        manager._apply_sender_caps.assert_called_once_with(
+            "light_1",
+            verify=True,
+            verify_reason="step_1",
+        )
+
+    def test_step_profile_verifies_stage_change_when_requested(self):
+        manager = object.__new__(TrafficManager)
+        manager.current_profile_name = "bursty_be_1"
+        manager.current_load = TrafficManager.PROFILE_STAGE_LOADS[
+            "bursty_be_1"
+        ]["low"].copy()
+        manager._shaped_stage_high = False
+        manager._bursty_cycle_patterns = {
+            0: (0, 0, 1, 1, 1, 0, 0, 0, 0, 0),
+        }
+        manager._apply_sender_caps = Mock(
+            return_value={"verified": True}
+        )
+
+        report = manager.apply_step_profile(
+            3,
+            verify_each_step=True,
+        )
+
+        self.assertEqual(report["step"], 3)
+        self.assertTrue(report["stage_changed"])
+        manager._apply_sender_caps.assert_called_once_with(
+            "bursty_be_1",
+            verify=True,
+            verify_reason="step_3",
         )
 
     def test_sender_cap_skip_verification_uses_cached_tc_metadata(self):

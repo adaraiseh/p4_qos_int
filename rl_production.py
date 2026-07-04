@@ -52,7 +52,7 @@ from ecmp_baseline import (
     collect_local_egress_observations,
     log_top_bottleneck_egresses,
 )
-from traffic_generator import TrafficManager
+from traffic_generator import TrafficManager, finalize_traffic_validation
 from config.schema import MAX_SWITCHES
 import rl_agent_4
 
@@ -211,6 +211,7 @@ class ProductionMetricsWriter:
 
         # Cumulative tracking (for get_summary)
         self.cumulative_reward = 0.0
+        self.invalid_steps = 0
         self.total_sla_checks = 0
         self.total_sla_met = 0
         self.total_steps = 0
@@ -239,12 +240,16 @@ class ProductionMetricsWriter:
 
         # Update stats for get_summary
         self.total_steps += 1
-        self.rewards.append(reward)
+        data_valid = bool(info.get('data_valid', False))
         sla_met_count = len(info.get('sla_met', []))
-        self.cumulative_reward += reward
-        self.total_sla_checks += len(QIDS)
-        self.total_sla_met += sla_met_count
-        self.valid_steps += int(info.get('data_valid', False))
+        if data_valid:
+            self.rewards.append(reward)
+            self.cumulative_reward += reward
+            self.total_sla_checks += len(QIDS)
+            self.total_sla_met += sla_met_count
+            self.valid_steps += 1
+        else:
+            self.invalid_steps += 1
 
         # Track the same comparison metrics reported by ecmp_baseline.py.
         # invalid_queues reflects telemetry validity independently of whether
@@ -252,7 +257,7 @@ class ProductionMetricsWriter:
         per_queue = info.get('per_queue', {})
         invalid_queues = set(info.get('invalid_queues', []))
         for qid in QIDS:
-            if qid in per_queue and qid not in invalid_queues:
+            if data_valid and qid in per_queue and qid not in invalid_queues:
                 self.queue_metrics[qid]['latency'].append(
                     float(per_queue[qid].get('lat', 0.0))
                 )
@@ -271,7 +276,7 @@ class ProductionMetricsWriter:
                 .field("reward", float(reward))
                 .field("q_values_max", float(q_stats['q_max']))
                 .field("sla_met_count", int(sla_met_count))
-	                .field("data_valid", int(info.get('data_valid', False)))
+	                .field("data_valid", int(data_valid))
 	                .field("pressure", float(info.get('pressure', 0.0)))
 	                .field("requested_batch_size", int(info.get('requested_batch_size', 0) or 0))
 	                .field("batch_reroute_count", int(info.get('batch_reroute_count', 0) or 0))
@@ -337,12 +342,13 @@ class ProductionMetricsWriter:
             'total_steps': self.total_steps,
             'cumulative_reward': self.cumulative_reward,
             'mean_reward': (
-                self.cumulative_reward / self.total_steps
-                if self.total_steps else 0.0
+                self.cumulative_reward / self.valid_steps
+                if self.valid_steps else 0.0
             ),
             'avg_reward_100': float(np.mean(self.rewards)) if self.rewards else 0.0,
             'overall_sla_compliance': (self.total_sla_met / max(1, self.total_sla_checks)) * 100,
             'valid_steps': self.valid_steps,
+            'invalid_steps': self.invalid_steps,
             'queue_metrics': queue_summary,
             'uptime_seconds': time.time() - self.start_time,
         }
@@ -501,6 +507,7 @@ class ProductionRunner:
             'step', 'action', 'action_name', 'reward', 'raw_reward',
             'q_max', 'q_mean', 'chosen_q', 'q_gap',
             'sla_met_count', 'sla_streak', 'action_applied', 'data_valid',
+            'invalid_reason',
 	            'routing_state_verified', 'traffic_state_verified',
 	            'telemetry_state_verified', 'pressure',
 	            'requested_batch_size', 'batch_reroute_count',
@@ -523,7 +530,8 @@ class ProductionRunner:
         warmup_state = None
         if traffic_manager:
             warmup_state = traffic_manager.warm_profile_for(
-                args.warmup_seconds
+                args.warmup_seconds,
+                verify_each_step=True,
             )
         routing_state = env.verify_base_routing(
             raise_on_error=True
@@ -537,11 +545,13 @@ class ProductionRunner:
             }
         )
         if traffic_manager:
-            traffic_state["sender_rate_shaping"] = profile_info.get(
-                "traffic_shaping",
-                {},
+            finalize_traffic_validation(
+                traffic_state,
+                profile_info=profile_info,
+                warmup_state=warmup_state,
+                require_measurement_shaping=False,
+                require_post_measurement=False,
             )
-            traffic_state["traffic_profile_warmup"] = warmup_state
         telemetry_window_seconds = (
             traffic_manager.telemetry_coverage_window_seconds(
                 max(5.0, args.warmup_seconds)
@@ -569,17 +579,22 @@ class ProductionRunner:
         log.info("Verified required queue telemetry for RL")
         if traffic_manager:
             measurement_shaping = traffic_manager.begin_measurement()
-            if measurement_shaping:
-                traffic_state["measurement_shaping"] = measurement_shaping
-                traffic_state["sender_rate_shaping"] = measurement_shaping
             post_measurement_traffic_state = traffic_manager.verify_exact_processes(
                 raise_on_error=True
             )
-            traffic_state["post_measurement"] = post_measurement_traffic_state
-            traffic_state["verified"] = bool(
-                traffic_state["verified"]
-                and post_measurement_traffic_state["verified"]
+            finalize_traffic_validation(
+                traffic_state,
+                profile_info=profile_info,
+                warmup_state=warmup_state,
+                measurement_shaping=measurement_shaping,
+                post_measurement=post_measurement_traffic_state,
             )
+            if not traffic_state["validation"]["verified"]:
+                raise RuntimeError(
+                    "RL traffic validation failed: "
+                    + "; ".join(traffic_state["validation"]["errors"])
+                )
+            log.info("Verified traffic validation for RL")
             state = env.reset(
                 force_reset=False,
                 cooldown_seconds=0.0,
@@ -596,7 +611,10 @@ class ProductionRunner:
                     break
 
                 if traffic_manager:
-                    traffic_manager.apply_step_profile(self.step)
+                    traffic_manager.apply_step_profile(
+                        self.step,
+                        verify_each_step=True,
+                    )
 
                 # PHASE 2.3: Check for model reload (hot-reload support)
                 # If checkpoint file is updated, reload model and clear stacks
@@ -616,12 +634,19 @@ class ProductionRunner:
 
                 # Console logging (matches training format) - placed immediately after env.step
                 action_name = rl_agent_4.action_to_name(action)
+                validity_note = ""
+                if not info.get('data_valid', False):
+                    validity_note = (
+                        " valid=0 reason="
+                        + str(info.get('invalid_reason', 'invalid telemetry'))
+                    )
                 log.info(
                     f"[Step {self.step}] action={action_name:8s} "
                     f"reward={reward:+.2f} "
                     f"sla={len(info['sla_met'])}/"
                     f"{info.get('sla_total', len(QIDS))} "
                     f"streak={info['sla_streak']}"
+                    f"{validity_note}"
                 )
 
                 # Write metrics to InfluxDB
@@ -639,6 +664,7 @@ class ProductionRunner:
                     len(info['sla_met']), info.get('sla_streak', 0),
                     int(info.get('action_applied', False)),
                     int(info.get('data_valid', False)),
+                    info.get('invalid_reason', ''),
                     int(routing_state['verified']),
                     int(traffic_state['verified']),
                     int(telemetry_state['verified']),
@@ -877,6 +903,7 @@ def main():
 
     # Setup logging (matches training: INFO console, DEBUG file with 50MB rotation)
     setup_logging(log_level=args.log_level)
+    logging.getLogger("traffic_generator").setLevel(logging.DEBUG)
 
     needs_influx = (
         args.telemetry_backend in ('influx', 'cache-fallback-influx')

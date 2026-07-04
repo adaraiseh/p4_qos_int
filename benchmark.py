@@ -34,7 +34,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from logging_config import normalize_artifact_permissions
-from traffic_generator import TrafficManager
+from traffic_generator import TrafficManager, traffic_validation_errors
 
 
 METHODS = ("rl", "ecmp", "ospf")
@@ -256,10 +256,10 @@ def summarize_run_csv(path: Path) -> Dict:
                 clean_float(row.get("load_q0_mbps"))
                 + clean_float(row.get("load_q1_mbps"))
                 + clean_float(row.get("load_q7_mbps"))
-                for row in rows
+                for row in analysis_rows
             ]
         ),
-        "action_applied_rate": mean(values("action_applied", rows))
+        "action_applied_rate": mean(values("action_applied"))
         if "action_applied" in rows[0]
         else 0.0,
     }
@@ -365,10 +365,9 @@ def validate_runner_summary(item: Dict, path: Path) -> Tuple[Dict, List[str]]:
         or traffic_processes.get("verified") is not True
     ):
         errors.append("traffic process evidence is missing or unverified")
-    elif not isinstance(traffic_processes.get("post_measurement"), dict):
-        errors.append("post-measurement traffic verification is missing")
-    elif traffic_processes["post_measurement"].get("verified") is not True:
-        errors.append("post-measurement traffic verification is not true")
+    else:
+        for traffic_error in traffic_validation_errors(traffic_processes):
+            errors.append(f"traffic validation: {traffic_error}")
     if item["method"] == "ecmp" and not (
         isinstance(routing_state, dict) and routing_state.get("plan_sha256")
     ):
@@ -658,9 +657,11 @@ class BenchmarkOrchestrator:
                     "Holm family-wise correction"
                 ),
                 "invalid_data_policy": (
-                    "raw rows and failed attempts retained; primary metrics "
-                    "use rows marked data_valid; runs also require verified "
-                    "routing state and exact traffic process counts"
+                    "raw rows and failed attempts retained; benchmark metrics "
+                    "use only rows marked data_valid; invalid rows carry an "
+                    "invalid_reason and affect valid_fraction only; runs also "
+                    "require verified routing, traffic, telemetry, and HTB "
+                    "shaping evidence"
                 ),
                 "treatment_integrity": (
                     "P4 tables are cleared and read back before measurement; "

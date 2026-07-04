@@ -66,8 +66,9 @@ make benchmark \
   BENCH_REPETITIONS=12 STEPS=300
 ```
 
-`high_2` is rejected by default because project testing found that it can
-overload the experiment host and contaminate measurements.
+`high_2` is rejected by default because it is the highest deterministic high
+profile and can overload the experiment host or contaminate measurements.
+Enable it only for intentional stress runs with `--allow-high-2`.
 
 ## Experimental design
 
@@ -97,6 +98,18 @@ one iperf3 server and one client for each configured `(flow_id, queue)` port.
 It retries from a clean process state, restarts TaskServers between attempts,
 and raises an error after three unsuccessful attempts. Aggregate process counts
 alone are not accepted because duplicates could otherwise hide missing flows.
+RL, ECMP, and OSPF use the same traffic validation contract: startup endpoint
+verification, verified sender HTB shaping at startup, verified sender HTB
+shaping at measurement start, and post-measurement endpoint verification.
+Missing or unverified shaping evidence invalidates the run.
+Production and standalone benchmark runners also verify sender HTB caps with
+`tc` readback on every warmup and measured profile step. RL training keeps its
+existing periodic per-step HTB verification policy.
+Per-step rows with invalid telemetry are retained in raw CSV files with
+`data_valid=0` and `invalid_reason`, but they are excluded from benchmark
+reward, SLA, latency, drop, utilization, load, and action-rate aggregates.
+They only affect `valid_fraction`; runs below the configured valid-fraction
+threshold are retried or rejected.
 
 Standalone OSPF, standalone ECMP, and RL-base runs publish visualization paths
 for the same configured traffic-flow set. RL-base runs use the selected base
@@ -112,29 +125,37 @@ Using common random numbers makes RL-vs-baseline comparisons paired, reducing
 variance caused by traffic randomization. Balanced order limits systematic
 carry-over and thermal/resource effects.
 
-### Deterministic shaped profiles
+### Seeded shaped profiles
 
 Light profiles use fixed offered-load tiers throughout the measured interval.
 On `fat_tree_k4`, the measured ECMP congestion knee is sharp, so medium and
-high profiles use deterministic recovery-low plus overload-pulse cycles. This
-keeps short runs near their intended SLA band instead of starting every run
-from an unrealistically empty queue and then slowly decaying into congestion.
+high profiles use seeded recovery-low plus overload-pulse cycles. The traffic
+seed chooses the high-step positions inside each ten-step cycle while preserving
+the profile's high-step count and average load. This keeps paired runs
+reproducible without forcing every seed to use the same congestion timing.
 
 Per-demand totals are:
 
 | Profile | Low Mbps | High Mbps | High steps / 10 |
 |---------|----------|-----------|-----------------|
-| `light_1` | 1.50 | 1.50 | 0 |
-| `light_2` | 1.62 | 1.62 | 0 |
-| `medium_1` | 1.50 | 1.80 | 3 |
-| `medium_2` | 1.50 | 1.92 | 4 |
-| `high_1` | 1.50 | 1.85 | 6 |
-| `high_2` | 1.85 | 1.85 | 0 |
+| `light_1` | 0.60 | 0.60 | 0 |
+| `light_2` | 0.75 | 0.75 | 0 |
+| `medium_1` | 1.563 | 1.803 | 3 |
+| `medium_2` | 1.60 | 2.00 | 5 |
+| `high_1` | 2.00 | 2.20 | 5 |
+| `high_2` | 2.20 | 2.60 | 5 |
 
 The common queue split is Q0=22.327%, Q1=34.591%, and Q7=43.082% of the
-active stage total. With three demands per sender, these correspond to source
-HTB caps from 45.0% of a 10 Mbps sender link at a 1.50 Mbps stage to 57.6% at
-a 1.92 Mbps pulse stage.
+active stage total. Iperf offers slightly above each profile's maximum target,
+while sender HTB caps are computed from the per-flow load plan and verified by
+readback before measurements are accepted. The per-flow plan uses a deterministic
+wide distribution from very low to very high demand totals while preserving the
+profile average. Each individual demand is capped at 75% of the weakest
+topology link, or 7.5 Mbps on the 10 Mbps `fat_tree_k4` links.
+For example, `medium_2`, `high_1`, and `high_2` each have five high steps per
+cycle, so their averages are 1.80, 2.10, and 2.40 Mbps per demand respectively.
+The positions of those five high steps are derived from `traffic_seed`, profile
+name, and cycle index.
 
 The former 70%, 50%, and 20% SLA figures motivated the selected stress points
 but are calibration references only. They are not runtime acceptance criteria,
@@ -144,11 +165,18 @@ outcome.
 
 All steady and bursty names live in the single
 `TrafficManager.TRAFFIC_PROFILES` registry. Bursty profiles use queue-biased
-load vectors and deterministic bursts in every ten-step block: three high
+load vectors and seeded contiguous bursts in every ten-step block: three high
 steps for `_1`, six for `_2`, and eight for `_3`. The `_3` burst profiles are
 the churn-sensitive cases used to check whether the RL policy can avoid
 chasing every burst transition. A short benchmark therefore always exercises
 the named burst, and changing stages does not restart iperf.
+
+All bursty profiles now use a 1.00 Mbps low stage. Tier `_2` uses a
+2.333333 Mbps high stage, giving a 1.80 Mbps cycle average with six high
+steps. Tier `_3` uses a 2.625 Mbps high stage, giving a 2.30 Mbps cycle
+average with eight high steps. Tier `_1` preserves its previous cycle average
+after the low-stage increase: `bursty_vo_1` averages 1.510 Mbps,
+`bursty_vi_1` averages 1.465 Mbps, and `bursty_be_1` averages 1.495 Mbps.
 
 ## RL policy behavior
 
@@ -177,10 +205,10 @@ allow the policy to choose K1 versus K2 without exposing demand IDs as neural
 network inputs.
 
 A 50-step ECMP sanity sweep on `fat_tree_k4` with traffic seed 42 produced the
-expected load staircase with every run verified: `light_1` 100.00% SLA,
-`light_2` 100.00%, `medium_1` 53.33%, `medium_2` 18.67%, `high_1` 16.00%,
-and `high_2` 10.67%. Treat these as calibration evidence, not acceptance
-thresholds for paper experiments.
+expected load staircase with every run verified before the current `high_2`
+increase: `light_1` 100.00% SLA, `light_2` 100.00%, `medium_1` 53.33%,
+`medium_2` 18.67%, `high_1` 16.00%, and `high_2` 10.67%. Treat these as
+calibration evidence, not acceptance thresholds for paper experiments.
 
 Iperf offers slightly above each profile's maximum target while the existing
 Mininet root HTB class on every sender is changed and read back to enforce the
@@ -248,9 +276,11 @@ Each invocation creates `benchmark_results/benchmark_<timestamp>/` containing:
 
 Every successful run must include `routing_state_verified=true`,
 `traffic_state_verified=true`, and `telemetry_state_verified=true` in its
-runner summary. Standalone ECMP runs, and RL runs with `rl_base_routing=ecmp`,
-also include a SHA-256 digest of the deterministic route plan and per-switch
-expected/observed ECMP table counts.
+runner summary. The `traffic_processes.validation` block must also be verified,
+including startup HTB shaping, measurement-start HTB shaping, startup endpoint
+inventory, and post-measurement endpoint inventory. Standalone ECMP runs, and
+RL runs with `rl_base_routing=ecmp`, also include a SHA-256 digest of the
+deterministic route plan and per-switch expected/observed ECMP table counts.
 Missing verification marks the run invalid even when the available telemetry
 values themselves appear complete.
 

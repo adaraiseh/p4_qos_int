@@ -2,9 +2,9 @@
 """Resilient, reproducible traffic generation for routing experiments.
 
 Traffic endpoints are started through P4Utils TaskServers and verified exactly.
-Benchmark profiles use verified sender HTB caps. Steady profiles use fixed
-ten-step schedules; bursty profiles use seeded random ten-step schedules,
-allowing RL, ECMP, and OSPF to receive the same offered workload.
+Benchmark profiles use verified sender HTB caps. Steady and bursty profiles
+use seeded random ten-step schedules, allowing RL, ECMP, and OSPF to receive
+the same offered workload.
 """
 
 import os
@@ -37,20 +37,142 @@ from logging_config import normalize_artifact_permissions, setup_unified_logging
 log = logging.getLogger(__name__)
 
 
+def _report_verified(report: Any) -> bool:
+    return isinstance(report, dict) and report.get("verified") is True
+
+
+def _shaping_errors(report: Any, label: str) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(report, dict):
+        return [f"{label} HTB shaping evidence is missing"]
+    if report.get("verified") is not True:
+        errors.append(f"{label} HTB shaping is not verified")
+    if report.get("verification_skipped") is True:
+        errors.append(f"{label} HTB verification was skipped")
+    senders = report.get("senders")
+    if not isinstance(senders, list) or not senders:
+        errors.append(f"{label} HTB sender reports are missing")
+    else:
+        unverified = [
+            item.get("host", "<unknown>")
+            for item in senders
+            if not isinstance(item, dict) or item.get("verified") is not True
+        ]
+        if unverified:
+            errors.append(
+                f"{label} HTB sender verification failed for "
+                + ", ".join(str(host) for host in unverified[:5])
+            )
+    return errors
+
+
+def traffic_validation_errors(
+    traffic_state: Any,
+    *,
+    require_start_verification: bool = True,
+    require_measurement_shaping: bool = True,
+    require_post_measurement: bool = True,
+) -> List[str]:
+    """Return fail-closed traffic validation errors shared by all runners."""
+    errors: List[str] = []
+    if not isinstance(traffic_state, dict):
+        return ["traffic process evidence is missing"]
+
+    if traffic_state.get("verified") is not True:
+        errors.append("traffic process inventory is not verified")
+
+    if require_start_verification:
+        start = traffic_state.get("start_verification")
+        if not _report_verified(start):
+            errors.append("startup traffic verification is missing or unverified")
+
+    errors.extend(
+        _shaping_errors(
+            traffic_state.get("startup_sender_rate_shaping")
+            or traffic_state.get("sender_rate_shaping"),
+            "startup",
+        )
+    )
+
+    if require_measurement_shaping:
+        errors.extend(
+            _shaping_errors(
+                traffic_state.get("measurement_shaping"),
+                "measurement",
+            )
+        )
+
+    if require_post_measurement:
+        post = traffic_state.get("post_measurement")
+        if not _report_verified(post):
+            errors.append(
+                "post-measurement traffic verification is missing or unverified"
+            )
+
+    return errors
+
+
+def finalize_traffic_validation(
+    traffic_state: Dict[str, Any],
+    *,
+    profile_info: Optional[Dict[str, Any]] = None,
+    warmup_state: Optional[Dict[str, Any]] = None,
+    measurement_shaping: Optional[Dict[str, Any]] = None,
+    post_measurement: Optional[Dict[str, Any]] = None,
+    require_measurement_shaping: bool = True,
+    require_post_measurement: bool = True,
+) -> Dict[str, Any]:
+    """Attach identical traffic validation evidence to a runner state dict."""
+    if profile_info:
+        traffic_state["start_verification"] = profile_info.get(
+            "start_verification",
+            {},
+        )
+        startup_shaping = profile_info.get("traffic_shaping", {})
+        traffic_state["startup_sender_rate_shaping"] = startup_shaping
+        traffic_state.setdefault("sender_rate_shaping", startup_shaping)
+    if warmup_state is not None:
+        traffic_state["traffic_profile_warmup"] = warmup_state
+    if measurement_shaping is not None:
+        traffic_state["measurement_shaping"] = measurement_shaping
+        traffic_state["sender_rate_shaping"] = measurement_shaping
+    if post_measurement is not None:
+        traffic_state["post_measurement"] = post_measurement
+
+    errors = traffic_validation_errors(
+        traffic_state,
+        require_measurement_shaping=require_measurement_shaping,
+        require_post_measurement=require_post_measurement,
+    )
+    traffic_state["validation"] = {
+        "verified": not errors,
+        "errors": errors,
+        "requires_start_verification": True,
+        "requires_startup_sender_rate_shaping": True,
+        "requires_measurement_shaping": require_measurement_shaping,
+        "requires_post_measurement": require_post_measurement,
+    }
+    traffic_state["verified"] = not errors
+    return traffic_state
+
+
 PROFILE_CYCLE_STEPS = 10
 PROFILE_VERIFY_INTERVAL_STEPS = 20
 MEASUREMENT_SETTLE_SECONDS = 0.0
 COMMON_QUEUE_WEIGHTS = {0: 0.22327, 1: 0.34591, 7: 0.43082}
 DEFAULT_BOTTLENECK_LINK_MBPS = 10.0
-MAX_FLOW_BOTTLENECK_FRACTION = 0.50
+# Individual demand caps are set below a single bottleneck link so one flow can
+# be stressful without fully monopolizing the worst topology link.
+MAX_FLOW_BOTTLENECK_FRACTION = 0.75
 FLOW_LOAD_WEIGHT_TEMPLATE = (
-    1.42, 0.74, 1.16,
-    0.66, 1.34, 0.92,
-    1.08, 1.48, 0.70,
-    0.86, 1.26, 0.60,
-    1.18, 0.82, 1.38,
-    0.76, 1.02, 1.30,
+    0.10, 0.18, 0.26,
+    0.34, 0.42, 0.50,
+    0.58, 0.66, 0.74,
+    0.85, 0.98, 1.12,
+    1.28, 1.45, 1.68,
+    1.95, 2.30, 2.61,
 )
+FLOW_LOAD_PERMUTATION_STRIDE = 7
 
 
 def _weighted_load(total_mbps: float, weights: Dict[int, float]) -> Dict[int, float]:
@@ -120,19 +242,19 @@ STEADY_PROFILE_SPECS = {
         "pattern": (0, 1, 0, 0, 1, 0, 0, 1, 0, 0),
     },
     "medium_2": {
-        "low": 1.50,
-        "high": 1.81,
-        "pattern": (0, 1, 0, 1, 0, 0, 1, 0, 1, 0),
+        "low": 1.60,
+        "high": 2.00,
+        "pattern": (1, 0, 1, 0, 1, 0, 1, 0, 1, 0),
     },
     "high_1": {
-        "low": 2.70,
-        "high": 3.15,
-        "pattern": (0, 1, 1, 0, 1, 1, 0, 1, 1, 0),
+        "low": 2.00,
+        "high": 2.20,
+        "pattern": (0, 0, 0, 1, 1, 1, 0, 0, 1, 1),
     },
     "high_2": {
-        "low": 2.98,
-        "high": 2.98,
-        "pattern": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        "low": 2.20,
+        "high": 2.60,
+        "pattern": (1, 1, 1, 1, 1, 0, 0, 0, 0, 0),
     },
 }
 
@@ -144,16 +266,18 @@ BURST_QUEUE_WEIGHTS = {
 BURST_TIER_SPECS = {
     # Suffixes mirror the steady profile difficulty bands:
     # _1 light, _2 medium, _3 high.
-    1: {"low": 0.70, "high_steps": 3},
-    2: {"low": 0.70, "high_steps": 6},
-    3: {"low": 0.70, "high_steps": 8},
+    1: {"low": 1.00, "high_steps": 3},
+    2: {"low": 1.00, "high_steps": 6},
+    3: {"low": 1.00, "high_steps": 8},
 }
 BURST_HIGH_TOTALS = {
     # Class-specific burst totals calibrated against the focused queue under
     # single-path OSPF concentration: voice=Q0, video=Q1, best-effort=Q7.
-    "vo": {1: 3.40, 2: 3.155, 3: 3.04},
-    "vi": {1: 3.25, 2: 3.20, 3: 3.03},
-    "be": {1: 3.35, 2: 3.13, 3: 3.148},
+    # Tier _1 preserves its prior cycle average after the low-stage increase.
+    # Tier _2 targets a 1.8 Mbps cycle average; tier _3 targets 2.3 Mbps.
+    "vo": {1: 2.70, 2: 2.3333333333333335, 3: 2.625},
+    "vi": {1: 2.55, 2: 2.3333333333333335, 3: 2.625},
+    "be": {1: 2.65, 2: 2.3333333333333335, 3: 2.625},
 }
 BURSTY_PROFILE_SPECS = {
     f"bursty_{traffic_class}_{tier}": {
@@ -402,6 +526,7 @@ class TrafficManager:
         self._shaped_stage_high: Optional[bool] = None
         self._profile_step_offset: int = 0
         self._bursty_cycle_patterns: Dict[int, Tuple[int, ...]] = {}
+        self._shaped_cycle_patterns: Dict[Tuple[str, int], Tuple[int, ...]] = {}
 
         # iPerf log cleanup thread (CPU-efficient, runs every 120s)
         self._log_cleanup_stop = threading.Event()
@@ -1377,16 +1502,46 @@ class TrafficManager:
     def _max_single_flow_mbps(self) -> float:
         return self._topology_bottleneck_mbps() * MAX_FLOW_BOTTLENECK_FRACTION
 
+    @staticmethod
+    def _ranked_flow_load_weights(count: int) -> List[float]:
+        """Return a low-to-high deterministic spread for any flow count."""
+        if count <= 0:
+            return []
+        if count == 1:
+            return [1.0]
+
+        template = FLOW_LOAD_WEIGHT_TEMPLATE
+        max_position = len(template) - 1
+        weights = []
+        for index in range(count):
+            position = index * max_position / (count - 1)
+            left = int(math.floor(position))
+            right = min(left + 1, max_position)
+            fraction = position - left
+            weights.append(
+                template[left] * (1.0 - fraction)
+                + template[right] * fraction
+            )
+        return weights
+
+    @staticmethod
+    def _permutation_stride(count: int) -> int:
+        stride = FLOW_LOAD_PERMUTATION_STRIDE
+        while count > 1 and math.gcd(stride, count) != 1:
+            stride += 2
+        return stride
+
     def _build_flow_load_weights(self) -> Dict[int, float]:
         """Assign deterministic heterogeneous weights to configured demands."""
         pairs = list(getattr(self, "traffic_pairs", []))
         if not pairs:
             return {}
 
-        raw_weights = [
-            FLOW_LOAD_WEIGHT_TEMPLATE[index % len(FLOW_LOAD_WEIGHT_TEMPLATE)]
-            for index, _pair in enumerate(pairs)
-        ]
+        ranked_weights = self._ranked_flow_load_weights(len(pairs))
+        raw_weights = [0.0] * len(pairs)
+        stride = self._permutation_stride(len(pairs))
+        for rank_index, weight in enumerate(ranked_weights):
+            raw_weights[(rank_index * stride) % len(pairs)] = weight
         mean_weight = sum(raw_weights) / len(raw_weights)
         if mean_weight <= 0.0:
             raise ValueError("Flow load weights must have a positive mean")
@@ -1534,23 +1689,63 @@ class TrafficManager:
         self._bursty_cycle_patterns[cycle_index] = pattern
         return pattern
 
+    def _shaped_pattern_for_cycle(self, cycle_index: int) -> Tuple[int, ...]:
+        """Return the seeded random shaped-profile pattern for a cycle."""
+        if cycle_index < 0:
+            raise ValueError("cycle_index must be non-negative")
+        profile_name = self.current_profile_name
+        template = self.SHAPED_PROFILE_PATTERNS.get(profile_name)
+        if not template:
+            raise ValueError(
+                f"No shaped traffic pattern for profile {profile_name!r}"
+            )
+
+        cache = getattr(self, "_shaped_cycle_patterns", None)
+        if cache is None:
+            cache = {}
+            self._shaped_cycle_patterns = cache
+        cache_key = (profile_name, cycle_index)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        high_steps = sum(template)
+        if high_steps <= 0:
+            pattern = (0,) * PROFILE_CYCLE_STEPS
+        elif high_steps >= PROFILE_CYCLE_STEPS:
+            pattern = (1,) * PROFILE_CYCLE_STEPS
+        else:
+            seed_material = (
+                f"{getattr(self, '_seed_material', 'unseeded')}:"
+                f"{profile_name}:{cycle_index}:shaped"
+            )
+            seed_int = int.from_bytes(
+                hashlib.sha256(seed_material.encode("utf-8")).digest()[:8],
+                "big",
+            )
+            rng = random.Random(seed_int)
+            high_indexes = set(rng.sample(range(PROFILE_CYCLE_STEPS), high_steps))
+            pattern = tuple(
+                int(index in high_indexes)
+                for index in range(PROFILE_CYCLE_STEPS)
+            )
+        cache[cache_key] = pattern
+        return pattern
+
+    def _pattern_for_cycle(self, cycle_index: int) -> Tuple[int, ...]:
+        if self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS:
+            return self._bursty_pattern_for_cycle(cycle_index)
+        return self._shaped_pattern_for_cycle(cycle_index)
+
     def _scheduled_stage_high(self, profile_step: int) -> bool:
         """Return whether the active profile should be in its high stage."""
         if profile_step < 1:
             raise ValueError("profile_step must be at least 1")
-        if self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS:
-            cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS
-            cycle_position = (profile_step - 1) % PROFILE_CYCLE_STEPS
-            return bool(
-                self._bursty_pattern_for_cycle(cycle_index)[cycle_position]
-            )
-
-        pattern = self.SHAPED_PROFILE_PATTERNS.get(self.current_profile_name)
-        if not pattern:
-            raise ValueError(
-                f"No shaped traffic pattern for profile {self.current_profile_name!r}"
-            )
-        return bool(pattern[(profile_step - 1) % len(pattern)])
+        cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS
+        cycle_position = (profile_step - 1) % PROFILE_CYCLE_STEPS
+        return bool(
+            self._pattern_for_cycle(cycle_index)[cycle_position]
+        )
 
     @staticmethod
     def _parse_root_htb_class(output: str) -> Optional[Dict[str, str]]:
@@ -1777,6 +1972,7 @@ class TrafficManager:
         self,
         current_step: int,
         use_offset: bool = True,
+        verify_each_step: bool = False,
     ) -> Optional[Dict]:
         """Apply the scheduled stage for a shaped benchmark profile."""
         has_pattern = (
@@ -1792,7 +1988,10 @@ class TrafficManager:
             getattr(self, "_profile_step_offset", 0) if use_offset else 0
         )
         stage_high = self._scheduled_stage_high(profile_step)
-        verify_profile = self._should_verify_profile_step(current_step)
+        verify_profile = (
+            bool(verify_each_step)
+            or self._should_verify_profile_step(current_step)
+        )
         if stage_high == self._shaped_stage_high:
             if verify_profile:
                 report = self._apply_sender_caps(
@@ -1824,15 +2023,13 @@ class TrafficManager:
         report["step"] = current_step
         report["profile_step"] = profile_step
         report["stage_changed"] = True
-        pattern_note = ""
-        if self.current_profile_name in self.BURSTY_PROFILE_HIGH_STEPS:
-            cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS
-            cycle_pattern = "".join(
-                str(bit) for bit in self._bursty_pattern_for_cycle(cycle_index)
-            )
-            report["profile_cycle"] = cycle_index + 1
-            report["cycle_pattern"] = cycle_pattern
-            pattern_note = f" cycle={cycle_index + 1} pattern={cycle_pattern}"
+        cycle_index = (profile_step - 1) // PROFILE_CYCLE_STEPS
+        cycle_pattern = "".join(
+            str(bit) for bit in self._pattern_for_cycle(cycle_index)
+        )
+        report["profile_cycle"] = cycle_index + 1
+        report["cycle_pattern"] = cycle_pattern
+        pattern_note = f" cycle={cycle_index + 1} pattern={cycle_pattern}"
         log.info(
             f"[Traffic] Step {current_step}: "
             f"profile_step={profile_step} "
@@ -1847,6 +2044,7 @@ class TrafficManager:
         self,
         duration_seconds: float,
         step_interval_seconds: float = 1.0,
+        verify_each_step: bool = False,
     ) -> Dict:
         """Advance the active profile during an excluded warmup window.
 
@@ -1865,6 +2063,7 @@ class TrafficManager:
             report = self.apply_step_profile(
                 transition + 1,
                 use_offset=False,
+                verify_each_step=verify_each_step,
             )
             if report:
                 applied.append(report)
@@ -2033,6 +2232,7 @@ class TrafficManager:
         )
         is_bursty = self.current_profile_category == "bursty"
         self._bursty_cycle_patterns = {}
+        self._shaped_cycle_patterns = {}
 
         # Apply the profile's first scheduled stage immediately. This keeps the
         # warmup and telemetry-coverage windows on the same offered workload as
@@ -2059,15 +2259,14 @@ class TrafficManager:
                 f"max={max(flow_totals):.2f}, "
                 f"cap={self._max_flow_total_mbps:.2f} Mbps"
             )
-        if is_bursty:
-            initial_pattern = "".join(
-                str(bit) for bit in self._bursty_pattern_for_cycle(0)
-            )
-            log.info(
-                f"  Bursty cycle 1 pattern: {initial_pattern} "
-                f"({sum(self._bursty_pattern_for_cycle(0))}/"
-                f"{PROFILE_CYCLE_STEPS} high steps)"
-            )
+        initial_pattern = "".join(
+            str(bit) for bit in self._pattern_for_cycle(0)
+        )
+        log.info(
+            f"  Seeded cycle 1 pattern: {initial_pattern} "
+            f"({sum(self._pattern_for_cycle(0))}/"
+            f"{PROFILE_CYCLE_STEPS} high steps)"
+        )
 
         # Track state for health monitoring
         self._last_packet_len = packet_len

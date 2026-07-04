@@ -181,7 +181,7 @@ single control step.
    sudo pkill -9 -f "rl_production"
    ```
 2. **Wait 30-60 seconds** for InfluxDB data to stabilize before querying
-3. **Do NOT use high_2 profile** for testing - it causes CPU overload and unreliable data
+3. Use `high_2` only for intentional stress testing; it is the highest deterministic high profile and may overload the experiment host
 4. Use `medium_1` or `medium_2` profiles for stable testing
 
 **CRITICAL: After completing any test:**
@@ -545,26 +545,47 @@ If data is invalid after all retries:
 
 All supported names are defined by `TrafficManager.TRAFFIC_PROFILES`; there is
 no separate test-profile registry. Loads are exact Mbps per demand. Light
-profiles are steady; medium/high profiles use recovery-low plus overload-pulse
-cycles so short ECMP runs start near the intended SLA band instead of slowly
-building a queue from an unrealistically clean start.
+profiles have zero high steps; medium/high profiles use seeded recovery-low
+plus overload-pulse cycles. The traffic seed chooses the high-step positions
+inside each ten-step cycle while preserving the profile's high-step count and
+average load.
 
 | Profile | Low total | High total | High steps / 10 | Category |
 |---------|-----------|------------|-----------------|----------|
-| light_1 | 1.50 | 1.50 | 0 | Light |
-| light_2 | 1.62 | 1.62 | 0 | Light |
-| medium_1 | 1.50 | 1.80 | 3 | Medium |
-| medium_2 | 1.50 | 1.92 | 4 | Medium |
-| high_1 | 1.50 | 1.85 | 6 | High |
-| high_2 | 1.85 | 1.85 | 0 | High |
+| light_1 | 0.60 | 0.60 | 0 | Light |
+| light_2 | 0.75 | 0.75 | 0 | Light |
+| medium_1 | 1.563 | 1.803 | 3 | Medium |
+| medium_2 | 1.60 | 2.00 | 5 | Medium |
+| high_1 | 2.00 | 2.20 | 5 | High |
+| high_2 | 2.20 | 2.60 | 5 | High |
 
 Queue weights for these totals are Q0=22.327%, Q1=34.591%, and Q7=43.082%.
 Stage changes use verified sender HTB shaping and do not restart iperf.
+Production and standalone benchmark runners read back sender HTB caps on every
+warmup and measured profile step. RL training keeps its existing periodic
+per-step HTB verification policy.
+`medium_2`, `high_1`, and `high_2` each have five high steps per cycle, so
+their averages are 1.80, 2.10, and 2.40 Mbps per demand respectively. The
+positions of those five high steps are derived from `traffic_seed`, profile
+name, and cycle index.
+Per-flow demand totals use a deterministic wide distribution from very low to
+very high while preserving the profile average. Each individual demand is
+capped at 75% of the weakest topology link, or 7.5 Mbps on the 10 Mbps
+`fat_tree_k4` links.
+RL production, ECMP, and OSPF all finalize traffic validation through the same
+helper: startup endpoint inventory, startup HTB shaping, measurement-start HTB
+shaping, and post-measurement endpoint inventory must all be verified before a
+run is accepted.
+Invalid per-step telemetry is kept in CSVs with `data_valid=0` and
+`invalid_reason`, but benchmark aggregates and runner-side reward/SLA summaries
+use only valid rows.
 
-Bursty profiles use a 0.70 Mbps low stage and queue-biased class-specific high
-stages. `_1` profiles have three high steps per ten-step cycle, `_2` profiles
-have six, and `_3` profiles have eight. The `_3` tier is the churn-sensitive
-case that motivated K1/K2 batching and demand-unit lockout.
+Bursty profiles use a 1.00 Mbps low stage and queue-biased class-specific high
+stages. `_1` profiles have three high steps per ten-step cycle and preserve
+their previous cycle averages after the low-stage increase. `_2` profiles use
+a 2.333333 Mbps high stage for a 1.80 Mbps cycle average. `_3` profiles use a
+2.625 Mbps high stage for a 2.30 Mbps cycle average. The `_3` tier is the
+churn-sensitive case that motivated K1/K2 batching and demand-unit lockout.
 
 ---
 

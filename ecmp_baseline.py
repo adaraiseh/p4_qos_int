@@ -891,6 +891,7 @@ class BenchmarkStats:
     def __init__(self):
         self.rewards: List[float] = []
         self.valid_steps = 0
+        self.invalid_steps = 0
         self.sla_met = 0
         self.sla_checks = 0
         self.queue_metrics = {
@@ -898,13 +899,17 @@ class BenchmarkStats:
         }
 
     def add(self, reward: float, info: dict, snapshot: dict) -> None:
-        self.rewards.append(float(reward))
-        self.valid_steps += int(info.get("data_valid", False))
-        self.sla_met += len(info.get("sla_met", []))
-        self.sla_checks += len(QIDS)
+        data_valid = bool(info.get("data_valid", False))
+        if data_valid:
+            self.rewards.append(float(reward))
+            self.valid_steps += 1
+            self.sla_met += len(info.get("sla_met", []))
+            self.sla_checks += len(QIDS)
+        else:
+            self.invalid_steps += 1
 
         for qid in QIDS:
-            if snapshot[qid].get("data_valid", False):
+            if data_valid and snapshot[qid].get("data_valid", False):
                 self.queue_metrics[qid]["latency"].append(snapshot[qid]["lat_p95"])
                 self.queue_metrics[qid]["drop"].append(snapshot[qid]["drop_p95"])
                 self.queue_metrics[qid]["util"].append(snapshot[qid]["util_p95"])
@@ -925,6 +930,7 @@ class BenchmarkStats:
             "overall_sla_compliance": sla_pct,
             "sla_met_pct": sla_pct,
             "valid_steps": self.valid_steps,
+            "invalid_steps": self.invalid_steps,
             "queue_metrics": {
                 qid: {
                     "mean_latency": self._mean(self.queue_metrics[qid]["latency"]),
@@ -1000,7 +1006,7 @@ class ECMPBenchmark:
 
         # Runtime-only imports keep --plan-only usable without BMv2/p4utils.
         from rl_agent_4 import QoSRoutingEnv, SLA_THRESHOLDS
-        from traffic_generator import TrafficManager
+        from traffic_generator import TrafficManager, finalize_traffic_validation
 
         builder = create_topology(self.args.config)
         planner = ECMPPlanner(builder)
@@ -1103,9 +1109,11 @@ class ECMPBenchmark:
         traffic_state = self.traffic_manager.verify_exact_processes(
             raise_on_error=True
         )
-        traffic_state["sender_rate_shaping"] = profile_info.get(
-            "traffic_shaping",
-            {},
+        finalize_traffic_validation(
+            traffic_state,
+            profile_info=profile_info,
+            require_measurement_shaping=False,
+            require_post_measurement=False,
         )
         self.routing_state["traffic_processes"] = traffic_state
         loads = profile_info.get("measurement_loads", profile_info["loads"])
@@ -1125,9 +1133,9 @@ class ECMPBenchmark:
         )
         del state
         warmup_state = self.traffic_manager.warm_profile_for(
-            self.args.warmup_seconds
+            self.args.warmup_seconds,
+            verify_each_step=True,
         )
-        self.routing_state["traffic_profile_warmup"] = warmup_state
         telemetry_window_seconds = (
             self.traffic_manager.telemetry_coverage_window_seconds(
                 max(5.0, self.args.warmup_seconds)
@@ -1143,17 +1151,24 @@ class ECMPBenchmark:
         self.routing_state["telemetry_required_metrics"] = telemetry_state
         log.info("Verified required queue telemetry for ECMP")
         measurement_shaping = self.traffic_manager.begin_measurement()
-        if measurement_shaping:
-            self.routing_state["measurement_shaping"] = measurement_shaping
-            traffic_state["sender_rate_shaping"] = measurement_shaping
         post_measurement_traffic_state = self.traffic_manager.verify_exact_processes(
             raise_on_error=True
         )
-        traffic_state["post_measurement"] = post_measurement_traffic_state
-        traffic_state["verified"] = bool(
-            traffic_state["verified"]
-            and post_measurement_traffic_state["verified"]
+        finalize_traffic_validation(
+            traffic_state,
+            profile_info=profile_info,
+            warmup_state=warmup_state,
+            measurement_shaping=measurement_shaping,
+            post_measurement=post_measurement_traffic_state,
         )
+        self.routing_state["traffic_profile_warmup"] = warmup_state
+        self.routing_state["measurement_shaping"] = measurement_shaping
+        if not traffic_state["validation"]["verified"]:
+            raise RuntimeError(
+                "ECMP traffic validation failed: "
+                + "; ".join(traffic_state["validation"]["errors"])
+            )
+        log.info("Verified traffic validation for ECMP")
         output_path = Path(self.args.output) if self.args.output else Path(
             "data"
         ) / f"ecmp_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -1178,6 +1193,7 @@ class ECMPBenchmark:
                     "raw_reward",
                     "sla_met_count",
                     "data_valid",
+                    "invalid_reason",
                     "routing_state_verified",
                     "traffic_state_verified",
                     "telemetry_state_verified",
@@ -1199,7 +1215,10 @@ class ECMPBenchmark:
                 self.args.steps == 0 or completed_steps < self.args.steps
             ):
                 next_step = completed_steps + 1
-                self.traffic_manager.apply_step_profile(next_step)
+                self.traffic_manager.apply_step_profile(
+                    next_step,
+                    verify_each_step=True,
+                )
 
                 _, reward, _, _, info = self.env.step(0)
                 completed_steps += 1
@@ -1221,6 +1240,7 @@ class ECMPBenchmark:
                     info.get("raw_reward", reward),
                     len(info.get("sla_met", [])),
                     int(info.get("data_valid", False)),
+                    info.get("invalid_reason", ""),
                     int(self.routing_state["verified"]),
                     int(traffic_state["verified"]),
                     int(telemetry_state["verified"]),
@@ -1239,11 +1259,18 @@ class ECMPBenchmark:
                 csv_file.flush()
 
                 if self.args.log_every > 0 and completed_steps % self.args.log_every == 0:
+                    validity_note = ""
+                    if not info.get("data_valid", False):
+                        validity_note = (
+                            " valid=0 reason="
+                            + str(info.get("invalid_reason", "invalid telemetry"))
+                        )
                     log.info(
                         f"[Step {completed_steps}] reward={reward:+.2f} "
                         f"sla={len(info.get('sla_met', []))}/"
                         f"{info.get('sla_total', len(QIDS))} "
                         f"pressure={pressure:.3f}"
+                        f"{validity_note}"
                     )
 
         final_traffic_state = self.traffic_manager.verify_exact_processes(
@@ -1491,6 +1518,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     setup_unified_logging(module_name="ecmp_baseline", log_level=args.log_level)
+    logging.getLogger("traffic_generator").setLevel(logging.DEBUG)
 
     builder = create_topology(args.config)
     planner = ECMPPlanner(builder)

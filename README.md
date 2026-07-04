@@ -92,6 +92,20 @@ Key behavior:
   `routing_mode`, and per-queue path). This makes the RL-base starting diagram
   directly comparable with the matching standalone baseline before overlays are
   applied.
+- RL production, standalone ECMP, and standalone OSPF use the same traffic
+  validation contract: exact startup endpoints, verified sender HTB shaping at
+  startup, verified sender HTB shaping at measurement start, and exact
+  post-measurement endpoints. Benchmark runs reject summaries that lack this
+  evidence.
+- Production and standalone benchmark runners also read back sender HTB caps on
+  every warmup and measured profile step. RL training keeps its existing
+  periodic step verification policy.
+- `traffic_seed` controls seeded high/low positions for shaped traffic
+  profiles while preserving each profile's high-step count and average load.
+- Per-flow demand loads use a deterministic wide distribution from very low to
+  very high senders while preserving each profile's aggregate target. Each
+  individual demand is capped at 75% of the weakest topology link, which is
+  7.5 Mbps on the 10 Mbps `fat_tree_k4` links.
 - The observation includes batch-awareness per queue:
   `eligible_count_norm`, `top1_pressure_norm`, and `top2_pressure_norm`.
   These expose whether K2 is meaningful without exposing full demand IDs.
@@ -101,7 +115,9 @@ Key behavior:
 
 Production and benchmark CSV logs include batch and lock diagnostics:
 `requested_batch_size`, `batch_reroute_count`, `locked_units_count`, and
-`rerouted_units`.
+`rerouted_units`. Production, ECMP, and OSPF rows also include
+`invalid_reason`; rows with `data_valid=0` are retained for audit but excluded
+from benchmark aggregates and runner-side reward/SLA summaries.
 
 # Hosts terminal tests:
 1. in mininet terminal
